@@ -43,33 +43,48 @@ class RiskFactors:
         
         return pd.DataFrame(factor_results)
     
+    def calculate_volatility_20d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
+        """计算20日波动率"""
+        if len(price_data) < 20:
+            return pd.Series(0.0, index=price_data.columns)
+        returns = price_data.pct_change(fill_method=None)
+        volatility = returns.rolling(window=20).std() * np.sqrt(252)
+        return volatility.iloc[-1].fillna(0)
+    
     def calculate_volatility_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算60日波动率"""
-        returns = price_data.pct_change()
+        if len(price_data) < 60:
+            return pd.Series(0.0, index=price_data.columns)
+        returns = price_data.pct_change(fill_method=None)
         volatility = returns.rolling(window=60).std() * np.sqrt(252)
-        return volatility.iloc[-1]
+        return volatility.iloc[-1].fillna(0)
     
     def calculate_volume_ratio(self, price_data: pd.DataFrame, volume_data: pd.DataFrame) -> pd.Series:
         """计算成交量比率"""
+        if volume_data is None or len(volume_data) < 20:
+            return pd.Series(1.0, index=price_data.columns)
         volume_ma = volume_data.rolling(window=20).mean()
         current_volume = volume_data.iloc[-1]
-        return current_volume / volume_ma.iloc[-1]
+        ratio = current_volume / volume_ma.iloc[-1]
+        return ratio.fillna(1.0)
     
     def calculate_turnover_rate(self, price_data: pd.DataFrame, volume_data: pd.DataFrame) -> pd.Series:
         """计算换手率"""
+        if volume_data is None or len(volume_data) < 20:
+            return pd.Series(0.1, index=price_data.columns)
         # 简化计算：成交量相对于20日均值的比率
         volume_std = volume_data.rolling(window=20).std()
         volume_mean = volume_data.rolling(window=20).mean()
         turnover = volume_std.iloc[-1] / volume_mean.iloc[-1]
-        return turnover
+        return turnover.fillna(0.1)
     
     def calculate_beta_60d(self, price_data: pd.DataFrame, volume_data=None, 
                           benchmark_data: Optional[pd.DataFrame] = None) -> pd.Series:
         """计算60日Beta"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         
         if benchmark_data is not None:
-            benchmark_returns = benchmark_data.pct_change()
+            benchmark_returns = benchmark_data.pct_change(fill_method=None)
             
             def calc_beta(stock_returns):
                 covariance = stock_returns.rolling(window=60).cov(benchmark_returns.iloc[:, 0])
@@ -90,19 +105,19 @@ class RiskFactors:
     
     def calculate_skewness_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算60日收益率偏度"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         skewness = returns.rolling(window=60).skew()
         return skewness.iloc[-1]
     
     def calculate_kurtosis_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算60日收益率峰度"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         kurtosis = returns.rolling(window=60).kurt()
         return kurtosis.iloc[-1]
     
     def calculate_max_drawdown_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算60日最大回撤"""
-        cumulative_returns = (1 + price_data.pct_change()).cumprod()
+        cumulative_returns = (1 + price_data.pct_change(fill_method=None)).cumprod()
         rolling_max = cumulative_returns.rolling(window=60, min_periods=1).max()
         drawdown = (cumulative_returns - rolling_max) / rolling_max
         max_drawdown = drawdown.rolling(window=60).min()
@@ -110,13 +125,13 @@ class RiskFactors:
     
     def calculate_var_95(self, price_data: pd.DataFrame, volume_data=None, window: int = 60) -> pd.Series:
         """计算95% VaR"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         var_95 = returns.rolling(window=window).quantile(0.05)
         return var_95.iloc[-1]
     
     def calculate_cvar_95(self, price_data: pd.DataFrame, volume_data=None, window: int = 60) -> pd.Series:
         """计算95% CVaR条件风险价值"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         
         def calc_cvar(series):
             var_95 = series.quantile(0.05)
@@ -129,7 +144,7 @@ class RiskFactors:
     def calculate_downside_deviation(self, price_data: pd.DataFrame, volume_data=None, 
                                    target_return: float = 0, window: int = 60) -> pd.Series:
         """计算下行偏差"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         excess_returns = returns - target_return
         downside_returns = excess_returns[excess_returns < 0]
         downside_deviation = downside_returns.rolling(window=window).std()
@@ -138,7 +153,7 @@ class RiskFactors:
     def calculate_upside_deviation(self, price_data: pd.DataFrame, volume_data=None,
                                  target_return: float = 0, window: int = 60) -> pd.Series:
         """计算上行偏差"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         excess_returns = returns - target_return
         upside_returns = excess_returns[excess_returns > 0]
         upside_deviation = upside_returns.rolling(window=window).std()
@@ -146,7 +161,7 @@ class RiskFactors:
     
     def calculate_volatility_regime(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算波动率状态因子"""
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         
         # 短期波动率(20日)
         short_vol = returns.rolling(window=20).std()

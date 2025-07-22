@@ -9,6 +9,7 @@ import numpy as np
 from torch.distributions import Normal
 from typing import Dict, List, Optional, Tuple
 import logging
+from utils.logging_utils import statistical_warning, throttled_warning
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,20 @@ class ActorCriticNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
+        
+        # 初始化网络权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化网络权重"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.constant_(module.bias, 0.0)
+        
+        # 特殊初始化actor输出层
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        nn.init.constant_(self.actor_mean.bias, 0.0)
         
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """前向传播"""
@@ -98,7 +113,10 @@ class CVaRPPOAgent:
         # 网络初始化
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.network = ActorCriticNetwork(state_dim, action_dim, self.hidden_dim).to(self.device)
-        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr)
+        self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr, eps=1e-8)
+        
+        # 添加学习率调度器
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
         
         # 经验缓存
         self.memory = {
@@ -109,6 +127,14 @@ class CVaRPPOAgent:
             'log_probs': [],
             'dones': [],
             'cvar_estimates': []
+        }
+        
+        # 数值稳定性统计
+        self.numerical_issues = {
+            'nan_states': 0,
+            'nan_actions': 0, 
+            'nan_losses': 0,
+            'nan_gradients': 0
         }
         
     def get_action(self, state: np.ndarray, deterministic: bool = False) -> Tuple[np.ndarray, float, float]:
@@ -124,10 +150,34 @@ class CVaRPPOAgent:
             log_prob: 对数概率
             value: 状态价值
         """
+        # 检查输入状态是否包含NaN
+        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+            self.numerical_issues['nan_states'] += 1
+            
+            # 使用统计性日志
+            statistical_warning(
+                logger,
+                "输入状态数值异常",
+                f"第{self.numerical_issues['nan_states']}次状态NaN/Inf检测",
+                report_interval=50  # 每50次报告一次
+            )
+            
+            state = np.zeros_like(state)
+        
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             action_mean, action_std, value, cvar_estimate = self.network(state_tensor)
+            
+            # 检查网络输出是否包含NaN
+            if torch.any(torch.isnan(action_mean)) or torch.any(torch.isnan(action_std)):
+                logger.error("网络输出包含NaN值，重新初始化网络")
+                self.network = ActorCriticNetwork(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
+                self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr)
+                action_mean, action_std, value, cvar_estimate = self.network(state_tensor)
+            
+            # 确保action_std不会太小
+            action_std = torch.clamp(action_std, min=1e-6, max=1.0)
             
             if deterministic:
                 action = action_mean
@@ -136,6 +186,22 @@ class CVaRPPOAgent:
                 dist = Normal(action_mean, action_std)
                 action = dist.sample()
                 log_prob = dist.log_prob(action).sum(dim=-1)
+                
+                # 检查采样结果
+                if torch.any(torch.isnan(action)) or torch.any(torch.isnan(log_prob)):
+                    self.numerical_issues['nan_actions'] += 1
+                    
+                    # 使用限制器控制日志频率
+                    throttled_warning(
+                        logger,
+                        "动作采样产生NaN，使用确定性动作",
+                        "nan_action_sampling",
+                        min_interval=30.0,  # 30秒间隔
+                        max_per_minute=1    # 每分钟最多1次
+                    )
+                    
+                    action = action_mean
+                    log_prob = torch.tensor(0.0)
         
         return (action.cpu().numpy().flatten(), 
                 log_prob.cpu().item(), 
@@ -195,6 +261,14 @@ class CVaRPPOAgent:
                 # 前向传播
                 action_mean, action_std, values, cvar_pred = self.network(batch_states)
                 
+                # 检查网络输出是否包含NaN
+                if torch.any(torch.isnan(action_mean)) or torch.any(torch.isnan(action_std)):
+                    logger.error("训练中网络输出包含NaN，跳过此批次")
+                    continue
+                
+                # 确保action_std不会太小或太大
+                action_std = torch.clamp(action_std, min=1e-6, max=1.0)
+                
                 # 计算新的对数概率
                 dist = Normal(action_mean, action_std)
                 new_log_probs = dist.log_prob(batch_actions).sum(dim=-1)
@@ -205,22 +279,59 @@ class CVaRPPOAgent:
                     values, batch_returns, cvar_pred, batch_cvar_target
                 )
                 
+                # 检查损失是否为NaN
+                if torch.isnan(loss):
+                    self.numerical_issues['nan_losses'] += 1
+                    
+                    # 使用统计性日志
+                    statistical_warning(
+                        logger,
+                        "训练损失数值异常",
+                        f"第{self.numerical_issues['nan_losses']}次损失NaN",
+                        report_interval=20  # 每20次报告一次
+                    )
+                    
+                    continue
+                
                 # 反向传播
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
+                
+                # 检查梯度是否包含NaN
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), 0.5)
+                if torch.isnan(grad_norm):
+                    self.numerical_issues['nan_gradients'] += 1
+                    
+                    # 使用限制器控制日志频率
+                    throttled_warning(
+                        logger,
+                        "梯度包含NaN，跳过此次更新",
+                        "nan_gradients",
+                        min_interval=20.0,  # 20秒间隔  
+                        max_per_minute=2    # 每分钟最多2次
+                    )
+                    
+                    continue
+                
                 self.optimizer.step()
                 
                 epoch_losses.append(loss.item())
             
             total_losses.extend(epoch_losses)
         
+        # 更新学习率
+        self.scheduler.step()
+        
         # 清空记忆
         self._clear_memory()
         
+        # 检查网络健康状态
+        self._check_network_health()
+        
         return {
-            'total_loss': np.mean(total_losses),
-            'avg_cvar_estimate': torch.mean(cvar_estimates).item()
+            'total_loss': np.mean(total_losses) if total_losses else 0.0,
+            'avg_cvar_estimate': torch.mean(cvar_estimates).item(),
+            'learning_rate': self.scheduler.get_last_lr()[0]
         }
     
     def _compute_gae(self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -316,3 +427,38 @@ class CVaRPPOAgent:
         checkpoint = torch.load(filepath, map_location=self.device)
         self.network.load_state_dict(checkpoint['network_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    def _check_network_health(self):
+        """检查网络健康状态"""
+        for name, param in self.network.named_parameters():
+            if torch.any(torch.isnan(param)):
+                logger.error(f"网络参数 {name} 包含NaN值，重新初始化网络")
+                self.network = ActorCriticNetwork(self.state_dim, self.action_dim, self.hidden_dim).to(self.device)
+                self.optimizer = torch.optim.Adam(self.network.parameters(), lr=self.lr, eps=1e-8)
+                self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.95)
+                break
+    
+    def get_numerical_issues_summary(self) -> str:
+        """获取数值稳定性问题统计"""
+        total_issues = sum(self.numerical_issues.values())
+        if total_issues == 0:
+            return "训练过程中无数值稳定性问题"
+        
+        summary_lines = [f"数值稳定性问题统计 (总计: {total_issues})"]
+        for issue_type, count in self.numerical_issues.items():
+            if count > 0:
+                issue_name = {
+                    'nan_states': 'NaN状态输入',
+                    'nan_actions': 'NaN动作采样', 
+                    'nan_losses': 'NaN训练损失',
+                    'nan_gradients': 'NaN梯度'
+                }.get(issue_type, issue_type)
+                percentage = (count / total_issues) * 100
+                summary_lines.append(f"  - {issue_name}: {count}次 ({percentage:.1f}%)")
+        
+        return '\n'.join(summary_lines)
+        
+    def reset_numerical_issues_counts(self):
+        """重置数值稳定性问题计数"""
+        for key in self.numerical_issues:
+            self.numerical_issues[key] = 0

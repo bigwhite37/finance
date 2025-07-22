@@ -12,20 +12,20 @@ def get_default_config() -> dict:
             'region': 'cn',
             'universe': 'csi300',
             'provider_uri': '~/.qlib/qlib_data/cn_data',
-            'start_date': '2020-01-01',
+            'start_date': '2019-01-01',  # 提前开始时间以获得更多历史数据
             'end_date': '2023-12-31'
         },
         
         # 因子配置
         'factors': {
             'default_factors': [
-                'return_20d', 'return_60d', 
+                'return_5d', 'return_20d', 
                 'volume_ratio', 'price_momentum',
-                'volatility_60d', 'rsi_14d',
-                'ma_ratio_20d', 'turnover_rate'
+                'volatility_20d', 'rsi_14d',
+                'ma_ratio_10d', 'turnover_rate'
             ],
-            'low_vol_threshold': 0.2,
-            'low_vol_window': 60
+            'low_vol_threshold': 0.5,  # 放宽阈值
+            'low_vol_window': 20  # 缩短窗口
         },
         
         # 强化学习环境配置
@@ -42,14 +42,14 @@ def get_default_config() -> dict:
         # CVaR-PPO智能体配置
         'agent': {
             'hidden_dim': 256,
-            'learning_rate': 3e-4,
+            'learning_rate': 1e-5,  # 大幅降低学习率防止梯度爆炸
             'clip_epsilon': 0.2,
-            'ppo_epochs': 10,
-            'batch_size': 64,
+            'ppo_epochs': 5,  # 减少训练轮数
+            'batch_size': 32,  # 减小批次大小
             'gamma': 0.99,
             'lambda_gae': 0.95,
             'cvar_alpha': 0.05,
-            'cvar_lambda': 1.0,
+            'cvar_lambda': 0.5,  # 减少CVaR权重
             'cvar_threshold': -0.02
         },
         
@@ -116,12 +116,12 @@ def get_default_config() -> dict:
         
         # 训练配置
         'training': {
-            'total_episodes': 1000,
+            'total_episodes': 500,  # 减少总训练轮数
             'max_steps_per_episode': 252,
-            'update_frequency': 100,
-            'save_frequency': 200,
-            'evaluation_frequency': 50,
-            'early_stopping_patience': 100,
+            'update_frequency': 50,  # 更频繁的更新
+            'save_frequency': 100,  # 更频繁的保存
+            'evaluation_frequency': 25,
+            'early_stopping_patience': 50,
             'min_improvement': 0.01
         },
         

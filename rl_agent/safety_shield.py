@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Tuple
 import logging
+from utils.logging_utils import throttled_warning, statistical_warning
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,19 @@ class SafetyShield:
         self.price_history = []
         self.return_history = []
         self.portfolio_history = []
+        
+        # 收益率缓存 - 避免重复计算
+        self._cached_returns = None
+        self._cache_timestamp = None
+        
+        # 风险事件统计
+        self.risk_event_counts = {
+            'leverage_constraint': 0,
+            'var_constraint': 0,
+            'volatility_constraint': 0,
+            'drawdown_constraint': 0,
+            'market_regime': 0
+        }
         
     def shield_action(self, 
                      action: np.ndarray, 
@@ -86,7 +100,16 @@ class SafetyShield:
         if total_leverage > self.max_leverage:
             scaling_factor = self.max_leverage / total_leverage
             action = action * scaling_factor
-            logger.warning(f"杠杆约束触发，缩放因子: {scaling_factor:.3f}")
+            self.risk_event_counts['leverage_constraint'] += 1
+            
+            # 使用限制器控制日志频率
+            throttled_warning(
+                logger,
+                f"杠杆约束触发，缩放因子: {scaling_factor:.3f}",
+                "leverage_constraint",
+                min_interval=10.0,  # 10秒间隔
+                max_per_minute=2    # 每分钟最多2次
+            )
         
         return action
     
@@ -97,24 +120,47 @@ class SafetyShield:
         """检查VaR约束"""
         if len(price_data) < self.lookback_window:
             return action
+        
+        # 使用缓存避免重复计算收益率
+        current_timestamp = id(price_data)
+        if (self._cached_returns is None or 
+            self._cache_timestamp != current_timestamp or 
+            len(self._cached_returns) != len(price_data)):
             
-        # 计算历史收益率协方差矩阵
-        returns = price_data.pct_change().dropna()
-        if len(returns) < self.lookback_window:
+            # 只计算必要的收益率（最近的lookback_window期间）
+            recent_prices = price_data.iloc[-min(self.lookback_window + 1, len(price_data)):]
+            self._cached_returns = recent_prices.pct_change(fill_method=None).dropna()
+            self._cache_timestamp = current_timestamp
+        
+        if len(self._cached_returns) < self.lookback_window:
             return action
             
-        recent_returns = returns.iloc[-self.lookback_window:]
-        cov_matrix = recent_returns.cov().values
+        # 使用最近的数据计算协方差矩阵
+        recent_returns = self._cached_returns.iloc[-self.lookback_window:]
         
-        # 预测组合VaR
-        portfolio_variance = np.dot(action, np.dot(cov_matrix, action))
-        predicted_var = -1.645 * np.sqrt(portfolio_variance)  # 95% VaR
+        # 简化协方差计算 - 只使用对角线（独立资产假设）
+        if len(recent_returns.columns) != len(action):
+            return action
+            
+        # 使用简化的风险模型：只考虑波动率，不考虑相关性
+        volatilities = recent_returns.std().values
+        portfolio_volatility = np.sqrt(np.sum((action * volatilities) ** 2))
+        predicted_var = -1.645 * portfolio_volatility  # 95% VaR
         
         # 如果VaR超出阈值，减少仓位
         if abs(predicted_var) > self.var_threshold:
             reduction_factor = self.var_threshold / abs(predicted_var)
             action = action * reduction_factor
-            logger.warning(f"VaR约束触发，预测VaR: {predicted_var:.4f}, 减少因子: {reduction_factor:.3f}")
+            self.risk_event_counts['var_constraint'] += 1
+            
+            # 使用限制器控制日志频率
+            throttled_warning(
+                logger,
+                f"VaR约束触发，预测VaR: {predicted_var:.4f}, 减少因子: {reduction_factor:.3f}",
+                "var_constraint",
+                min_interval=15.0,  # 15秒间隔
+                max_per_minute=2    # 每分钟最多2次
+            )
         
         return action
     
@@ -135,7 +181,16 @@ class SafetyShield:
             if max_change > 0.05:  # 单次最大调整5%
                 scaling_factor = 0.05 / max_change
                 action = current_portfolio + (action - current_portfolio) * scaling_factor
-                logger.warning(f"波动率约束触发，当前波动率: {current_vol:.4f}, 缩放因子: {scaling_factor:.3f}")
+                self.risk_event_counts['volatility_constraint'] += 1
+                
+                # 使用限制器控制日志频率
+                throttled_warning(
+                    logger,
+                    f"波动率约束触发，当前波动率: {current_vol:.4f}, 缩放因子: {scaling_factor:.3f}",
+                    "volatility_constraint",
+                    min_interval=15.0,  # 15秒间隔
+                    max_per_minute=2    # 每分钟最多2次
+                )
         
         return action
     
@@ -148,7 +203,16 @@ class SafetyShield:
             # 减少总仓位
             reduction_factor = 0.5  # 减仓50%
             action = action * reduction_factor
-            logger.warning(f"回撤约束触发，当前回撤: {current_drawdown:.4f}, 强制减仓至: {reduction_factor}")
+            self.risk_event_counts['drawdown_constraint'] += 1
+            
+            # 使用限制器控制日志频率
+            throttled_warning(
+                logger,
+                f"回撤约束触发，当前回撤: {current_drawdown:.4f}, 强制减仓至: {reduction_factor}",
+                "drawdown_constraint",
+                min_interval=5.0,   # 5秒间隔（回撤比较紧急）
+                max_per_minute=3    # 每分钟最多3次
+            )
         
         return action
     
@@ -161,7 +225,16 @@ class SafetyShield:
         if market_volatility > 0.3:  # 假设30%为高波动阈值
             defensive_factor = 0.7
             action = action * defensive_factor
-            logger.warning(f"高波动市场环境，市场波动率: {market_volatility:.4f}, 防守因子: {defensive_factor}")
+            self.risk_event_counts['market_regime'] += 1
+            
+            # 使用限制器控制日志频率
+            throttled_warning(
+                logger,
+                f"高波动市场环境，市场波动率: {market_volatility:.4f}, 防守因子: {defensive_factor}",
+                "market_regime",
+                min_interval=20.0,  # 20秒间隔
+                max_per_minute=1    # 每分钟最多1次
+            )
         
         return action
     
@@ -230,3 +303,29 @@ class SafetyShield:
             return False, f"回撤超限: {current_drawdown:.4f} > {self.max_drawdown_threshold}"
         
         return True, "安全"
+    
+    def get_risk_event_summary(self) -> str:
+        """获取风险事件统计摘要"""
+        total_events = sum(self.risk_event_counts.values())
+        if total_events == 0:
+            return "无风险约束触发事件"
+        
+        summary_lines = [f"风险约束触发统计 (总计: {total_events})"]
+        for event_type, count in self.risk_event_counts.items():
+            if count > 0:
+                percentage = (count / total_events) * 100
+                event_name = {
+                    'leverage_constraint': '杠杆约束',
+                    'var_constraint': 'VaR约束', 
+                    'volatility_constraint': '波动率约束',
+                    'drawdown_constraint': '回撤约束',
+                    'market_regime': '市场环境调整'
+                }.get(event_type, event_type)
+                summary_lines.append(f"  - {event_name}: {count}次 ({percentage:.1f}%)")
+        
+        return '\n'.join(summary_lines)
+    
+    def reset_risk_event_counts(self):
+        """重置风险事件计数"""
+        for key in self.risk_event_counts:
+            self.risk_event_counts[key] = 0

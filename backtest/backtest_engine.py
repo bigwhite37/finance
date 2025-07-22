@@ -45,7 +45,8 @@ class BacktestEngine:
                     env,
                     start_date: str,
                     end_date: str,
-                    benchmark_data: Optional[pd.DataFrame] = None) -> Dict:
+                    benchmark_data: Optional[pd.DataFrame] = None,
+                    safety_shield=None) -> Dict:
         """
         执行策略回测
         
@@ -63,6 +64,8 @@ class BacktestEngine:
         
         # 初始化
         self._initialize_backtest()
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = pd.to_datetime(end_date)
         
         # 重置环境
         state, info = env.reset()
@@ -73,11 +76,16 @@ class BacktestEngine:
             # 获取智能体动作
             action, log_prob, value, cvar_estimate = agent.get_action(state, deterministic=True)
             
-            # 执行动作
-            next_state, reward, terminated, truncated, info = env.step(action)
+            # 应用安全保护层
+            safe_action = action
+            if safety_shield is not None:
+                safe_action = safety_shield.shield_action(action, info)
             
-            # 记录交易信息
-            self._record_step(action, state, info, step_count)
+            # 执行动作
+            next_state, reward, terminated, truncated, info = env.step(safe_action)
+            
+            # 记录交易信息（使用受保护的动作）
+            self._record_step(safe_action, state, info, step_count)
             
             # 更新状态
             state = next_state
@@ -102,10 +110,13 @@ class BacktestEngine:
     
     def _record_step(self, action: np.ndarray, state: np.ndarray, info: Dict, step: int):
         """记录每步的交易信息"""
+        # 计算当前日期（历史回测日期）
+        current_date = self.start_date + pd.Timedelta(days=step)
+        
         # 记录组合信息
         portfolio_info = {
             'step': step,
-            'date': pd.Timestamp.now() + pd.Timedelta(days=step),  # 模拟日期
+            'date': current_date,
             'portfolio_value': info.get('portfolio_value', 1.0),
             'total_return': info.get('total_return', 0.0),
             'max_drawdown': info.get('max_drawdown', 0.0),

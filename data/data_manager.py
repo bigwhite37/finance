@@ -114,14 +114,45 @@ class DataManager:
     
     def _get_universe_stocks(self, start_time: str, end_time: str) -> List[str]:
         """获取股票池"""
+        import os
+        from pathlib import Path
+        
+        # 获取qlib数据路径
+        qlib_data_path = Path.home() / '.qlib' / 'qlib_data' / 'cn_data' / 'instruments'
+        
+        # 根据股票池选择对应文件
         if self.universe == "csi300":
-            instruments = D.instruments(market="csi300")
-        elif self.universe == "csi500": 
-            instruments = D.instruments(market="csi500")
+            instrument_file = qlib_data_path / "csi300.txt"
+        elif self.universe == "csi500":
+            instrument_file = qlib_data_path / "csi500.txt"
+        elif self.universe == "csi1000":
+            instrument_file = qlib_data_path / "csi1000.txt"
         else:
-            instruments = D.instruments(market="all")
+            instrument_file = qlib_data_path / "all.txt"
+        
+        instruments = []
+        if instrument_file.exists():
+            try:
+                with open(instrument_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 1:
+                            # 转换格式：SZ000001 -> sz000001 (qlib内部格式)
+                            instrument = parts[0].lower()
+                            instruments.append(instrument)
+                logger.info(f"从{instrument_file}加载了{len(instruments)}只股票")
+            except Exception as e:
+                logger.error(f"读取股票池文件失败: {e}")
+        else:
+            logger.warning(f"股票池文件不存在: {instrument_file}")
+            # 使用一些默认的股票代码作为fallback
+            instruments = [
+                '000001.SZ', '000002.SZ', '000858.SZ', '002415.SZ',
+                '600000.SH', '600036.SH', '600519.SH', '600887.SH'
+            ]
+            logger.info(f"使用默认股票池，共{len(instruments)}只股票")
             
-        return list(instruments) if instruments else []
+        return instruments
     
     def _clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """数据清洗"""
@@ -131,8 +162,18 @@ class DataManager:
         # 去除异常值
         data = data.replace([np.inf, -np.inf], np.nan)
         
+        # 去除零值和负值价格（对于价格数据）
+        price_columns = ['$open', '$high', '$low', '$close', '$vwap']
+        for col in data.columns:
+            if any(price_col in str(col) for price_col in price_columns):
+                # 价格数据不能为零或负数
+                data[col] = data[col].where(data[col] > 0.001)
+        
         # 填充缺失值 - 使用前值填充
-        data = data.fillna(method='ffill').fillna(method='bfill')
+        data = data.ffill().bfill()
+        
+        # 最终检查：确保没有NaN或异常值
+        data = data.ffill().fillna(100)  # 备用填充值
         
         return data
     

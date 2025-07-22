@@ -116,17 +116,26 @@ class FactorEngine:
         Returns:
             低波动股票列表
         """
+        if len(price_data) < window:
+            logger.warning(f"数据长度 {len(price_data)} 小于窗口 {window}，使用前100只股票")
+            return price_data.columns[:100].tolist()
+        
         # 计算收益率
-        returns = price_data.pct_change()
+        returns = price_data.pct_change(fill_method=None)
         
         # 计算滚动波动率
         volatility = returns.rolling(window=window).std() * np.sqrt(252)
         
         # 计算平均波动率
-        avg_volatility = volatility.mean()
+        avg_volatility = volatility.mean().dropna()
         
         # 筛选低波动股票
         low_vol_stocks = avg_volatility[avg_volatility < threshold].index.tolist()
+        
+        # 如果筛选结果为空，使用波动率最小的前100只
+        if len(low_vol_stocks) == 0:
+            logger.warning(f"阈值 {threshold} 太严格，筛选出0只股票，使用波动率最小的前100只")
+            low_vol_stocks = avg_volatility.nsmallest(100).index.tolist()
         
         logger.info(f"筛选出 {len(low_vol_stocks)} 只低波动股票")
         return low_vol_stocks
@@ -221,13 +230,25 @@ class FactorEngine:
         factor_data = factor_data.replace([np.inf, -np.inf], np.nan)
         
         # 填充缺失值
-        factor_data = factor_data.fillna(method='ffill').fillna(0)
+        factor_data = factor_data.ffill().bfill().fillna(0)
         
-        # 异常值处理
+        # 异常值处理 - 更严格的限制
         for col in factor_data.columns:
-            q01 = factor_data[col].quantile(0.01)
-            q99 = factor_data[col].quantile(0.99)
-            factor_data[col] = factor_data[col].clip(lower=q01, upper=q99)
+            # 使用IQR方法检测异常值
+            Q1 = factor_data[col].quantile(0.25)
+            Q3 = factor_data[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 3 * IQR
+            upper_bound = Q3 + 3 * IQR
+            factor_data[col] = factor_data[col].clip(lower=lower_bound, upper=upper_bound)
+            
+            # 最终NaN检查
+            if factor_data[col].isna().any():
+                factor_data[col] = factor_data[col].fillna(factor_data[col].median())
+        
+        # 最终数值稳定性验证
+        assert not factor_data.isna().any().any(), "因子数据仍包含NaN值"
+        assert not np.isinf(factor_data.values).any(), "因子数据仍包含无穷值"
         
         return factor_data
     

@@ -21,18 +21,34 @@ from risk_control import RiskController
 from backtest import BacktestEngine
 
 
-def setup_logging(config):
+def setup_logging(config, mode='train', verbose=False):
     """设置日志"""
     log_config = config.get('logging', {})
     log_dir = log_config.get('log_dir', './logs')
     
     os.makedirs(log_dir, exist_ok=True)
     
+    # 训练模式使用更安静的日志级别（除非显式启用verbose）
+    if mode == 'train' and not verbose:
+        base_level = logging.INFO  # 保持INFO级别以显示进度
+        # 只抑制特定的噪音日志
+        noisy_loggers = [
+            'rl_agent.safety_shield', 
+            'rl_agent.cvar_ppo_agent'
+        ]
+        for logger_name in noisy_loggers:
+            logging.getLogger(logger_name).setLevel(logging.ERROR)
+        
+        # 保持重要进度日志可见
+        logging.getLogger('__main__').setLevel(logging.INFO)
+    else:
+        base_level = getattr(logging, log_config.get('level', 'INFO'))
+    
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = os.path.join(log_dir, f'trading_system_{timestamp}.log')
     
     logging.basicConfig(
-        level=getattr(logging, log_config.get('level', 'INFO')),
+        level=base_level,
         format=log_config.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s'),
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
@@ -41,7 +57,11 @@ def setup_logging(config):
     )
     
     logger = logging.getLogger(__name__)
-    logger.info(f"日志系统初始化完成，日志文件: {log_file}")
+    if mode == 'train' and not verbose:
+        logger.warning(f"训练模式 - 使用简化日志输出，详细日志请查看: {log_file}")
+        logger.warning("提示: 使用 --verbose 或 -v 参数启用详细日志输出")
+    else:
+        logger.info(f"日志系统初始化完成，日志文件: {log_file}")
     return logger
 
 
@@ -98,25 +118,41 @@ def prepare_data(data_manager, factor_engine, config):
     logger.info(f"价格数据形状: {price_data.shape}")
     
     # 筛选低波动股票池
+    logger.info("正在筛选低波动股票池...")
     low_vol_stocks = factor_engine.filter_low_volatility_universe(
         price_data,
-        threshold=config.get_value('factors.low_vol_threshold', 0.2),
+        threshold=config.get_value('factors.low_vol_threshold', 0.5),  # 放宽到50%
         window=config.get_value('factors.low_vol_window', 60)
     )
+    logger.info("股票池筛选完成")
     
     # 过滤价格数据
     if low_vol_stocks:
         price_data = price_data[low_vol_stocks]
         logger.info(f"筛选后股票数量: {len(low_vol_stocks)}")
+    else:
+        # 如果没有筛选出股票，使用前100只股票
+        logger.warning("低波动筛选未找到股票，使用前100只股票")
+        price_data = price_data.iloc[:, :100]
+        logger.info(f"使用前100只股票: {price_data.shape[1]}")
     
     # 计算因子
     logger.info("正在计算因子...")
-    factor_data = factor_engine.calculate_all_factors(price_data)
+    # 从原始股票数据中提取成交量数据
+    logger.info("正在提取成交量数据...")
+    volume_data = stock_data['$volume'].unstack()
+    if not low_vol_stocks:
+        volume_data = volume_data.iloc[:, :100]
+    else:
+        volume_data = volume_data[low_vol_stocks]
+    
+    logger.info("正在计算技术因子（预计需要10-30秒）...")
+    factor_data = factor_engine.calculate_all_factors(price_data, volume_data)
     
     if factor_data.empty:
         raise ValueError("未能计算出因子数据")
     
-    logger.info(f"因子数据形状: {factor_data.shape}")
+    logger.info(f"因子计算完成! 因子数据形状: {factor_data.shape}")
     
     return price_data, factor_data
 
@@ -150,7 +186,12 @@ def train_agent(price_data, factor_data, config_manager, systems):
     best_sharpe = float('-inf')
     episode_rewards = []
     
+    logger.info(f"开始训练: 总共 {total_episodes} 个episode")
+    
     for episode in range(total_episodes):
+        # 定期显示进度
+        if episode % 10 == 0:
+            logger.info(f"训练进度: Episode {episode}/{total_episodes} ({episode/total_episodes*100:.1f}%)")
         state, info = environment.reset()
         episode_reward = 0
         step_count = 0
@@ -199,6 +240,22 @@ def train_agent(price_data, factor_data, config_manager, systems):
                 agent.save_model(model_path)
                 logger.info(f"保存最佳模型: {model_path}, Sharpe: {current_sharpe:.4f}")
     
+    # 生成训练统计报告
+    logger.warning("=" * 60)
+    logger.warning("训练完成统计报告")
+    logger.warning("=" * 60)
+    
+    # 安全保护层统计
+    if hasattr(safety_shield, 'get_risk_event_summary'):
+        risk_summary = safety_shield.get_risk_event_summary()
+        logger.warning(f"安全保护层统计:\n{risk_summary}")
+    
+    # 智能体数值稳定性统计  
+    if hasattr(agent, 'get_numerical_issues_summary'):
+        numerical_summary = agent.get_numerical_issues_summary()
+        logger.warning(f"智能体数值稳定性:\n{numerical_summary}")
+    
+    logger.warning("=" * 60)
     logger.info("训练完成")
     return agent, environment, safety_shield
 
@@ -221,7 +278,8 @@ def run_backtest(agent, environment, safety_shield, config_manager, systems):
         agent=agent,
         env=environment,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        safety_shield=safety_shield
     )
     
     # 生成报告
@@ -247,6 +305,8 @@ def main():
     parser.add_argument('--mode', type=str, choices=['train', 'backtest', 'full'], 
                        default='full', help='运行模式')
     parser.add_argument('--model', type=str, help='加载预训练模型路径')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='启用详细日志输出（训练模式下默认使用简化日志）')
     
     args = parser.parse_args()
     
@@ -258,7 +318,7 @@ def main():
         sys.exit(1)
     
     # 设置日志
-    logger = setup_logging(config_manager.config)
+    logger = setup_logging(config_manager.config, args.mode, args.verbose)
     
     # 打印配置摘要
     config_manager.print_config_summary()

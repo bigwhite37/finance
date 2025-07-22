@@ -119,7 +119,15 @@ class TradingEnvironment(gym.Env):
         # 计算收益
         if self.current_step < len(self.price_data):
             returns = self._calculate_portfolio_return()
-            self.portfolio_value *= (1 + returns - transaction_costs)
+            
+            # 保护组合价值计算
+            new_value = self.portfolio_value * (1 + returns - transaction_costs)
+            if np.isfinite(new_value) and new_value > 0:
+                self.portfolio_value = new_value
+            else:
+                # 如果计算出现问题，保持当前价值不变
+                logger.warning(f"组合价值计算异常: returns={returns}, transaction_costs={transaction_costs}")
+                
             self.portfolio_returns.append(returns)
             
             # 更新回撤统计
@@ -185,6 +193,10 @@ class TradingEnvironment(gym.Env):
         # 合并观测
         observation = np.concatenate([factor_obs, macro_obs, portfolio_obs])
         
+        # 数值稳定性检查
+        observation = np.where(np.isfinite(observation), observation, 0.0)
+        observation = np.clip(observation, -1000, 1000)  # 限制极值
+        
         return observation.astype(np.float32)
     
     def _calculate_portfolio_return(self) -> float:
@@ -196,12 +208,23 @@ class TradingEnvironment(gym.Env):
         current_prices = self.price_data.iloc[self.current_step]
         previous_prices = self.price_data.iloc[self.current_step - 1]
         
-        # 计算个股收益率
-        stock_returns = (current_prices - previous_prices) / previous_prices
+        # 安全除法：避免除零和负价格
+        mask = (previous_prices > 0.001)  # 避免零或极小值
+        stock_returns = np.zeros_like(current_prices)
+        
+        # 只对有效价格计算收益率
+        stock_returns[mask] = (current_prices[mask] - previous_prices[mask]) / previous_prices[mask]
+        
+        # 限制极端收益率
+        stock_returns = np.clip(stock_returns, -0.5, 0.5)  # 限制在±50%
         
         # 计算组合收益率
         portfolio_return = np.dot(self.portfolio_weights, stock_returns)
         
+        # 确保返回值数值稳定
+        if not np.isfinite(portfolio_return):
+            portfolio_return = 0.0
+            
         return portfolio_return
     
     def _update_drawdown_stats(self):
@@ -231,8 +254,8 @@ class TradingEnvironment(gym.Env):
             cvar_95 = np.mean(recent_returns[recent_returns <= var_95])
             cvar_penalty = self.lambda2 * max(0, -cvar_95 - 0.02)  # CVaR超过2%则惩罚
         
-        # 交易成本惩罚
-        cost_penalty = transaction_costs * 10  # 放大交易成本影响
+        # 交易成本惩罚 - 降低影响避免过度保守
+        cost_penalty = transaction_costs * 3
         
         reward = base_reward - drawdown_penalty - cvar_penalty - cost_penalty
         
@@ -240,12 +263,12 @@ class TradingEnvironment(gym.Env):
     
     def _check_termination(self) -> bool:
         """检查终止条件"""
-        # 破产检查
-        if self.portfolio_value < 0.8:  # 亏损超过20%终止
+        # 破产检查 - 放宽至30%亏损
+        if self.portfolio_value < 0.7:
             return True
             
-        # 极端回撤检查
-        if self.max_drawdown > 0.15:  # 最大回撤超过15%终止
+        # 极端回撤检查 - 放宽至25%回撤
+        if self.max_drawdown > 0.25:
             return True
             
         return False

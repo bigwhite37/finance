@@ -43,13 +43,23 @@ class AlphaFactors:
         
         return pd.DataFrame(factor_results)
     
+    def calculate_return_5d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
+        """计算5日收益率"""
+        if len(price_data) < 5:
+            return pd.Series(0.0, index=price_data.columns)
+        return price_data.pct_change(periods=5, fill_method=None).iloc[-1].fillna(0)
+    
     def calculate_return_20d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算20日收益率"""
-        return price_data.pct_change(periods=20).iloc[-1]
+        if len(price_data) < 20:
+            return pd.Series(0.0, index=price_data.columns)
+        return price_data.pct_change(periods=20, fill_method=None).iloc[-1].fillna(0)
     
     def calculate_return_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算60日收益率"""
-        return price_data.pct_change(periods=60).iloc[-1]
+        if len(price_data) < 60:
+            return pd.Series(0.0, index=price_data.columns)
+        return price_data.pct_change(periods=60, fill_method=None).iloc[-1].fillna(0)
     
     def calculate_price_momentum(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算价格动量因子"""
@@ -59,7 +69,7 @@ class AlphaFactors:
         else:
             window = 232  # 12个月 - 1个月
             
-        long_return = price_data.pct_change(periods=window)
+        long_return = price_data.pct_change(periods=window, fill_method=None)
         return long_return.iloc[-1]
     
     def calculate_rsi_14d(self, price_data: pd.DataFrame, volume_data=None, window: int = 14) -> pd.Series:
@@ -78,16 +88,26 @@ class AlphaFactors:
         
         return price_data.apply(rsi_single)
     
+    def calculate_ma_ratio_10d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
+        """计算10日均线比率"""
+        if len(price_data) < 10:
+            return pd.Series(0.0, index=price_data.columns)
+        ma_10 = price_data.rolling(window=10).mean()
+        current_price = price_data.iloc[-1]
+        return (current_price / ma_10.iloc[-1] - 1).fillna(0)
+    
     def calculate_ma_ratio_20d(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算20日均线比率"""
+        if len(price_data) < 20:
+            return pd.Series(0.0, index=price_data.columns)
         ma_20 = price_data.rolling(window=20).mean()
         current_price = price_data.iloc[-1]
-        return current_price / ma_20.iloc[-1] - 1
+        return (current_price / ma_20.iloc[-1] - 1).fillna(0)
     
     def calculate_price_reversal(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算短期价格反转因子"""
         # 使用过去5日收益率的负值作为反转因子
-        short_return = price_data.pct_change(periods=5).iloc[-1]
+        short_return = price_data.pct_change(periods=5, fill_method=None).iloc[-1]
         return -short_return
     
     def calculate_volume_price_trend(self, 
@@ -98,10 +118,10 @@ class AlphaFactors:
             return pd.Series(index=price_data.columns, dtype=float)
         
         # 价格变化
-        price_change = price_data.pct_change()
+        price_change = price_data.pct_change(fill_method=None)
         
         # 成交量变化
-        volume_change = volume_data.pct_change()
+        volume_change = volume_data.pct_change(fill_method=None)
         
         # 计算量价相关性
         correlation = price_change.rolling(window=20).corr(volume_change.rolling(window=20))
@@ -156,9 +176,9 @@ class AlphaFactors:
     def calculate_momentum_quality(self, price_data: pd.DataFrame, volume_data=None) -> pd.Series:
         """计算动量质量因子"""
         # 计算不同周期的动量
-        mom_5d = price_data.pct_change(periods=5)
-        mom_20d = price_data.pct_change(periods=20)
-        mom_60d = price_data.pct_change(periods=60)
+        mom_5d = price_data.pct_change(periods=5, fill_method=None)
+        mom_20d = price_data.pct_change(periods=20, fill_method=None)
+        mom_60d = price_data.pct_change(periods=60, fill_method=None)
         
         # 动量一致性得分
         momentum_consistency = (
