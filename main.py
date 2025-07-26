@@ -7,6 +7,7 @@ import sys
 import argparse
 import logging
 from datetime import datetime
+import pickle
 import pandas as pd
 import numpy as np
 
@@ -97,7 +98,7 @@ def initialize_system(config_manager):
     }
 
 
-def prepare_data(data_manager, factor_engine, config):
+def prepare_data(data_manager, factor_engine, config, mode='train'):
     """准备训练和回测数据"""
     logger = logging.getLogger(__name__)
     
@@ -115,42 +116,92 @@ def prepare_data(data_manager, factor_engine, config):
     
     # 获取价格数据
     price_data = stock_data['$close'].unstack()
+    price_data = price_data.T
     logger.info(f"价格数据形状: {price_data.shape}")
     
-    # 筛选低波动股票池
-    logger.info("正在筛选低波动股票池...")
-    low_vol_stocks = factor_engine.filter_low_volatility_universe(
-        price_data,
-        threshold=config.get_value('factors.low_vol_threshold', 0.5),  # 放宽到50%
-        window=config.get_value('factors.low_vol_window', 60)
-    )
-    logger.info("股票池筛选完成")
-    
-    # 过滤价格数据
-    if low_vol_stocks:
-        price_data = price_data[low_vol_stocks]
-        logger.info(f"筛选后股票数量: {len(low_vol_stocks)}")
+    # 根据模式处理股票池
+    if mode == 'backtest':
+        # 回测模式：加载训练时保存的股票池
+        import pickle
+        try:
+            with open('./models/selected_stocks.pkl', 'rb') as f:
+                selected_stocks = pickle.load(f)
+            logger.info(f"已加载训练时的股票池，包含 {len(selected_stocks)} 只股票")
+            # 过滤价格数据到相同的股票池
+            available_stocks = [s for s in selected_stocks if s in price_data.columns]
+            if len(available_stocks) < len(selected_stocks):
+                logger.warning(f"部分股票在回测期间不可用，使用 {len(available_stocks)} 只股票")
+            
+            # 如果可用股票太少，直接报错退出
+            if len(available_stocks) == 0:
+                logger.error("数据不匹配：训练时使用的股票池在回测期间完全不可用！")
+                logger.error("请检查数据源或重新训练模型。")
+                sys.exit(1)
+            
+            price_data = price_data[available_stocks]
+            low_vol_stocks = available_stocks
+        except FileNotFoundError:
+            logger.warning("未找到训练时的股票池文件，重新筛选")
+            # 如果没有保存的股票池，则重新筛选
+            low_vol_stocks = factor_engine.filter_low_volatility_universe(
+                price_data,
+                threshold=config.get_value('factors.low_vol_threshold', 0.5),
+                window=config.get_value('factors.low_vol_window', 60)
+            )
+            if low_vol_stocks:
+                price_data = price_data[low_vol_stocks]
+            else:
+                price_data = price_data.iloc[:, :100]
+                low_vol_stocks = list(price_data.columns)
     else:
-        # 如果没有筛选出股票，使用前100只股票
-        logger.warning("低波动筛选未找到股票，使用前100只股票")
-        price_data = price_data.iloc[:, :100]
-        logger.info(f"使用前100只股票: {price_data.shape[1]}")
+        # 训练模式：正常筛选低波动股票池
+        logger.info("正在筛选低波动股票池...")
+        low_vol_stocks = factor_engine.filter_low_volatility_universe(
+            price_data,
+            threshold=config.get_value('factors.low_vol_threshold', 0.5),  # 放宽到50%
+            window=config.get_value('factors.low_vol_window', 60)
+        )
+        logger.info("股票池筛选完成")
+        
+        # 过滤价格数据
+        if low_vol_stocks:
+            price_data = price_data[low_vol_stocks]
+            logger.info(f"筛选后股票数量: {len(low_vol_stocks)}")
+            # 保存股票池信息供回测使用
+            selected_stocks = low_vol_stocks
+        else:
+            # 如果没有筛选出股票，使用前100只股票
+            logger.warning("低波动筛选未找到股票，使用前100只股票")
+            price_data = price_data.iloc[:, :100]
+            selected_stocks = list(price_data.columns)
+            logger.info(f"使用前100只股票: {price_data.shape[1]}")
+        
+        # 保存股票池到文件
+        import pickle
+        os.makedirs('./models', exist_ok=True)
+        with open('./models/selected_stocks.pkl', 'wb') as f:
+            pickle.dump(selected_stocks, f)
+        logger.info(f"已保存股票池信息到 ./models/selected_stocks.pkl")
     
     # 计算因子
     logger.info("正在计算因子...")
     # 从原始股票数据中提取成交量数据
     logger.info("正在提取成交量数据...")
     volume_data = stock_data['$volume'].unstack()
-    if not low_vol_stocks:
-        volume_data = volume_data.iloc[:, :100]
-    else:
-        volume_data = volume_data[low_vol_stocks]
+    volume_data = volume_data.T
+    # 使用相同的股票池过滤成交量数据
+    volume_data = volume_data[low_vol_stocks]
     
     logger.info("正在计算技术因子（预计需要10-30秒）...")
     factor_data = factor_engine.calculate_all_factors(price_data, volume_data)
     
-    if factor_data.empty:
-        raise ValueError("未能计算出因子数据")
+    if isinstance(factor_data.index, pd.MultiIndex):
+        # The factor engine now returns a correctly shaped dataframe
+        # We just need to align it with the price data
+        factor_data = factor_data.unstack()
+        aligned_price, aligned_factor = price_data.align(factor_data, join='inner', axis=0)
+        price_data = aligned_price
+        factor_data = aligned_factor.stack().reorder_levels(['datetime', 'instrument'])
     
     logger.info(f"因子计算完成! 因子数据形状: {factor_data.shape}")
     
@@ -234,11 +285,23 @@ def train_agent(price_data, factor_data, config_manager, systems):
             if current_sharpe > best_sharpe:
                 best_sharpe = current_sharpe
                 model_dir = config_manager.get_value('model.save_dir', './models')
+                
+                # 确保路径是绝对路径
+                if not os.path.isabs(model_dir):
+                    # 获取main.py文件所在的目录作为项目根目录
+                    project_root = os.path.dirname(os.path.abspath(__file__))
+                    model_dir = os.path.join(project_root, model_dir)
+
                 os.makedirs(model_dir, exist_ok=True)
                 
                 model_path = os.path.join(model_dir, f"best_agent_episode_{episode}.pth")
                 agent.save_model(model_path)
-                logger.info(f"保存最佳模型: {model_path}, Sharpe: {current_sharpe:.4f}")
+                
+                # 增加验证步骤
+                if os.path.exists(model_path):
+                    logger.info(f"成功保存并验证模型: {model_path}, Sharpe: {current_sharpe:.4f}")
+                else:
+                    logger.error(f"严重错误: 模型保存失败，文件未找到: {model_path}")
     
     # 生成训练统计报告
     logger.warning("=" * 60)
@@ -330,7 +393,8 @@ def main():
     price_data, factor_data = prepare_data(
         systems['data_manager'], 
         systems['factor_engine'], 
-        config_manager
+        config_manager,
+        args.mode  # 传递模式参数
     )
     
     agent = None
@@ -347,8 +411,13 @@ def main():
         if agent is None and args.model:
             # 加载预训练模型
             logger.info(f"加载预训练模型: {args.model}")
+            
+            # 加载训练时的股票池
+            with open('./models/selected_stocks.pkl', 'rb') as f:
+                train_universe = pickle.load(f)
+
             env_config = config_manager.get_environment_config()
-            environment = TradingEnvironment(factor_data, price_data, env_config)
+            environment = TradingEnvironment(factor_data, price_data, env_config, train_universe=train_universe)
             
             agent_config = config_manager.get_agent_config()
             state_dim = environment.observation_space.shape[0]

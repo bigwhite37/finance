@@ -1,0 +1,154 @@
+# O2O强化学习配置模板
+# 此模板提供了O2O (Offline-to-Online) 强化学习的完整配置示例
+
+# O2O强化学习配置
+o2o:
+  # 离线预训练配置
+  offline_pretraining:
+    epochs: 100                    # 预训练轮数
+    behavior_cloning_weight: 0.5   # 行为克隆损失权重
+    td_learning_weight: 0.5        # TD学习损失权重
+    learning_rate: 1.0e-4          # 学习率
+    batch_size: 256                # 批次大小
+    save_checkpoints: true         # 是否保存检查点
+    checkpoint_frequency: 20       # 检查点保存频率
+
+  # 热身微调配置
+  warmup_finetuning:
+    days: 60                       # 热身数据天数
+    epochs: 20                     # 热身训练轮数
+    critic_only_updates: true      # 是否仅更新Critic
+    learning_rate: 5.0e-5          # 热身学习率
+    batch_size: 128                # 热身批次大小
+    convergence_threshold: 1.0e-4  # 收敛阈值
+    max_no_improvement: 5          # 最大无改善轮数
+
+  # 在线学习配置
+  online_learning:
+    initial_rho: 0.2               # 初始在线采样比例
+    rho_increment: 0.01            # 采样比例增量
+    max_rho: 1.0                   # 最大采样比例
+    trust_region_beta: 1.0         # 信任域参数
+    beta_decay: 0.99               # beta衰减因子
+    min_beta: 0.1                  # 最小beta值
+    learning_rate: 3.0e-4          # 在线学习率
+    batch_size: 64                 # 在线批次大小
+    update_frequency: 10           # 更新频率
+
+  # 漂移检测配置
+  drift_detection:
+    kl_threshold: 0.1              # KL散度阈值
+    sharpe_drop_threshold: 0.2     # 夏普率下降阈值
+    sharpe_window: 30              # 夏普率计算窗口
+    cvar_breach_threshold: -0.02   # CVaR突破阈值
+    cvar_consecutive_days: 3       # CVaR连续突破天数
+    monitoring_frequency: 5        # 监控频率
+    enable_auto_retraining: true   # 启用自动重训练
+
+  # 缓冲区配置
+  buffer_config:
+    online_buffer_size: 10000      # 在线缓冲区大小
+    priority_alpha: 0.6            # 优先级采样alpha参数
+    priority_beta: 0.4             # 优先级采样beta参数
+    time_decay_factor: 0.99        # 时间衰减因子
+    min_offline_ratio: 0.1         # 最小离线样本比例
+    fifo_eviction: true            # FIFO淘汰策略
+
+  # 风险约束配置
+  risk_constraints:
+    dynamic_cvar_lambda: true      # 启用动态CVaR权重
+    base_cvar_lambda: 1.0          # 基础CVaR权重
+    lambda_scaling_factor: 1.5     # 权重缩放因子
+    emergency_risk_multiplier: 2.0 # 紧急风险倍数
+    regime_aware_adjustment: true  # 制度感知调整
+
+  # 训练流程配置
+  training_flow:
+    enable_offline_pretraining: true    # 启用离线预训练
+    enable_warmup_finetuning: true      # 启用热身微调
+    enable_online_learning: true        # 启用在线学习
+    auto_stage_transition: true         # 自动阶段转换
+    save_intermediate_models: true      # 保存中间模型
+    model_versioning: true              # 模型版本管理
+
+  # 监控和日志配置
+  monitoring:
+    log_sampling_ratio: true       # 记录采样比例
+    log_drift_metrics: true        # 记录漂移指标
+    log_performance_metrics: true  # 记录性能指标
+    save_training_history: true    # 保存训练历史
+    generate_reports: true         # 生成报告
+    report_frequency: 50           # 报告频率
+
+# 智能体配置调整（支持O2O）
+agent:
+  split_optimizers: true          # 启用分离优化器
+  actor_lr: 3.0e-4               # Actor学习率
+  critic_lr: 1.0e-3              # Critic学习率
+  learning_rate: 3.0e-4          # 默认学习率
+  hidden_dim: 64                 # 隐藏层维度
+  clip_epsilon: 0.2              # PPO裁剪参数
+  ppo_epochs: 10                 # PPO训练轮数
+  batch_size: 256                # 批次大小
+  gamma: 0.99                    # 折扣因子
+  lambda_gae: 0.95               # GAE参数
+  cvar_alpha: 0.05               # CVaR置信水平
+  cvar_lambda: 1.0               # CVaR权重
+  cvar_threshold: -0.02          # CVaR阈值
+
+# 环境配置调整（支持O2O）
+environment:
+  mode_switching: true           # 启用模式切换
+  trajectory_collection: true   # 启用轨迹收集
+  regime_detection: true         # 启用制度检测
+  lookback_window: 20           # 回望窗口
+  transaction_cost: 0.001       # 交易成本
+  max_position: 0.1             # 最大仓位
+  max_leverage: 1.2             # 最大杠杆
+  lambda1: 2.0                  # 回撤惩罚系数
+  lambda2: 1.0                  # CVaR惩罚系数
+  max_dd_threshold: 0.05        # 最大回撤阈值
+
+# 训练配置调整（支持O2O）
+training:
+  o2o_enabled: true             # 启用O2O训练
+  stage_management: true        # 启用阶段管理
+  checkpoint_management: true   # 启用检查点管理
+  total_episodes: 1000          # 总训练轮数
+  max_steps_per_episode: 252    # 每轮最大步数
+  update_frequency: 50          # 更新频率
+  save_frequency: 100           # 保存频率
+  evaluation_frequency: 25      # 评估频率
+  early_stopping_patience: 50   # 早停耐心值
+  min_improvement: 0.01         # 最小改善值
+
+# 数据配置
+data:
+  provider: 'qlib'              # 数据提供商
+  region: 'cn'                  # 地区
+  universe: 'csi300'            # 股票池
+  start_date: '2019-01-01'      # 开始日期
+  end_date: '2023-12-31'        # 结束日期
+
+# 风险控制配置
+risk_control:
+  target_volatility: 0.12       # 目标波动率
+  max_position: 0.1             # 最大仓位
+  max_leverage: 1.2             # 最大杠杆
+  max_drawdown_threshold: 0.10  # 最大回撤阈值
+  enable_risk_parity: false     # 启用风险平价
+  alpha_weight: 0.7             # Alpha权重
+
+# 回测配置
+backtest:
+  initial_capital: 1000000      # 初始资金
+  transaction_cost: 0.001       # 交易成本
+  slippage: 0.0001             # 滑点
+  commission: 0.0005           # 佣金
+  risk_free_rate: 0.03         # 无风险利率
+
+# 日志配置
+logging:
+  level: 'INFO'                 # 日志级别
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  log_dir: './logs'             # 日志目录

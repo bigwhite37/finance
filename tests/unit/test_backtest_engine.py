@@ -65,6 +65,9 @@ class TestBacktestEngine(unittest.TestCase):
     
     def test_record_step(self):
         """测试步骤记录"""
+        # 设置必需的属性
+        self.backtest_engine.start_date = pd.to_datetime('2023-01-01')
+        
         # 模拟动作和信息
         action = np.array([0.2, 0.3, 0.5])
         state = np.array([1.0, 2.0, 3.0])

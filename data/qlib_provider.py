@@ -47,7 +47,7 @@ class QlibDataProvider:
             
         except Exception as e:
             logger.error(f"获取因子数据失败: {e}")
-            return pd.DataFrame()
+            raise
     
     def get_fundamental_data(self, 
                            instruments: List[str],
@@ -80,14 +80,8 @@ class QlibDataProvider:
                 end_time=end_time
             )
         except Exception as e:
-            logger.warning(f"获取基本面数据失败: {e}")
-            # 返回基础价格数据
-            return D.features(
-                instruments=instruments,
-                fields=["$close", "$volume"],
-                start_time=start_time,
-                end_time=end_time
-            )
+            logger.error(f"获取基本面数据失败: {e}")
+            raise
     
     def calculate_returns(self, price_data: pd.DataFrame, periods: int = 1) -> pd.DataFrame:
         """
@@ -168,8 +162,8 @@ class QlibDataProvider:
                 end_time=end_time
             )
         except Exception as e:
-            logger.warning(f"获取行业数据失败: {e}")
-            return pd.DataFrame()
+            logger.error(f"获取行业数据失败: {e}")
+            raise
     
     def validate_instruments(self, instruments: List[str]) -> List[str]:
         """
@@ -229,4 +223,4 @@ class QlibDataProvider:
             
         except Exception as e:
             logger.error(f"获取基准数据失败: {e}")
-            return pd.DataFrame()
+            raise

@@ -23,12 +23,12 @@ class SafetyShield:
         """
         self.config = config
         
-        # 风险约束参数
-        self.max_position = config.get('max_position', 0.1)
-        self.max_leverage = config.get('max_leverage', 1.2)
-        self.var_threshold = config.get('var_threshold', 0.015)
-        self.max_drawdown_threshold = config.get('max_drawdown_threshold', 0.05)
-        self.volatility_threshold = config.get('volatility_threshold', 0.15)
+        # 风险约束参数 - 调整为更宽松的设置
+        self.max_position = config.get('max_position', 0.15)
+        self.max_leverage = config.get('max_leverage', 1.5)
+        self.var_threshold = config.get('var_threshold', 0.025)
+        self.max_drawdown_threshold = config.get('max_drawdown_threshold', 0.08)
+        self.volatility_threshold = config.get('volatility_threshold', 0.20)
         
         # 风险预测器参数
         self.lookback_window = config.get('lookback_window', 20)

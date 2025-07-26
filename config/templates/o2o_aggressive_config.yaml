@@ -1,0 +1,72 @@
+# O2O激进策略配置模板
+# 适用于追求高收益的量化交易场景
+
+data:
+  start_date: '2021-01-01'
+  end_date: '2023-12-31'
+  universe: 'csi500'  # 更多中小盘股票
+  factors: ['technical', 'momentum', 'volatility']
+  apply_cleaning: true
+  outlier_threshold: 4.0  # 保留更多极值信息
+
+o2o:
+  # 离线预训练参数 - 激进设置
+  offline_epochs: 80  # 较少训练轮数，快速启动
+  behavior_cloning_weight: 0.3  # 较少依赖历史经验
+  td_learning_weight: 0.7  # 更重视价值学习
+  offline_batch_size: 512  # 更大批次
+  offline_lr: 5e-4  # 较高学习率
+  
+  # 热身微调参数 - 激进设置
+  warmup_days: 30  # 较短热身期
+  warmup_epochs: 15
+  critic_only_updates: false  # 同时更新Actor和Critic
+  warmup_lr: 2e-4  # 较高学习率
+  convergence_threshold: 0.02  # 较宽松收敛标准
+  
+  # 在线学习参数 - 激进设置
+  initial_rho: 0.3  # 较高初始在线比例
+  rho_increment: 0.02  # 快速增长
+  trust_region_beta: 0.5  # 较弱信任域约束
+  beta_decay: 0.98
+  online_buffer_size: 8000
+  priority_alpha: 0.8  # 更高优先级权重
+  priority_beta: 0.3
+  importance_weight_clip: 20.0  # 允许更大重要性权重
+  
+  # 漂移检测参数 - 不敏感设置
+  kl_threshold: 0.15  # 较高KL散度阈值
+  sharpe_drop_threshold: 0.3  # 较高夏普率阈值
+  cvar_breach_threshold: -0.03  # 较宽松CVaR阈值
+  drift_window: 20  # 较短检测窗口
+  noise_filter: false
+
+agent:
+  hidden_dims: [256, 128]  # 较小网络，快速响应
+  activation: 'leaky_relu'
+  cvar_alpha: 0.1  # 较高CVaR参数，允许更多风险
+  risk_lambda: 0.5  # 较低风险惩罚
+  entropy_coef: 0.02  # 较高熵系数，鼓励探索
+  value_coef: 0.3  # 较低价值权重
+  max_grad_norm: 1.0  # 较宽松梯度裁剪
+
+environment:
+  initial_capital: 1000000
+  transaction_cost: 0.0008  # 较低交易成本假设
+  max_position: 0.2  # 更激进的最大仓位
+  rebalance_freq: 'daily'
+  risk_free_rate: 0.03
+  leverage: 1.5  # 允许适度杠杆
+
+training:
+  max_episodes: 1500
+  eval_freq: 100  # 较少评估频率
+  save_freq: 200
+  early_stopping_patience: 150
+
+logging:
+  level: 'WARNING'  # 减少日志输出
+  save_logs: true
+  log_dir: 'logs/aggressive'
+  tensorboard: true
+  detailed_metrics: false

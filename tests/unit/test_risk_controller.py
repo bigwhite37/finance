@@ -83,7 +83,7 @@ class TestRiskController(unittest.TestCase):
         
         for key in expected_keys:
             self.assertIn(key, risk_metrics)
-            self.assertIsInstance(risk_metrics[key], (int, float))
+            self.assertIsInstance(risk_metrics[key], (int, float, np.integer))
         
         # 验证杠杆计算
         self.assertAlmostEqual(risk_metrics['total_leverage'], np.sum(np.abs(weights)), places=6)

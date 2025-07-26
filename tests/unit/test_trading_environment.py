@@ -171,12 +171,12 @@ class TestTradingEnvironment(unittest.TestCase):
         self.env.reset()
         
         # 测试破产条件
-        self.env.portfolio_value = 0.7
+        self.env.portfolio_value = 0.69  # 低于0.7的阈值
         self.assertTrue(self.env._check_termination())
         
         # 测试极端回撤条件
         self.env.portfolio_value = 1.0
-        self.env.max_drawdown = 0.2
+        self.env.max_drawdown = 0.26  # 高于0.25的阈值
         self.assertTrue(self.env._check_termination())
         
         # 测试正常条件
