@@ -9,11 +9,13 @@ data:
 
 agent:
   learning_rate: 3.0e-4
-  cvar_threshold: -0.02 # CVaR约束，目标是尾部风险不劣于-2%
+  cvar_threshold: -0.015  # 优化CVaR约束
+  cvar_lambda: 0.008      # 优化CVaR权重
+  hidden_dim: 256         # 增加网络容量
 
 risk_control:
-  target_volatility: 0.12 # 目标年化波动率12%
-  max_leverage: 1.2
+  target_volatility: 0.15 # 提升目标波动率至15%
+  max_leverage: 1.4       # 提升杠杆至1.4倍
 
 training:
   total_episodes: 200 # 减少训练回合数以避免过拟合

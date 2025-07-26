@@ -707,31 +707,53 @@ class TradingEnvironment(gym.Env):
         self.max_drawdown = max(self.max_drawdown, current_drawdown)
 
     def _calculate_reward(self, returns: float, transaction_costs: float) -> float:
-        """计算CVaR增强奖励函数"""
-        # 夏普比率激励
-        sharpe_ratio = (np.mean(self.portfolio_returns) / (np.std(self.portfolio_returns) + 1e-8)) * np.sqrt(252)
-        sharpe_bonus = sharpe_ratio * 0.1 # 给予夏普比率一个小的正向奖励
-
-        # 回撤惩罚
-        drawdown_penalty = 0.0
-        current_drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
-        if current_drawdown > self.max_dd_threshold:
-            drawdown_penalty = self.lambda1 * (current_drawdown - self.max_dd_threshold)
-
-        # CVaR惩罚
-        cvar_penalty = 0.0
+        """计算优化的奖励函数 - 注重收益最大化"""
+        
+        # 基础收益奖励 - 智能动态调整策略增强
+        base_reward = returns * 18.0  # 18倍放大收益信号
+        
+        # 动量奖励 - 奖励持续盈利
+        momentum_bonus = 0.0
+        if len(self.portfolio_returns) >= 5:
+            recent_returns = np.array(self.portfolio_returns[-5:])
+            if np.mean(recent_returns) > 0:
+                momentum_bonus = np.mean(recent_returns) * 5.0  # 奖励近期盈利趋势
+        
+        # 夏普比率奖励 - 大幅增强
+        sharpe_bonus = 0.0
         if len(self.portfolio_returns) >= 20:
-            recent_returns = np.array(self.portfolio_returns[-20:])
-            var_95 = np.percentile(recent_returns, 5)
-            cvar_95 = np.mean(recent_returns[recent_returns <= var_95])
-            cvar_penalty = self.lambda2 * max(0, -cvar_95 - 0.02)  # CVaR超过2%则惩罚
-
-        # 交易成本惩罚 - 进一步降低影响
-        cost_penalty = transaction_costs * 0.5
-
-        reward = returns + sharpe_bonus - drawdown_penalty - cvar_penalty - cost_penalty
-
-        return reward
+            returns_array = np.array(self.portfolio_returns)
+            mean_return = np.mean(returns_array)
+            std_return = np.std(returns_array)
+            if std_return > 1e-8 and mean_return > 0:
+                sharpe_ratio = mean_return / std_return * np.sqrt(252)
+                sharpe_bonus = sharpe_ratio * 2.0  # 大幅提升夏普比率奖励
+        
+        # 适度的风险控制 - 仅在极端情况下惩罚
+        risk_penalty = 0.0
+        
+        # 极端回撤惩罚 - 只在超过20%时惩罚
+        current_drawdown = (self.peak_value - self.portfolio_value) / self.peak_value
+        if current_drawdown > 0.20:
+            risk_penalty += 0.5 * (current_drawdown - 0.20)  # 减轻惩罚强度
+        
+        # 轻微的交易成本约束
+        cost_penalty = transaction_costs * 0.1  # 大幅减轻交易成本惩罚
+        
+        # 收益稳定性奖励
+        stability_bonus = 0.0
+        if len(self.portfolio_returns) >= 10:
+            recent_returns = np.array(self.portfolio_returns[-10:])
+            if np.mean(recent_returns) > 0:
+                # 奖励稳定的正收益
+                consistency = 1.0 - (np.std(recent_returns) / (np.abs(np.mean(recent_returns)) + 1e-8))
+                stability_bonus = max(0, consistency) * np.mean(recent_returns) * 3.0
+        
+        # 组合最终奖励 - 重点激励收益
+        total_reward = (base_reward + momentum_bonus + sharpe_bonus + 
+                       stability_bonus - risk_penalty - cost_penalty)
+        
+        return total_reward
 
     def _check_termination(self) -> bool:
         """检查终止条件"""

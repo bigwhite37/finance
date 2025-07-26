@@ -28,38 +28,38 @@ def get_default_config() -> dict:
             'low_vol_window': 20  # 缩短窗口
         },
         
-        # 强化学习环境配置
+        # 强化学习环境配置 - 智能动态调整策略
         'environment': {
             'lookback_window': 20,
             'transaction_cost': 0.001,
-            'max_position': 0.1,
-            'max_leverage': 1.2,
-            'lambda1': 2.0,  # 回撤惩罚系数
-            'lambda2': 1.0,  # CVaR惩罚系数
+            'max_position': 0.22,  # 提升至22%
+            'max_leverage': 1.7,   # 提升至1.7倍
+            'lambda1': 0.9,       # 降低回撤惩罚
+            'lambda2': 0.4,       # 降低CVaR惩罚
             'max_dd_threshold': 0.05
         },
         
-        # CVaR-PPO智能体配置 - 极度保守设置
+        # CVaR-PPO智能体配置 - 平衡型设置
         'agent': {
-            'hidden_dim': 32,   # 最小网络规模
-            'learning_rate': 1e-6,  # 极低学习率
-            'clip_epsilon': 0.01,   # 极小clip范围
-            'ppo_epochs': 1,    # 单轮训练
-            'batch_size': 4,    # 极小批次
-            'gamma': 0.9,       # 更低折扣因子
-            'lambda_gae': 0.8,  # 更低GAE参数
+            'hidden_dim': 256,      # 恢复标准网络规模
+            'learning_rate': 3e-4,  # 恢复标准学习率
+            'clip_epsilon': 0.2,    # 标准clip范围
+            'ppo_epochs': 4,        # 增加训练轮次
+            'batch_size': 64,       # 增加批次大小
+            'gamma': 0.99,          # 标准折扣因子
+            'lambda_gae': 0.95,     # 标准GAE参数
             'cvar_alpha': 0.05,
-            'cvar_lambda': 0.01,  # 极小CVaR权重
-            'cvar_threshold': -0.02
+            'cvar_lambda': 0.008,   # 优化CVaR权重
+            'cvar_threshold': -0.015 # 优化CVaR阈值
         },
         
-        # 安全保护层配置
+        # 安全保护层配置 - 智能动态调整策略
         'safety_shield': {
-            'max_position': 0.15,  # 放宽单股票仓位限制
-            'max_leverage': 1.2,   # 与risk_control保持一致
-            'var_threshold': 0.025, # 放宽VaR阈值
-            'max_drawdown_threshold': 0.08, # 放宽回撤阈值
-            'volatility_threshold': 0.20,   # 放宽波动率阈值
+            'max_position': 0.22,  # 提升至22%单股票仓位
+            'max_leverage': 1.7,   # 提升至1.7倍杠杆
+            'var_threshold': 0.050, # 放宽VaR至5.0%
+            'max_drawdown_threshold': 0.12, # 设置12%回撤阈值
+            'volatility_threshold': 0.25,   # 允许25%波动率
             'lookback_window': 20
         },
         
@@ -160,7 +160,7 @@ def get_default_config() -> dict:
         
         # 训练配置
         'training': {
-            'total_episodes': 500,  # 减少总训练轮数
+            'total_episodes': 350,  # 智能动态调整策略训练轮数
             'max_steps_per_episode': 252,
             'update_frequency': 50,  # 更频繁的更新
             'save_frequency': 100,  # 更频繁的保存

@@ -37,11 +37,18 @@ class RiskFactors:
             factors = ['volatility_60d', 'volume_ratio', 'turnover_rate', 'beta_60d']
 
         for factor_name in factors:
-            factor_func = getattr(self, f'calculate_{factor_name}')
-            factor_data = factor_func(price_data, volume_data)
-            factor_results[factor_name] = factor_data
+            if hasattr(self, f'calculate_{factor_name}'):
+                factor_func = getattr(self, f'calculate_{factor_name}')
+                factor_data = factor_func(price_data, volume_data)
+                factor_results[factor_name] = factor_data
+            else:
+                logger.warning(f"风险因子计算方法不存在: calculate_{factor_name}")
 
-        return pd.concat(factor_results, axis=1)
+        if factor_results:
+            return pd.concat(factor_results, axis=1)
+        else:
+            # 返回空DataFrame，保持与输入数据相同的索引
+            return pd.DataFrame(index=price_data.index)
 
     def calculate_volatility_20d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
         """计算20日波动率"""

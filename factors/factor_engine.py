@@ -29,12 +29,24 @@ class FactorEngine:
         # 因子缓存
         self._factor_cache = {}
 
-        # 默认因子列表
+        # 增强因子列表 - 添加更多alpha因子
         self.default_factors = [
-            "price_reversal", "bollinger_position", "williams_r", # 反转和震荡因子
-            "volume_ratio", 
-            "volatility_60d", "rsi_14d",
-            "ma_ratio_20d", "turnover_rate"
+            # 趋势因子
+            "momentum_20d", "momentum_60d", "price_reversal",
+            
+            # 技术指标
+            "ma_ratio_20d", "ma_ratio_60d", "bollinger_position", 
+            "williams_r", "rsi_14d",
+            
+            # 成交量因子
+            "volume_ratio", "turnover_rate", "volume_price_trend",
+            
+            # 波动率因子  
+            "volatility_20d", "volatility_60d",
+            
+            # Alpha因子
+            "price_volume_correlation", "mean_reversion_5d", 
+            "trend_strength", "volume_momentum"
         ]
 
     def calculate_all_factors(self,
@@ -57,14 +69,32 @@ class FactorEngine:
 
         # 计算Alpha因子
         alpha_factor_names = [f for f in factors if hasattr(self.alpha_factors_calculator, f"calculate_{f}")]
-        alpha_data = self.alpha_factors_calculator.calculate_factors(price_data, volume_data, alpha_factor_names)
+        if alpha_factor_names:
+            alpha_data = self.alpha_factors_calculator.calculate_factors(price_data, volume_data, alpha_factor_names)
+        else:
+            alpha_data = pd.DataFrame()
 
         # 计算风险因子
         risk_factor_names = [f for f in factors if hasattr(self.risk_factors_calculator, f"calculate_{f}")]
-        risk_data = self.risk_factors_calculator.calculate_factors(price_data, volume_data, risk_factor_names)
+        if risk_factor_names:
+            risk_data = self.risk_factors_calculator.calculate_factors(price_data, volume_data, risk_factor_names)
+        else:
+            risk_data = pd.DataFrame()
 
         # 合并因子数据
-        all_factors = pd.concat([alpha_data, risk_data], axis=1)
+        if not alpha_data.empty and not risk_data.empty:
+            all_factors = pd.concat([alpha_data, risk_data], axis=1)
+        elif not alpha_data.empty:
+            all_factors = alpha_data
+        elif not risk_data.empty:
+            all_factors = risk_data
+        else:
+            logger.warning("未计算出任何因子数据")
+            # 创建空的因子数据框
+            all_factors = pd.DataFrame(
+                index=price_data.index,
+                columns=pd.MultiIndex.from_tuples([], names=['factor', 'instrument'])
+            )
         
         # Reshape to (datetime, instrument) MultiIndex
         all_factors_stacked = all_factors.stack()
@@ -81,10 +111,23 @@ class FactorEngine:
         factor_data = factor_data.groupby(level='datetime').transform(lambda x: x.fillna(x.mean()))
         factor_data = factor_data.fillna(0) # Fill any remaining NaNs
 
-        # 按截面进行标准化和去极值
+        # 按截面进行去极值和标准化
+        def robust_scaler(x):
+            # 1. Winsorization (去极值)
+            p5 = np.percentile(x, 5)
+            p95 = np.percentile(x, 95)
+            x = np.clip(x, p5, p95)
+            
+            # 2. Standardization (标准化)
+            mean = np.mean(x)
+            std = np.std(x)
+            if std > 1e-8:
+                return (x - mean) / std
+            return x - mean # 如果标准差为0，则只进行中心化
+
+        processed_data = factor_data.groupby(level='datetime').transform(robust_scaler)
         
-        
-        return factor_data.fillna(0)
+        return processed_data.fillna(0)
 
     
 

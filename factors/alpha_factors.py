@@ -37,11 +37,18 @@ class AlphaFactors:
             factors = ['return_20d', 'return_60d', 'price_momentum', 'rsi_14d', 'ma_ratio_20d']
 
         for factor_name in factors:
-            factor_func = getattr(self, f'calculate_{factor_name}')
-            factor_data = factor_func(price_data, volume_data)
-            factor_results[factor_name] = factor_data
+            if hasattr(self, f'calculate_{factor_name}'):
+                factor_func = getattr(self, f'calculate_{factor_name}')
+                factor_data = factor_func(price_data, volume_data)
+                factor_results[factor_name] = factor_data
+            else:
+                logger.warning(f"Alpha因子计算方法不存在: calculate_{factor_name}")
 
-        return pd.concat(factor_results, axis=1)
+        if factor_results:
+            return pd.concat(factor_results, axis=1)
+        else:
+            # 返回空DataFrame，保持与输入数据相同的索引
+            return pd.DataFrame(index=price_data.index)
 
     def calculate_return_5d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
         """计算5日收益率"""
@@ -126,3 +133,60 @@ class AlphaFactors:
                                 (mom_60d > 0).astype(int)) / 3
         momentum_strength = (abs(mom_5d) + abs(mom_20d) + abs(mom_60d)) / 3
         return (momentum_consistency * momentum_strength).fillna(0)
+
+    def calculate_momentum_20d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
+        """计算20日动量因子"""
+        return price_data.pct_change(periods=20).fillna(0)
+
+    def calculate_momentum_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
+        """计算60日动量因子"""
+        return price_data.pct_change(periods=60).fillna(0)
+
+    def calculate_ma_ratio_60d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
+        """计算60日均线比率"""
+        ma_60 = price_data.rolling(window=60).mean()
+        return (price_data / ma_60 - 1).fillna(0)
+
+    def calculate_price_volume_correlation(self, price_data: pd.DataFrame, volume_data: pd.DataFrame) -> pd.DataFrame:
+        """计算价格成交量相关性因子"""
+        if volume_data is None:
+            return pd.DataFrame(0, index=price_data.index, columns=price_data.columns)
+        price_change = price_data.pct_change()
+        volume_change = volume_data.pct_change()
+        return price_change.rolling(window=20).corr(volume_change).fillna(0)
+
+    def calculate_mean_reversion_5d(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
+        """计算5日均值回归因子"""
+        returns = price_data.pct_change()
+        # 计算5日累计收益率的负值作为均值回归信号
+        cumulative_5d = (1 + returns).rolling(window=5).apply(lambda x: x.prod()) - 1
+        return -cumulative_5d.fillna(0)
+
+    def calculate_trend_strength(self, price_data: pd.DataFrame, volume_data=None) -> pd.DataFrame:
+        """计算趋势强度因子"""
+        # 使用线性回归斜率衡量趋势强度
+        def calc_trend_slope(series):
+            if len(series) < 2:
+                return 0
+            x = np.arange(len(series))
+            y = series.values
+            try:
+                slope = np.polyfit(x, y, 1)[0]
+                return slope / np.mean(y) if np.mean(y) != 0 else 0
+            except:
+                return 0
+        
+        trend_strength = price_data.rolling(window=20).apply(calc_trend_slope)
+        return trend_strength.fillna(0)
+
+    def calculate_volume_momentum(self, price_data: pd.DataFrame, volume_data: pd.DataFrame) -> pd.DataFrame:
+        """计算成交量动量因子"""
+        if volume_data is None:
+            return pd.DataFrame(0, index=price_data.index, columns=price_data.columns)
+        
+        # 计算成交量的动量（20日成交量变化率）
+        volume_ma_short = volume_data.rolling(window=5).mean()
+        volume_ma_long = volume_data.rolling(window=20).mean()
+        volume_momentum = (volume_ma_short / volume_ma_long - 1).fillna(0)
+        
+        return volume_momentum
