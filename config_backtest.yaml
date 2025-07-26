@@ -1,0 +1,13 @@
+# config_backtest.yaml
+# 用于在2023年的全新数据上回测模型
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2023-01-01"
+  end_date: "2023-12-31"
+  universe: "csi300"
+
+# 回测时不需要训练和agent配置，但需要risk_control来管理风险
+risk_control:
+  target_volatility: 0.08
+  max_leverage: 1.2

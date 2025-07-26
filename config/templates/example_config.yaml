@@ -1,0 +1,15 @@
+# 示例配置文件
+# 复制此文件并根据需要修改参数
+
+data:
+  start_date: '2020-01-01'
+  end_date: '2023-12-31'
+  universe: 'csi300'
+
+agent:
+  learning_rate: 3e-4
+  hidden_dim: 64
+
+risk_control:
+  target_volatility: 0.12
+  max_leverage: 1.2

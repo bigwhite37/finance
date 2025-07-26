@@ -1,0 +1,24 @@
+# config_train.yaml
+# 用于在2020-2022年的数据上进行离线预训练
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2020-01-01"
+  end_date: "2022-12-31"
+  universe: "csi300"
+
+agent:
+  learning_rate: 3.0e-4
+  cvar_threshold: -0.02 # CVaR约束，目标是尾部风险不劣于-2%
+
+risk_control:
+  target_volatility: 0.12 # 目标年化波动率12%
+  max_leverage: 1.2
+
+training:
+  total_episodes: 200 # 减少训练回合数以避免过拟合
+
+model:
+  save_dir: "./models/csi300_2020_2022"
+
+o2o: {}
