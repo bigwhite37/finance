@@ -46,7 +46,8 @@ class DataManager:
                       instruments: Optional[List[str]] = None,
                       start_time: str = "2020-01-01",
                       end_time: str = "2023-12-31",
-                      fields: List[str] = None) -> pd.DataFrame:
+                      fields: List[str] = None,
+                      include_fundamentals: bool = False) -> pd.DataFrame:
         """
         获取股票基础数据
         
@@ -55,17 +56,21 @@ class DataManager:
             start_time: 开始时间
             end_time: 结束时间  
             fields: 数据字段
+            include_fundamentals: 是否包含基本面数据
             
         Returns:
             股票数据DataFrame
         """
         if fields is None:
             fields = ["$open", "$high", "$low", "$close", "$volume", "$vwap"]
+        
+        if include_fundamentals:
+            fields.append("Ref($ROE, 0)") # 添加ROE因子
             
         if instruments is None:
             instruments = self._get_universe_stocks(start_time, end_time)
             
-        cache_key = f"stock_data_{hash(str(instruments))}_{start_time}_{end_time}"
+        cache_key = f"stock_data_{hash(str(instruments))}_{start_time}_{end_time}_{include_fundamentals}"
         
         if cache_key in self._cache:
             return self._cache[cache_key].copy()

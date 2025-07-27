@@ -98,7 +98,7 @@ def initialize_system(config_manager):
     }
 
 
-def prepare_data(data_manager, factor_engine, config, mode='train'):
+def prepare_data(data_manager, factor_engine, config, mode='train', include_fundamentals=False):
     """准备训练和回测数据"""
     logger = logging.getLogger(__name__)
     
@@ -108,7 +108,8 @@ def prepare_data(data_manager, factor_engine, config, mode='train'):
     logger.info("正在获取股票数据...")
     stock_data = data_manager.get_stock_data(
         start_time=data_config['start_date'],
-        end_time=data_config['end_date']
+        end_time=data_config['end_date'],
+        include_fundamentals=include_fundamentals
     )
     
     if stock_data.empty:
@@ -185,15 +186,15 @@ def prepare_data(data_manager, factor_engine, config, mode='train'):
     
     # 计算因子
     logger.info("正在计算因子...")
-    # 从原始股票数据中提取成交量数据
-    logger.info("正在提取成交量数据...")
-    volume_data = stock_data['$volume'].unstack()
-    volume_data = volume_data.T
-    # 使用相同的股票池过滤成交量数据
-    volume_data = volume_data[low_vol_stocks]
+    # 从原始股票数据中提取成交量和基本面数据
+    volume_data = stock_data['$volume'].unstack().T[low_vol_stocks]
     
+    roe_data = None
+    if include_fundamentals:
+        roe_data = stock_data['Ref($ROE, 0)'].unstack().T[low_vol_stocks]
+
     logger.info("正在计算技术因子（预计需要10-30秒）...")
-    factor_data = factor_engine.calculate_all_factors(price_data, volume_data)
+    factor_data = factor_engine.calculate_all_factors(price_data, volume_data, roe_data)
     
     if isinstance(factor_data.index, pd.MultiIndex):
         # The factor engine now returns a correctly shaped dataframe
@@ -394,7 +395,8 @@ def main():
         systems['data_manager'], 
         systems['factor_engine'], 
         config_manager,
-        args.mode  # 传递模式参数
+        args.mode,  # 传递模式参数
+        include_fundamentals=True # <--- 添加此行
     )
     
     agent = None

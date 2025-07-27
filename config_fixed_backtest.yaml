@@ -1,0 +1,21 @@
+# 修复后的回测配置
+# 使用2022年下半年作为样本外测试期
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2022-07-01"  # 使用2022年下半年
+  end_date: "2022-12-31"    # 确保有完整数据
+  universe: "csi300"
+
+# 优化的风险控制参数
+risk_control:
+  target_volatility: 0.12    # 适中的目标波动率
+  max_leverage: 1.5           # 平衡的杠杆
+
+# 平衡的安全保护层
+safety_shield:
+  max_position: 0.15          # 适中的单股仓位限制
+  max_leverage: 1.5           # 与risk_control一致
+  var_threshold: 0.04         # 适中的VaR阈值
+  max_drawdown_threshold: 0.08 # 合理的回撤限制
+  volatility_threshold: 0.25   # 适中的波动率阈值

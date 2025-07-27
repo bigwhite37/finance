@@ -1,0 +1,34 @@
+# 增强系统回测配置
+# 用于在2023年的全新数据上回测模型
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2023-01-01"
+  end_date: "2023-12-31"
+  universe: "csi300"
+
+# 回测时不需要训练参数，但需要保持一致的风险控制配置
+risk_control:
+  target_volatility: 0.15
+  max_leverage: 2.0
+
+# 安全保护层配置（与训练时保持一致）
+safety_shield:
+  max_position: 0.25
+  max_leverage: 2.0
+  var_threshold: 0.05
+  max_drawdown_threshold: 0.12
+  volatility_threshold: 0.30
+
+# 因子配置（与训练时保持一致）
+factors:
+  use_advanced_factors: true
+  short_window: 5
+  medium_window: 20
+  long_window: 60
+
+# 环境配置
+environment:
+  lookback_window: 30
+  transaction_cost: 0.001
+  initial_capital: 1000000

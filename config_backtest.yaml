@@ -10,5 +10,8 @@ data:
 # 回测时不需要训练和agent配置，但需要risk_control来管理风险
 # 使用优化后的风险控制参数
 risk_control:
-  target_volatility: 0.15  # 提升目标波动率以匹配收益目标
-  max_leverage: 1.4         # 提升杠杆倍数
+  target_volatility: 0.10  # 降低目标波动率
+  max_leverage: 1.2         # 降低杠杆
+
+safety_shield:
+  max_leverage: 1.2 # 统一训练和回测的杠杆

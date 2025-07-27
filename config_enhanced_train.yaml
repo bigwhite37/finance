@@ -1,0 +1,77 @@
+# 增强系统训练配置
+# 用于在2020-2022年的数据上进行离线预训练
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2020-01-01"
+  end_date: "2022-12-31"
+  universe: "csi300"
+
+# 增强智能体配置
+agent:
+  learning_rate: 1.0e-4  # 降低学习率提升稳定性
+  hidden_dim: 256
+  clip_epsilon: 0.2
+  ppo_epochs: 8          # 增加训练轮次
+  batch_size: 64
+  gamma: 0.99
+  lambda_gae: 0.95
+  cvar_alpha: 0.05
+  cvar_lambda: 0.1
+  cvar_threshold: -0.02
+
+# 自适应风险控制
+risk_control:
+  target_volatility: 0.15    # 提升目标波动率
+  max_leverage: 2.0          # 提升杠杆限制
+
+# 自适应安全保护层
+safety_shield:
+  max_position: 0.25         # 提升单股仓位限制
+  max_leverage: 2.0          # 提升杠杆限制
+  var_threshold: 0.05        # 放宽VaR阈值
+  max_drawdown_threshold: 0.12
+  volatility_threshold: 0.30
+  risk_adaptation_factor: 1.0
+  market_regime_sensitivity: 0.3
+  performance_feedback_weight: 0.2
+
+# 增强奖励系统
+reward_system:
+  target_annual_return: 0.08 # 8%目标
+  target_sharpe_ratio: 1.0
+  return_weight: 1.0
+  sharpe_weight: 0.3
+  consistency_weight: 0.2
+  momentum_weight: 0.15
+  efficiency_weight: 0.1
+  risk_penalty_weight: 0.1
+  cost_penalty_weight: 0.05
+
+# 高级因子配置
+factors:
+  use_advanced_factors: true
+  short_window: 5
+  medium_window: 20
+  long_window: 60
+
+# 训练配置
+training:
+  total_episodes: 400        # 增加训练轮数
+  max_steps_per_episode: 300
+  save_frequency: 50
+  evaluation_frequency: 25
+  early_stopping_patience: 100
+  target_annual_return: 0.08
+
+# 环境配置
+environment:
+  lookback_window: 30
+  transaction_cost: 0.001
+  initial_capital: 1000000
+  max_position: 0.25
+  max_leverage: 2.0
+
+# 模型保存
+model:
+  save_dir: "./models/enhanced_csi300_2020_2022"

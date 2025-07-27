@@ -31,27 +31,15 @@ class FactorEngine:
 
         # 增强因子列表 - 添加更多alpha因子
         self.default_factors = [
-            # 趋势因子
-            "momentum_20d", "momentum_60d", "price_reversal",
-            
-            # 技术指标
-            "ma_ratio_20d", "ma_ratio_60d", "bollinger_position", 
-            "williams_r", "rsi_14d",
-            
-            # 成交量因子
-            "volume_ratio", "turnover_rate", "volume_price_trend",
-            
-            # 波动率因子  
-            "volatility_20d", "volatility_60d",
-            
-            # Alpha因子
-            "price_volume_correlation", "mean_reversion_5d", 
-            "trend_strength", "volume_momentum"
+            "roe_factor",
+            "volatility_20d",
+            "volatility_60d",
         ]
 
     def calculate_all_factors(self,
                             price_data: pd.DataFrame,
                             volume_data: Optional[pd.DataFrame] = None,
+                            roe_data: Optional[pd.DataFrame] = None,
                             factors: Optional[List[str]] = None) -> pd.DataFrame:
         """
         计算所有因子
@@ -70,7 +58,7 @@ class FactorEngine:
         # 计算Alpha因子
         alpha_factor_names = [f for f in factors if hasattr(self.alpha_factors_calculator, f"calculate_{f}")]
         if alpha_factor_names:
-            alpha_data = self.alpha_factors_calculator.calculate_factors(price_data, volume_data, alpha_factor_names)
+            alpha_data = self.alpha_factors_calculator.calculate_factors(price_data, volume_data, roe_data, alpha_factor_names)
         else:
             alpha_data = pd.DataFrame()
 

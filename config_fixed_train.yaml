@@ -1,0 +1,53 @@
+# 修复后的训练配置
+# 使用2020-2022年上半年训练，下半年测试
+
+data:
+  provider_uri: "~/.qlib/qlib_data/cn_data"
+  start_date: "2020-01-01"
+  end_date: "2022-06-30"    # 缩短训练期，为回测留出空间
+  universe: "csi300"
+
+agent:
+  learning_rate: 2.0e-4       # 适中的学习率
+  cvar_threshold: -0.02       # 保持CVaR约束
+  cvar_lambda: 0.3            # 适中的CVaR权重
+  hidden_dim: 256
+  batch_size: 64
+  ppo_epochs: 6               # 适中的训练轮次
+
+# 平衡的风险控制
+risk_control:
+  target_volatility: 0.12
+  max_leverage: 1.5
+
+# 平衡的环境配置
+environment:
+  max_leverage: 1.5
+  max_position: 0.15
+  lambda1: 0.8              # 适中的回撤惩罚
+  lambda2: 0.4              # 适中的CVaR惩罚
+  reward_amplification: 15.0 # 适中的奖励放大
+
+# 平衡的安全保护层
+safety_shield:
+  max_position: 0.15
+  max_leverage: 1.5
+  var_threshold: 0.04
+  max_drawdown_threshold: 0.08
+  volatility_threshold: 0.25
+
+# 训练配置
+training:
+  total_episodes: 300         # 适中的训练轮数
+  max_steps_per_episode: 250
+  save_frequency: 50
+  evaluation_frequency: 25
+
+# 因子配置
+factors:
+  low_vol_threshold: 0.25     # 适中的波动率阈值
+
+model:
+  save_dir: "./models/fixed_csi300_train"
+
+o2o: {}

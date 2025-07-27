@@ -1,89 +1,117 @@
+
+
 import sys
 import os
 import pandas as pd
 import numpy as np
+import logging
 
-# Add project path to import project modules
+# Add project path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import ConfigManager
 from data import DataManager
 from factors import FactorEngine
 
-def analyze_factors():
+def setup_logging():
+    """Sets up basic logging."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stdout
+    )
+
+def calculate_ic(factor_data: pd.DataFrame, price_data: pd.DataFrame, periods: list = [1, 5, 10]) -> pd.DataFrame:
     """
-    Analyzes the generated factor data for numerical stability issues.
+    Calculates the Information Coefficient (IC) for each factor.
+
+    Args:
+        factor_data: DataFrame with factor values. Index is (datetime, instrument), columns are factors.
+        price_data: DataFrame with price data. Index is datetime, columns are instruments.
+        periods: List of forward returns periods to calculate IC against.
+
+    Returns:
+        DataFrame with IC values for each factor and period.
     """
-    print("--- 因子数据稳定性分析 ---")
+    logger = logging.getLogger(__name__)
     
-    try:
-        # 1. Load data and generate factors
-        print("\n[1/3] 正在加载数据并计算因子...")
-        config_manager = ConfigManager('config_train.yaml')
-        data_config = config_manager.get_data_config()
-        data_manager = DataManager(data_config)
-        factor_engine = FactorEngine(config_manager.get_config('factors'))
+    results = {}
+    for period in periods:
+        # Calculate forward returns and stack
+        forward_returns = price_data.pct_change(periods=period).shift(-period)
+        forward_returns_stacked = forward_returns.stack()
+        forward_returns_stacked.name = 'return'
 
-        stock_data = data_manager.get_stock_data(
-            start_time=data_config['start_date'],
-            end_time=data_config['end_date']
-        )
+        # Join with factor data, this aligns on the (datetime, instrument) index
+        data = factor_data.join(forward_returns_stacked, how='inner')
         
-        price_data = stock_data['$close'].unstack().T
-        volume_data = stock_data['$volume'].unstack().T
-        
-        low_vol_stocks = factor_engine.filter_low_volatility_universe(price_data)
-        price_data = price_data[low_vol_stocks]
-        volume_data = volume_data[low_vol_stocks]
+        if data.empty:
+            logger.warning(f"No common data for period {period}d, skipping.")
+            continue
 
-        factor_data = factor_engine.calculate_all_factors(price_data, volume_data)
-        print("    -> 因子数据生成完毕。")
-        print(f"    -> 因子数据形状: {factor_data.shape}")
+        # Calculate IC for each factor for each day
+        daily_ic = data.groupby(level='datetime').apply(
+            lambda x: x.corr(method='spearman')['return']
+        ).drop('return', axis=1, errors='ignore')
 
-        # 2. Perform statistical analysis
-        print("\n[2/3] 正在对每个因子进行统计分析...")
-        
-        # Use .describe() for a quick overview
-        stats_summary = factor_data.describe(percentiles=[.01, .05, .25, .75, .95, .99])
-        
-        print("\n--- 统计摘要 ---")
-        print(stats_summary)
+        # Average the daily ICs for the period
+        results[f'ic_{period}d'] = daily_ic.mean()
 
-        # 3. Check for NaN and Inf values
-        print("\n[3/3] 正在检查 NaN 和 Inf 值...")
-        nan_report = factor_data.isnull().sum()
-        inf_report = (factor_data == np.inf).sum()
-        neg_inf_report = (factor_data == -np.inf).sum()
+    return pd.DataFrame(results)
 
-        print("\n--- 不稳定值报告 ---")
-        report_df = pd.DataFrame({
-            'NaN_Count': nan_report,
-            'Infinity_Count': inf_report,
-            'Neg_Infinity_Count': neg_inf_report
-        })
-        print(report_df[report_df.sum(axis=1) > 0])
-        
-        print("\n--- 分析结论 ---")
-        if report_df.sum().sum() > 0:
-            print("[警告] 发现不稳定的值 (NaN/Inf)。这是导致训练失败的直接原因。")
-        else:
-            print("[信息] 未发现 NaN 或 Inf 值。")
-            
-        # Check for extreme values based on standard deviation
-        extreme_value_threshold = 10  # 10个标准差以外的值被认为是极端值
-        extreme_values = (np.abs(factor_data - factor_data.mean()) > extreme_value_threshold * factor_data.std()).sum()
-        
-        if extreme_values.sum() > 0:
-            print(f"[警告] 发现极端值 (超过 {extreme_value_threshold} 倍标准差)。这可能导致梯度爆炸和训练不稳定。")
-            print("极端值报告 (计数):")
-            print(extreme_values[extreme_values > 0])
-        else:
-            print("[信息] 未发现明显的极端值。")
 
-    except Exception as e:
-        print(f"\n[错误] 分析过程中出现异常: {e}")
-        import traceback
-        traceback.print_exc()
+def analyze_factor_performance(config_path: str, data_range: tuple):
+    """
+    Analyzes the performance of factors for a given data range.
+
+    Args:
+        config_path: Path to the config file.
+        data_range: Tuple with start and end date.
+    """
+    logger = logging.getLogger(__name__)
+    
+    start_date, end_date = data_range
+    
+    logger.info(f"Analyzing factors for the period: {start_date} to {end_date}")
+
+    # Initialize components
+    config_manager = ConfigManager(config_path)
+    config_manager.set_value('data.start_date', start_date)
+    config_manager.set_value('data.end_date', end_date)
+    
+    data_manager = DataManager(config_manager.get_data_config())
+    factor_engine = FactorEngine(config_manager.get_config('factors'))
+
+    # Prepare data
+    logger.info("Preparing data...")
+    stock_data = data_manager.get_stock_data(start_time=start_date, end_time=end_date)
+    price_data = stock_data['$close'].unstack().T
+    volume_data = stock_data['$volume'].unstack().T
+    
+    logger.info("Calculating factors...")
+    factor_data = factor_engine.calculate_all_factors(price_data, volume_data)
+
+    # Calculate IC
+    logger.info("Calculating Information Coefficient (IC)...")
+    ic_df = calculate_ic(factor_data, price_data)
+    
+    # Print results
+    logger.info("\n=== Factor IC Analysis ===\n")
+    logger.info(f"Period: {start_date} to {end_date}")
+    logger.info(ic_df)
+
 
 if __name__ == "__main__":
-    analyze_factors()
+    setup_logging()
+    
+    # Analyze training period
+    analyze_factor_performance(
+        config_path='config_train.yaml',
+        data_range=('2020-01-01', '2022-12-31')
+    )
+
+    # Analyze backtest period
+    analyze_factor_performance(
+        config_path='config_backtest.yaml',
+        data_range=('2023-01-01', '2023-12-31')
+    )
