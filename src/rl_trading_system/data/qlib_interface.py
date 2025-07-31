@@ -106,8 +106,11 @@ class QlibDataInterface(DataInterface):
         if not self.validate_date_range(start_date, end_date):
             raise ValueError("日期范围无效")
         
+        # 格式化股票代码以匹配qlib的要求
+        formatted_symbols = [s.replace('.', '').lower() for s in symbols]
+
         cache_key = self._get_cache_key('get_price_data', 
-                                       symbols=tuple(symbols),
+                                       symbols=tuple(formatted_symbols),
                                        start_date=start_date, 
                                        end_date=end_date)
         cached_result = self._get_from_cache(cache_key)
@@ -124,7 +127,7 @@ class QlibDataInterface(DataInterface):
             fields = ['$open', '$high', '$low', '$close', '$volume', '$amount']
             
             # 获取数据
-            data = D.features(symbols, fields, 
+            data = D.features(formatted_symbols, fields, 
                             start_time=start_date, 
                             end_time=end_date)
             
@@ -182,8 +185,11 @@ class QlibDataInterface(DataInterface):
         if not self.validate_date_range(start_date, end_date):
             raise ValueError("日期范围无效")
         
+        # 格式化股票代码以匹配qlib的要求
+        formatted_symbols = [s.replace('.', '').lower() for s in symbols]
+
         cache_key = self._get_cache_key('get_fundamental_data',
-                                       symbols=tuple(symbols),
+                                       symbols=tuple(formatted_symbols),
                                        start_date=start_date,
                                        end_date=end_date)
         cached_result = self._get_from_cache(cache_key)
@@ -211,7 +217,7 @@ class QlibDataInterface(DataInterface):
             ]
             
             # 获取数据
-            data = D.features(symbols, fundamental_fields,
+            data = D.features(formatted_symbols, fundamental_fields,
                             start_time=start_date,
                             end_time=end_date)
             
