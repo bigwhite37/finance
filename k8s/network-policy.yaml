@@ -1,0 +1,263 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rl-trading-system-netpol
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: rl-trading-system
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 允许来自Ingress Controller的流量
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 5000
+  # 允许来自Prometheus的监控流量
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8000
+  # 允许来自同一命名空间内的Pod
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: rl-trading
+    ports:
+    - protocol: TCP
+      port: 5000
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 6006
+  # 允许来自负载均衡器的健康检查
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 5000
+  egress:
+  # 允许访问DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 允许访问PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # 允许访问Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  # 允许访问InfluxDB
+  - to:
+    - podSelector:
+        matchLabels:
+          app: influxdb
+    ports:
+    - protocol: TCP
+      port: 8086
+  # 允许访问外部API (HTTPS)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # 允许访问外部API (HTTP) - 仅用于开发
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+  # 允许访问Kubernetes API
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 6443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-netpol
+  namespace: rl-trading
+  labels:
+    app: postgres
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 只允许来自RL Trading System的连接
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rl-trading-system
+    ports:
+    - protocol: TCP
+      port: 5432
+  # 允许来自备份Pod的连接
+  - from:
+    - podSelector:
+        matchLabels:
+          app: postgres-backup
+    ports:
+    - protocol: TCP
+      port: 5432
+  egress:
+  # 允许DNS查询
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 允许访问备份存储
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-netpol
+  namespace: rl-trading
+  labels:
+    app: redis
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 只允许来自RL Trading System的连接
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rl-trading-system
+    ports:
+    - protocol: TCP
+      port: 6379
+  # 允许来自监控系统的连接
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: redis-exporter
+    ports:
+    - protocol: TCP
+      port: 6379
+  egress:
+  # 允许DNS查询
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: influxdb-netpol
+  namespace: rl-trading
+  labels:
+    app: influxdb
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: influxdb
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 允许来自RL Trading System的连接
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rl-trading-system
+    ports:
+    - protocol: TCP
+      port: 8086
+  # 允许来自Grafana的连接
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: grafana
+    ports:
+    - protocol: TCP
+      port: 8086
+  # 允许来自Prometheus的连接
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8086
+  egress:
+  # 允许DNS查询
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 允许访问备份存储
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: security
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress

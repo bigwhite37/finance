@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rl-trading
+  labels:
+    name: rl-trading
+    environment: production
+    app: rl-trading-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rl-trading-dev
+  labels:
+    name: rl-trading-dev
+    environment: development
+    app: rl-trading-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rl-trading-staging
+  labels:
+    name: rl-trading-staging
+    environment: staging
+    app: rl-trading-system

@@ -1,0 +1,193 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rl-trading-system
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: rbac
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rl-trading-system-role
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: rbac
+rules:
+# Pod相关权限
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/status"]
+  verbs: ["get"]
+
+# Service相关权限
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+
+# ConfigMap和Secret权限
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+
+# PVC权限
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+
+# Event权限
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+
+# Deployment相关权限 (只读)
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
+
+# Ingress权限 (只读)
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+
+# HPA权限 (只读)
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+
+# Metrics权限
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rl-trading-system-rolebinding
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: rbac
+subjects:
+- kind: ServiceAccount
+  name: rl-trading-system
+  namespace: rl-trading
+roleRef:
+  kind: Role
+  name: rl-trading-system-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rl-trading-system-cluster-role
+  labels:
+    app: rl-trading-system
+    component: rbac
+rules:
+# Node信息权限 (用于监控)
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/metrics"]
+  verbs: ["get", "list"]
+
+# Namespace权限 (只读)
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+
+# 集群级别的metrics权限
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+
+# 自定义资源权限 (如果需要)
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rl-trading-system-cluster-rolebinding
+  labels:
+    app: rl-trading-system
+    component: rbac
+subjects:
+- kind: ServiceAccount
+  name: rl-trading-system
+  namespace: rl-trading
+roleRef:
+  kind: ClusterRole
+  name: rl-trading-system-cluster-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# 开发环境RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rl-trading-system
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: rbac
+    environment: development
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rl-trading-system-role-dev
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: rbac
+    environment: development
+rules:
+# 开发环境更宽松的权限
+- apiGroups: [""]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rl-trading-system-rolebinding-dev
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: rbac
+    environment: development
+subjects:
+- kind: ServiceAccount
+  name: rl-trading-system
+  namespace: rl-trading-dev
+roleRef:
+  kind: Role
+  name: rl-trading-system-role-dev
+  apiGroup: rbac.authorization.k8s.io

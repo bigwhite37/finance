@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # 主交易系统
+  rl-trading-system:
+    build: .
+    container_name: rl-trading-system
+    ports:
+      - "5000:5000"  # Web仪表板
+      - "8000:8000"  # Prometheus指标端口
+      - "6006:6006"  # TensorBoard端口
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./checkpoints:/app/checkpoints
+      - ./outputs:/app/outputs
+      - ./config:/app/config
+      - ./cache:/app/cache
+    environment:
+      - PYTHONPATH=/app/src
+      - CONFIG_PATH=/app/config/system_config.yaml
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+      - influxdb
+      - postgres
+    networks:
+      - trading-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/systems"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL关系数据库
+  postgres:
+    image: postgres:14
+    container_name: rl-trading-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=trading_db
+      - POSTGRES_USER=trading_user
+      - POSTGRES_PASSWORD=trading_pass
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: rl-trading-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  # InfluxDB时序数据库
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: rl-trading-influxdb
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password123
+      - DOCKER_INFLUXDB_INIT_ORG=rl-trading
+      - DOCKER_INFLUXDB_INIT_BUCKET=trading-data
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  # Prometheus监控
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rl-trading-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  # Grafana可视化
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rl-trading-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+  # Jupyter Lab (开发环境)
+  jupyter:
+    build: .
+    container_name: rl-trading-jupyter
+    ports:
+      - "8889:8888"
+    volumes:
+      - ./notebooks:/app/notebooks
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./config:/app/config
+    environment:
+      - PYTHONPATH=/app/src
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=''
+    networks:
+      - trading-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  influxdb_data:
+  prometheus_data:
+  grafana_data:
+  postgres_data:
+
+networks:
+  trading-network:
+    driver: bridge

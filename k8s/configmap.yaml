@@ -1,0 +1,229 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rl-trading-config
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: config
+data:
+  system_config.yaml: |
+    # 系统配置
+    system:
+      name: "RL Trading System"
+      version: "1.0.0"
+      environment: "production"
+      debug: false
+      log_level: "INFO"
+    
+    # 数据库配置
+    database:
+      host: "postgres-service"
+      port: 5432
+      name: "trading_db"
+      username: "trading_user"
+      pool_size: 20
+      max_overflow: 30
+      pool_timeout: 30
+      pool_recycle: 3600
+    
+    # Redis配置
+    redis:
+      host: "redis-service"
+      port: 6379
+      db: 0
+      password: ""
+      max_connections: 100
+      socket_timeout: 5
+      socket_connect_timeout: 5
+    
+    # InfluxDB配置
+    influxdb:
+      host: "influxdb-service"
+      port: 8086
+      org: "rl-trading"
+      bucket: "trading-data"
+      timeout: 10000
+    
+    # 交易配置
+    trading:
+      initial_capital: 1000000
+      max_position_size: 0.1
+      risk_free_rate: 0.02
+      transaction_cost: 0.001
+      slippage: 0.001
+      max_drawdown: 0.2
+    
+    # 强化学习配置
+    rl:
+      algorithm: "PPO"
+      learning_rate: 0.0003
+      batch_size: 256
+      buffer_size: 100000
+      gamma: 0.99
+      tau: 0.005
+      update_frequency: 1000
+      target_update_frequency: 10000
+    
+    # 监控配置
+    monitoring:
+      prometheus:
+        enabled: true
+        port: 8000
+        path: "/metrics"
+      grafana:
+        enabled: true
+        port: 3000
+      health_check:
+        enabled: true
+        port: 8000
+        path: "/health"
+        interval: 30
+    
+    # 日志配置
+    logging:
+      level: "INFO"
+      format: "json"
+      file_rotation: true
+      max_file_size: "100MB"
+      backup_count: 10
+      elasticsearch:
+        enabled: true
+        host: "elasticsearch-service"
+        port: 9200
+        index: "rl-trading-logs"
+  
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    rule_files:
+      - "alert_rules.yml"
+    
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+              - alertmanager:9093
+    
+    scrape_configs:
+      - job_name: 'rl-trading-system'
+        static_configs:
+          - targets: ['rl-trading-system-service:8000']
+        metrics_path: '/metrics'
+        scrape_interval: 15s
+        scrape_timeout: 10s
+      
+      - job_name: 'redis'
+        static_configs:
+          - targets: ['redis-service:6379']
+      
+      - job_name: 'postgres'
+        static_configs:
+          - targets: ['postgres-service:5432']
+      
+      - job_name: 'influxdb'
+        static_configs:
+          - targets: ['influxdb-service:8086']
+  
+  alert_rules.yml: |
+    groups:
+      - name: rl-trading-system
+        rules:
+          - alert: HighErrorRate
+            expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High error rate detected"
+              description: "Error rate is above 10% for 5 minutes"
+          
+          - alert: HighMemoryUsage
+            expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) > 0.8
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage"
+              description: "Memory usage is above 80%"
+          
+          - alert: HighCPUUsage
+            expr: rate(container_cpu_usage_seconds_total[5m]) > 0.8
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU usage"
+              description: "CPU usage is above 80%"
+          
+          - alert: ServiceDown
+            expr: up == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Service is down"
+              description: "{{ $labels.instance }} is down"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rl-trading-config-dev
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: config
+    environment: development
+data:
+  system_config.yaml: |
+    # 开发环境配置
+    system:
+      name: "RL Trading System (Dev)"
+      version: "1.0.0-dev"
+      environment: "development"
+      debug: true
+      log_level: "DEBUG"
+    
+    database:
+      host: "postgres-service"
+      port: 5432
+      name: "trading_db_dev"
+      username: "trading_user"
+      pool_size: 5
+      max_overflow: 10
+    
+    redis:
+      host: "redis-service"
+      port: 6379
+      db: 1
+    
+    influxdb:
+      host: "influxdb-service"
+      port: 8086
+      org: "rl-trading-dev"
+      bucket: "trading-data-dev"
+    
+    trading:
+      initial_capital: 100000
+      max_position_size: 0.05
+    
+    rl:
+      learning_rate: 0.001
+      batch_size: 64
+      buffer_size: 10000
+    
+    monitoring:
+      prometheus:
+        enabled: true
+        port: 8000
+      health_check:
+        enabled: true
+        port: 8000
+        path: "/health"
+        interval: 10
+    
+    logging:
+      level: "DEBUG"
+      format: "text"

@@ -1,0 +1,493 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  lint:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install flake8 mypy black isort bandit safety
+
+    - name: Run Black formatter check
+      run: black --check --diff src/ tests/
+
+    - name: Run isort import sorting check
+      run: isort --check-only --diff src/ tests/
+
+    - name: Run flake8 linting
+      run: flake8 src/ tests/ --max-line-length=100 --exclude=__pycache__
+
+    - name: Run mypy type checking
+      run: mypy src/ --ignore-missing-imports --strict
+
+    - name: Run Bandit security linting
+      run: bandit -r src/ -f json -o bandit-report.json
+
+    - name: Run Safety dependency check
+      run: safety check --json --output safety-report.json
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        test-type: [unit, integration, e2e]
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+      influxdb:
+        image: influxdb:2.7-alpine
+        env:
+          DOCKER_INFLUXDB_INIT_MODE: setup
+          DOCKER_INFLUXDB_INIT_USERNAME: admin
+          DOCKER_INFLUXDB_INIT_PASSWORD: password
+          DOCKER_INFLUXDB_INIT_ORG: test-org
+          DOCKER_INFLUXDB_INIT_BUCKET: test-bucket
+        ports:
+          - 8086:8086
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-xdist pytest-mock
+
+    - name: Wait for services
+      run: |
+        sleep 10
+        curl -f http://localhost:8086/health || exit 1
+
+    - name: Run unit tests
+      if: matrix.test-type == 'unit'
+      run: |
+        python -m pytest tests/unit/ \
+          --cov=src/ \
+          --cov-report=xml \
+          --cov-report=html \
+          --cov-report=term-missing \
+          --junitxml=junit-unit.xml \
+          -v
+
+    - name: Run integration tests
+      if: matrix.test-type == 'integration'
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379/0
+        INFLUXDB_URL: http://localhost:8086
+        INFLUXDB_TOKEN: test-token
+        INFLUXDB_ORG: test-org
+        INFLUXDB_BUCKET: test-bucket
+      run: |
+        python -m pytest tests/integration/ \
+          --junitxml=junit-integration.xml \
+          -v
+
+    - name: Run E2E tests
+      if: matrix.test-type == 'e2e'
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+        REDIS_URL: redis://localhost:6379/0
+        INFLUXDB_URL: http://localhost:8086
+        INFLUXDB_TOKEN: test-token
+        INFLUXDB_ORG: test-org
+        INFLUXDB_BUCKET: test-bucket
+      run: |
+        python -m pytest tests/e2e/ \
+          --junitxml=junit-e2e.xml \
+          --maxfail=1 \
+          -v
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.test-type }}
+        path: |
+          junit-*.xml
+          htmlcov/
+          coverage.xml
+
+    - name: Upload coverage to Codecov
+      if: matrix.test-type == 'unit'
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run Snyk to check for vulnerabilities
+      uses: snyk/actions/python@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high --file=requirements.txt
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push'
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v3
+      with:
+        name: sbom
+        path: sbom.spdx.json
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: development
+      url: https://trading-dev.rlsystem.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Deploy to development
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Update image tag
+        kubectl set image deployment/rl-trading-system-dev \
+          rl-trading-system=${{ needs.build.outputs.image-tag }} \
+          -n rl-trading-dev
+        
+        # Wait for rollout
+        kubectl rollout status deployment/rl-trading-system-dev \
+          -n rl-trading-dev \
+          --timeout=300s
+        
+        # Verify deployment
+        kubectl get pods -l app=rl-trading-system -n rl-trading-dev
+
+    - name: Run smoke tests
+      run: |
+        sleep 30
+        curl -f https://trading-dev.rlsystem.com/api/health || exit 1
+        curl -f https://api-dev.trading.rlsystem.com/api/ready || exit 1
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://trading-staging.rlsystem.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Deploy to staging
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f k8s/namespace.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/secret.yaml
+        kubectl apply -f k8s/rbac.yaml
+        kubectl apply -f k8s/pvc.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/ingress.yaml
+        kubectl apply -f k8s/hpa.yaml
+        kubectl apply -f k8s/network-policy.yaml
+        
+        # Update image tag
+        kubectl set image deployment/rl-trading-system \
+          rl-trading-system=${{ needs.build.outputs.image-tag }} \
+          -n rl-trading-staging
+        
+        # Wait for rollout
+        kubectl rollout status deployment/rl-trading-system \
+          -n rl-trading-staging \
+          --timeout=600s
+
+    - name: Run integration tests
+      run: |
+        sleep 60
+        curl -f https://trading-staging.rlsystem.com/api/health || exit 1
+        curl -f https://api-staging.trading.rlsystem.com/api/ready || exit 1
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: production
+      url: https://trading.rlsystem.com
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Blue-Green Deployment
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Create green deployment
+        sed 's/rl-trading-system/rl-trading-system-green/g' k8s/deployment.yaml | \
+        sed 's/version: v1.0.0/version: green/g' | \
+        kubectl apply -f -
+        
+        # Update green deployment image
+        kubectl set image deployment/rl-trading-system-green \
+          rl-trading-system=${{ needs.build.outputs.image-tag }} \
+          -n rl-trading
+        
+        # Wait for green deployment
+        kubectl rollout status deployment/rl-trading-system-green \
+          -n rl-trading \
+          --timeout=600s
+        
+        # Health check green deployment
+        kubectl wait --for=condition=available \
+          deployment/rl-trading-system-green \
+          -n rl-trading \
+          --timeout=300s
+        
+        # Switch traffic to green
+        kubectl patch service rl-trading-system-service \
+          -n rl-trading \
+          -p '{"spec":{"selector":{"version":"green"}}}'
+        
+        # Wait and verify
+        sleep 30
+        curl -f https://trading.rlsystem.com/api/health || exit 1
+        
+        # Remove blue deployment
+        kubectl delete deployment rl-trading-system -n rl-trading --ignore-not-found=true
+        
+        # Rename green to blue
+        kubectl patch deployment rl-trading-system-green \
+          -n rl-trading \
+          -p '{"metadata":{"name":"rl-trading-system"},"spec":{"selector":{"matchLabels":{"version":"v1.0.0"}},"template":{"metadata":{"labels":{"version":"v1.0.0"}}}}}'
+
+    - name: Post-deployment verification
+      run: |
+        sleep 60
+        curl -f https://trading.rlsystem.com/api/health || exit 1
+        curl -f https://api.trading.rlsystem.com/api/ready || exit 1
+        curl -f https://metrics.trading.rlsystem.com/metrics || exit 1
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging, deploy-prod]
+    if: always()
+    steps:
+    - name: Notify Slack
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#devops'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: Send email notification
+      if: failure()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 587
+        username: ${{ secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.EMAIL_PASSWORD }}
+        subject: 'Deployment Failed: ${{ github.repository }}'
+        body: |
+          Deployment failed for ${{ github.repository }}
+          
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref }}
+          Author: ${{ github.actor }}
+          
+          Please check the GitHub Actions logs for more details.
+        to: devops@rltrading.com
+        from: noreply@rltrading.com

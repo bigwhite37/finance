@@ -1,0 +1,21 @@
+# 合规配置文件
+compliance:
+  audit:
+    retention_years: 5
+    database_url: "influxdb://localhost:8086/trading_audit"
+    
+  risk_control:
+    max_position_concentration: 0.1  # 单只股票最大持仓比例
+    max_sector_exposure: 0.3  # 单个行业最大暴露
+    stop_loss_threshold: -0.05  # 止损阈值
+    
+  explainability:
+    shap_enabled: true
+    lime_enabled: true
+    attention_visualization: true
+    
+  reporting:
+    daily_report: true
+    weekly_report: true
+    monthly_report: true
+    report_recipients: []

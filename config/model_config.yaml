@@ -1,0 +1,32 @@
+# 模型配置文件
+# 支持环境变量覆盖，例如：MODEL_TRANSFORMER_D_MODEL=512
+model:
+  transformer:
+    d_model: 256                # 模型维度，可通过 MODEL_TRANSFORMER_D_MODEL 覆盖
+    n_heads: 8                  # 注意力头数，可通过 MODEL_TRANSFORMER_N_HEADS 覆盖
+    n_layers: 6                 # 编码器层数，可通过 MODEL_TRANSFORMER_N_LAYERS 覆盖
+    d_ff: 1024                  # 前馈网络维度，可通过 MODEL_TRANSFORMER_D_FF 覆盖
+    dropout: 0.1                # Dropout率，可通过 MODEL_TRANSFORMER_DROPOUT 覆盖
+    max_seq_len: 252            # 最大序列长度（一年交易日），可通过 MODEL_TRANSFORMER_MAX_SEQ_LEN 覆盖
+    n_features: 50              # 特征数量，可通过 MODEL_TRANSFORMER_N_FEATURES 覆盖
+  
+  sac:
+    state_dim: 256              # 状态维度，可通过 MODEL_SAC_STATE_DIM 覆盖
+    action_dim: 100             # 动作维度（股票数量），可通过 MODEL_SAC_ACTION_DIM 覆盖
+    hidden_dim: 512             # 隐藏层维度，可通过 MODEL_SAC_HIDDEN_DIM 覆盖
+    lr_actor: 0.0003            # Actor学习率，可通过 MODEL_SAC_LR_ACTOR 覆盖
+    lr_critic: 0.0003           # Critic学习率，可通过 MODEL_SAC_LR_CRITIC 覆盖
+    lr_alpha: 0.0003            # Alpha学习率，可通过 MODEL_SAC_LR_ALPHA 覆盖
+    gamma: 0.99                 # 折扣因子，可通过 MODEL_SAC_GAMMA 覆盖
+    tau: 0.005                  # 软更新系数，可通过 MODEL_SAC_TAU 覆盖
+    alpha: 0.2                  # 熵正则化系数，可通过 MODEL_SAC_ALPHA 覆盖
+    target_entropy: -100.0      # 目标熵，可通过 MODEL_SAC_TARGET_ENTROPY 覆盖
+    buffer_size: 1000000        # 经验回放缓冲区大小，可通过 MODEL_SAC_BUFFER_SIZE 覆盖
+    batch_size: 256             # 批次大小，可通过 MODEL_SAC_BATCH_SIZE 覆盖
+    
+training:
+  n_episodes: 10000             # 训练轮数，可通过 TRAINING_N_EPISODES 覆盖
+  eval_freq: 100                # 评估频率，可通过 TRAINING_EVAL_FREQ 覆盖
+  patience: 50                  # 早停耐心值，可通过 TRAINING_PATIENCE 覆盖
+  min_delta: 0.001              # 最小改进阈值，可通过 TRAINING_MIN_DELTA 覆盖
+  checkpoint_dir: "./checkpoints"  # 检查点目录，可通过 TRAINING_CHECKPOINT_DIR 覆盖

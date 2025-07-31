@@ -1,0 +1,131 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rl-trading-system-ingress
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization"
+spec:
+  tls:
+  - hosts:
+    - trading.rlsystem.com
+    - api.trading.rlsystem.com
+    - metrics.trading.rlsystem.com
+    - tensorboard.trading.rlsystem.com
+    secretName: rl-trading-tls
+  rules:
+  - host: trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service
+            port:
+              number: 80
+  - host: api.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service
+            port:
+              number: 80
+  - host: metrics.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service
+            port:
+              number: 8000
+  - host: tensorboard.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service
+            port:
+              number: 6006
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rl-trading-system-ingress-dev
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: ingress
+    environment: development
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  rules:
+  - host: trading-dev.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service-dev
+            port:
+              number: 80
+  - host: api-dev.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service-dev
+            port:
+              number: 80
+  - host: metrics-dev.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service-dev
+            port:
+              number: 8000
+  - host: tensorboard-dev.trading.rlsystem.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rl-trading-system-service-dev
+            port:
+              number: 6006

@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-trading-system-service
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: service
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 8000
+    targetPort: metrics
+    protocol: TCP
+  - name: tensorboard
+    port: 6006
+    targetPort: tensorboard
+    protocol: TCP
+  selector:
+    app: rl-trading-system
+    component: main
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-trading-system-headless
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: headless-service
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: rl-trading-system
+    component: main
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-trading-system-nodeport
+  namespace: rl-trading
+  labels:
+    app: rl-trading-system
+    component: nodeport-service
+spec:
+  type: NodePort
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+    nodePort: 30080
+  - name: metrics
+    port: 8000
+    targetPort: metrics
+    protocol: TCP
+    nodePort: 30800
+  - name: tensorboard
+    port: 6006
+    targetPort: tensorboard
+    protocol: TCP
+    nodePort: 30606
+  selector:
+    app: rl-trading-system
+    component: main
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-trading-system-service-dev
+  namespace: rl-trading-dev
+  labels:
+    app: rl-trading-system
+    component: service
+    environment: development
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 8000
+    targetPort: metrics
+    protocol: TCP
+  - name: tensorboard
+    port: 6006
+    targetPort: tensorboard
+    protocol: TCP
+  selector:
+    app: rl-trading-system
+    component: main
+    environment: development

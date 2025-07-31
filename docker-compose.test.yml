@@ -1,0 +1,265 @@
+version: '3.8'
+
+services:
+  # PostgreSQL测试数据库
+  postgres:
+    image: postgres:14
+    container_name: rl-trading-postgres-test
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=test_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis测试缓存
+  redis:
+    image: redis:7-alpine
+    container_name: rl-trading-redis-test
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_test_data:/data
+    command: redis-server --appendonly yes --requirepass test_password
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # InfluxDB测试时序数据库
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: rl-trading-influxdb-test
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_test_data:/var/lib/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=test_password
+      - DOCKER_INFLUXDB_INIT_ORG=rl-trading-test
+      - DOCKER_INFLUXDB_INIT_BUCKET=test-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=test_token_123456789
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 测试应用容器
+  rl-trading-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    container_name: rl-trading-system-test
+    ports:
+      - "5001:5000"  # Web仪表板
+      - "8001:8000"  # Prometheus指标端口
+      - "6007:6006"  # TensorBoard端口
+    volumes:
+      - ./test_data:/app/data
+      - ./test_logs:/app/logs
+      - ./test_outputs:/app/outputs
+      - ./config:/app/config
+      - ./tests:/app/tests
+      - ./src:/app/src
+    environment:
+      - PYTHONPATH=/app/src
+      - CONFIG_PATH=/app/config/test_config.yaml
+      - LOG_LEVEL=DEBUG
+      - TESTING=true
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/test_db
+      - REDIS_URL=redis://:test_password@redis:6379/0
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=test_token_123456789
+      - INFLUXDB_ORG=rl-trading-test
+      - INFLUXDB_BUCKET=test-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Prometheus测试监控
+  prometheus-test:
+    image: prom/prometheus:latest
+    container_name: rl-trading-prometheus-test
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus-test.yml:/etc/prometheus/prometheus.yml
+      - prometheus_test_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=24h'
+      - '--web.enable-lifecycle'
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # Grafana测试可视化
+  grafana-test:
+    image: grafana/grafana:latest
+    container_name: rl-trading-grafana-test
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_test_data:/var/lib/grafana
+      - ./monitoring/grafana/test-dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/test-datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=test_admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # Jaeger测试链路追踪
+  jaeger-test:
+    image: jaegertracing/all-in-one:latest
+    container_name: rl-trading-jaeger-test
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # HTTP collector
+      - "14250:14250"  # gRPC collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # Elasticsearch测试日志存储
+  elasticsearch-test:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: rl-trading-elasticsearch-test
+    ports:
+      - "9201:9200"
+      - "9301:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_test_data:/usr/share/elasticsearch/data
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Kibana测试日志可视化
+  kibana-test:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: rl-trading-kibana-test
+    ports:
+      - "5602:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch-test:9200
+      - xpack.security.enabled=false
+    depends_on:
+      elasticsearch-test:
+        condition: service_healthy
+    networks:
+      - test-network
+    restart: unless-stopped
+
+  # MinIO测试对象存储
+  minio-test:
+    image: minio/minio:latest
+    container_name: rl-trading-minio-test
+    ports:
+      - "9001:9000"
+      - "9011:9001"
+    volumes:
+      - minio_test_data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    command: server /data --console-address ":9001"
+    networks:
+      - test-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Nginx测试负载均衡器
+  nginx-test:
+    image: nginx:alpine
+    container_name: rl-trading-nginx-test
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./nginx/test-nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/test-ssl:/etc/nginx/ssl
+    depends_on:
+      - rl-trading-test
+    networks:
+      - test-network
+    restart: unless-stopped
+
+volumes:
+  postgres_test_data:
+    driver: local
+  redis_test_data:
+    driver: local
+  influxdb_test_data:
+    driver: local
+  prometheus_test_data:
+    driver: local
+  grafana_test_data:
+    driver: local
+  elasticsearch_test_data:
+    driver: local
+  minio_test_data:
+    driver: local
+
+networks:
+  test-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

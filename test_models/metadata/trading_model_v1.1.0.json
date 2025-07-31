@@ -1,0 +1,22 @@
+{
+  "model_id": "trading_model",
+  "version": "v1.1.0",
+  "name": "改进的交易模型",
+  "description": "新的改进版本",
+  "created_at": "2025-07-31T12:22:32.905193",
+  "created_by": "developer",
+  "model_type": "rl_agent",
+  "framework": "pytorch",
+  "status": "active",
+  "tags": [],
+  "metrics": {
+    "accuracy": 0.9,
+    "precision": 0.88,
+    "recall": 0.85,
+    "f1_score": 0.86
+  },
+  "config": {},
+  "file_path": "test_models/trading_model_v1.1.0.model",
+  "file_size": 2875,
+  "checksum": "6c52df3a23e1fa7e285cda7851053098"
+}

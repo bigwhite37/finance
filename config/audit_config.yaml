@@ -1,0 +1,94 @@
+# 审计日志系统配置文件
+
+# InfluxDB时序数据库配置
+influxdb:
+  url: "http://localhost:8086"
+  token: "${INFLUXDB_TOKEN}"  # 从环境变量获取
+  org: "trading"
+  bucket: "audit"
+  timeout: 30  # 连接超时时间（秒）
+
+# PostgreSQL关系数据库配置
+relational_db:
+  url: "${POSTGRES_URL}"  # 从环境变量获取，格式: postgresql://user:password@host:port/database
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+
+# 审计日志器配置
+audit_logger:
+  batch_size: 100  # 批处理大小
+  flush_interval: 60  # 刷新间隔（秒）
+  max_retries: 3  # 最大重试次数
+  retry_delay: 5  # 重试延迟（秒）
+
+# 数据保留策略
+data_retention:
+  retention_days: 1825  # 数据保留天数（5年）
+  cleanup_interval_hours: 24  # 清理任务执行间隔（小时）
+  backup_before_cleanup: true  # 清理前是否备份
+  backup_path: "/var/backups/audit"
+
+# 合规报告配置
+compliance_report:
+  auto_generate: true  # 是否自动生成报告
+  generation_interval_days: 30  # 报告生成间隔（天）
+  report_retention_days: 2555  # 报告保留天数（7年）
+  
+  # 合规阈值
+  thresholds:
+    max_concentration: 0.5  # 最大持仓集中度
+    max_single_position: 0.3  # 单一持仓最大权重
+    min_compliance_score: 0.8  # 最低合规分数
+    max_violation_rate: 0.05  # 最大违规率
+
+# 告警配置
+alerts:
+  enabled: true
+  channels:
+    - email
+    - webhook
+  
+  # 告警规则
+  rules:
+    high_violation_rate:
+      threshold: 0.1
+      severity: "high"
+      cooldown_minutes: 60
+    
+    low_compliance_score:
+      threshold: 0.7
+      severity: "medium"
+      cooldown_minutes: 30
+    
+    system_error:
+      severity: "critical"
+      cooldown_minutes: 5
+
+# 性能监控配置
+monitoring:
+  enabled: true
+  metrics_port: 8080  # Prometheus指标端口
+  
+  # 性能阈值
+  performance_thresholds:
+    max_write_latency_ms: 100
+    max_query_latency_ms: 500
+    max_batch_size: 1000
+    max_memory_usage_mb: 512
+
+# 安全配置
+security:
+  encryption_enabled: true
+  encryption_key: "${AUDIT_ENCRYPTION_KEY}"  # 从环境变量获取
+  access_log_enabled: true
+  audit_trail_enabled: true  # 审计日志的审计日志
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_path: "/var/log/audit/audit.log"
+  max_file_size_mb: 100
+  backup_count: 10
+  rotation: "daily"

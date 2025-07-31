@@ -1,0 +1,28 @@
+# 交易配置文件
+# 支持环境变量覆盖，例如：TRADING_ENVIRONMENT_INITIAL_CASH=2000000.0
+trading:
+  environment:
+    stock_pool: []              # 股票池，将在运行时填充，可通过 TRADING_ENVIRONMENT_STOCK_POOL 覆盖
+    lookback_window: 60         # 回看窗口，可通过 TRADING_ENVIRONMENT_LOOKBACK_WINDOW 覆盖
+    initial_cash: 1000000.0     # 初始资金，可通过 TRADING_ENVIRONMENT_INITIAL_CASH 覆盖
+    commission_rate: 0.001      # 手续费率 0.1%，可通过 TRADING_ENVIRONMENT_COMMISSION_RATE 覆盖
+    stamp_tax_rate: 0.001       # 印花税率 0.1%，可通过 TRADING_ENVIRONMENT_STAMP_TAX_RATE 覆盖
+    risk_aversion: 0.1          # 风险厌恶系数，可通过 TRADING_ENVIRONMENT_RISK_AVERSION 覆盖
+    max_drawdown_penalty: 1.0   # 最大回撤惩罚，可通过 TRADING_ENVIRONMENT_MAX_DRAWDOWN_PENALTY 覆盖
+    
+  cost_model:
+    almgren_chriss:
+      permanent_impact: 0.1     # 永久冲击系数，可通过 TRADING_COST_MODEL_ALMGREN_CHRISS_PERMANENT_IMPACT 覆盖
+      temporary_impact: 0.05    # 临时冲击系数，可通过 TRADING_COST_MODEL_ALMGREN_CHRISS_TEMPORARY_IMPACT 覆盖
+    
+  data:
+    provider: "qlib"            # 数据提供商 qlib 或 akshare，可通过 TRADING_DATA_PROVIDER 覆盖
+    cache_enabled: true         # 是否启用缓存，可通过 TRADING_DATA_CACHE_ENABLED 覆盖
+    cache_dir: "./data_cache"   # 缓存目录，可通过 TRADING_DATA_CACHE_DIR 覆盖
+    
+backtest:
+  freq: "1d"                    # 回测频率 1d 或 1min，可通过 BACKTEST_FREQ 覆盖
+  rebalance_freq: "1d"          # 再平衡频率，可通过 BACKTEST_REBALANCE_FREQ 覆盖
+  start_date: "2020-01-01"      # 回测开始日期，可通过 BACKTEST_START_DATE 覆盖
+  end_date: "2023-12-31"        # 回测结束日期，可通过 BACKTEST_END_DATE 覆盖
+  benchmark: "000300.SH"        # 基准指数（沪深300），可通过 BACKTEST_BENCHMARK 覆盖
