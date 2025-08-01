@@ -699,17 +699,17 @@ class FeatureEngineer:
             logger.info("计算技术指标...")
             technical_features = self.calculate_technical_indicators(data)
             
-            logger.info("计算微观结构特征...")
+            logger.debug("计算微观结构特征...")
             microstructure_features = self.calculate_microstructure_features(data)
             
-            logger.info("计算波动率特征...")
+            logger.debug("计算波动率特征...")
             volatility_features = self.calculate_volatility_features(data)
             
-            logger.info("计算动量特征...")
+            logger.debug("计算动量特征...")
             momentum_features = self.calculate_momentum_features(data)
             
             # 合并所有特征
-            logger.info("合并特征...")
+            logger.debug("合并特征...")
             all_features = self.combine_features([
                 data,
                 technical_features,
@@ -719,11 +719,11 @@ class FeatureEngineer:
             ])
             
             # 处理缺失值
-            logger.info("处理缺失值...")
+            logger.debug("处理缺失值...")
             clean_features = self.handle_missing_values(all_features, method='ffill_bfill_zero')
             
             # 标准化特征
-            logger.info("标准化特征...")
+            logger.debug("标准化特征...")
             normalized_features = self.normalize_features(clean_features)
             
             logger.info(f"特征计算完成，共生成 {len(normalized_features.columns)} 个特征")

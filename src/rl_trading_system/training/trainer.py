@@ -233,7 +233,8 @@ class RLTrainer:
         # 初始化学习率调度器（如果智能体支持）
         self._setup_lr_scheduler()
 
-        logger.info(f"训练器初始化完成，配置: {config}")
+        logger.info("训练器初始化完成")
+        logger.debug(f"训练配置: {config}")
 
     def _set_random_seed(self, seed: int):
         """设置随机种子"""
@@ -319,8 +320,8 @@ class RLTrainer:
                 )
                 self.agent.add_experience(experience)
 
-                # 调试日志：验证total_env_steps是否正确更新
-                if step % 50 == 0:  # 每50步记录一次
+                # 调试日志：验证total_env_steps是否正确更新（降低频率）
+                if step % 100 == 0:  # 每100步记录一次
                     logger.debug(f"Episode {episode_num}, Step {step}: total_env_steps = {self.agent.total_env_steps}, can_update = {self.agent.can_update()}")
 
 
@@ -339,7 +340,7 @@ class RLTrainer:
 
     def _validate(self) -> float:
         """运行验证"""
-        logger.info("开始验证...")
+        logger.debug("开始验证...")
 
         validation_rewards = []
         n_validation_episodes = 5  # 运行5个验证episode
@@ -375,7 +376,7 @@ class RLTrainer:
         with open(filepath, 'wb') as f:
             pickle.dump(checkpoint, f)
 
-        logger.info(f"检查点已保存到: {filepath}")
+        logger.debug(f"检查点已保存到: {filepath}")
 
     def load_checkpoint(self, filepath: str) -> int:
         """加载检查点"""
@@ -395,20 +396,31 @@ class RLTrainer:
         if 'agent_path' in checkpoint and hasattr(self.agent, 'load'):
             self.agent.load(checkpoint['agent_path'])
 
-        logger.info(f"检查点已从 {filepath} 加载，episode: {episode}")
+        logger.debug(f"检查点已从 {filepath} 加载，episode: {episode}")
         return episode
 
     def _log_episode_stats(self, episode: int, reward: float, length: int,
                           update_info: Dict[str, float]):
         """记录episode统计信息"""
-        if episode % 10 == 0:  # 每10个episode记录一次
-            recent_stats = self.metrics.get_recent_statistics(window=10)
+        # 根据训练进度调整日志频率
+        if self.config.n_episodes <= 10:
+            # 少量episode时每个都记录
+            log_frequency = 1
+        elif self.config.n_episodes <= 100:
+            # 中等数量episode时每5个记录一次
+            log_frequency = 5
+        else:
+            # 大量episode时每20个记录一次
+            log_frequency = 20
+            
+        if episode % log_frequency == 0:
+            recent_stats = self.metrics.get_recent_statistics(window=min(10, episode))
 
             log_msg = (
                 f"Episode {episode:4d} | "
                 f"Reward: {reward:7.2f} | "
                 f"Length: {length:3d} | "
-                f"Avg Reward (10): {recent_stats.get('mean_reward', 0):7.2f}"
+                f"Avg Reward ({min(10, episode)}): {recent_stats.get('mean_reward', 0):7.2f}"
             )
 
             if update_info:
@@ -502,5 +514,6 @@ class RLTrainer:
             'total_episodes': n_episodes
         }
 
-        logger.info(f"评估完成: {evaluation_stats}")
+        logger.info(f"评估完成，平均奖励: {evaluation_stats['mean_reward']:.4f}")
+        logger.debug(f"详细评估结果: {evaluation_stats}")
         return evaluation_stats

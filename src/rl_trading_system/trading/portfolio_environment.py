@@ -146,12 +146,15 @@ class PortfolioEnvironment(gym.Env):
         # 初始化环境状态变量
         self._initialize_state_variables()
         
+        # 初始化警告跟踪
+        self._warned_invalid_prices = set()  # 跟踪已经警告过的股票-日期组合
+        
         # 加载历史数据
         self._load_market_data()
         
-        logger.info(f"投资组合环境初始化完成: {self.n_stocks}只股票, "
-                   f"观察空间: {self.observation_space}, "
-                   f"动作空间: {self.action_space}")
+        logger.info(f"投资组合环境初始化完成: {self.n_stocks}只股票")
+        logger.debug(f"观察空间: {self.observation_space}")
+        logger.debug(f"动作空间: {self.action_space}")
     
     def _initialize_state_variables(self):
         """初始化状态变量"""
@@ -193,7 +196,7 @@ class PortfolioEnvironment(gym.Env):
         
         # 加载基准指数数据（沪深300）
         benchmark_symbol = "000300.SH"  # 沪深300指数
-        logger.info(f"加载基准指数数据: {benchmark_symbol}")
+        logger.debug(f"加载基准指数数据: {benchmark_symbol}")
         
         self.benchmark_data = self.data_interface.get_price_data(
             symbols=[benchmark_symbol],
@@ -211,7 +214,7 @@ class PortfolioEnvironment(gym.Env):
                 elif 'date' in self.benchmark_data.columns:
                     self.benchmark_data = self.benchmark_data.set_index('date')
             
-            logger.info(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
+            logger.debug(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
         else:
             logger.warning("基准数据为空，将使用默认市场收益率")
             self.benchmark_data = None
@@ -281,7 +284,7 @@ class PortfolioEnvironment(gym.Env):
         
         observation = self._get_observation()
         
-        logger.info(f"环境重置完成，起始索引: {self.start_idx}, 初始价格: {self.current_prices}")
+        logger.debug(f"环境重置完成，起始索引: {self.start_idx}, 初始价格: {self.current_prices}")
         
         return observation
     
@@ -502,14 +505,14 @@ class PortfolioEnvironment(gym.Env):
             logger.warning(f"投资组合收益率异常: {portfolio_return}")
             portfolio_return = 0.0
         
-        # 调试日志：记录收益计算详情
-        if self.current_step % 50 == 0:
-            logger.info(f"Step {self.current_step} 收益计算详情:")
-            logger.info(f"  当前价格: {self.current_prices}")
-            logger.info(f"  前期价格: {self.previous_prices}")
-            logger.info(f"  个股收益率: {stock_returns}")
-            logger.info(f"  持仓权重: {self.current_positions}")
-            logger.info(f"  投资组合收益率: {portfolio_return}")
+        # 调试日志：记录收益计算详情（降低频率并设为debug级别）
+        if self.current_step % 200 == 0:
+            logger.debug(f"Step {self.current_step} 收益计算详情:")
+            logger.debug(f"  当前价格: {self.current_prices}")
+            logger.debug(f"  前期价格: {self.previous_prices}")
+            logger.debug(f"  个股收益率: {stock_returns}")
+            logger.debug(f"  持仓权重: {self.current_positions}")
+            logger.debug(f"  投资组合收益率: {portfolio_return}")
         
         return portfolio_return
     
@@ -604,15 +607,15 @@ class PortfolioEnvironment(gym.Env):
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
         
-        # 调试日志（增加详细信息）
-        if self.current_step % 50 == 0:  # 更频繁的日志
-            logger.info(f"Step {self.current_step}: portfolio_return={portfolio_return:.6f}, "
+        # 调试日志（降低频率并设为debug级别）
+        if self.current_step % 200 == 0:  # 降低日志频率
+            logger.debug(f"Step {self.current_step}: portfolio_return={portfolio_return:.6f}, "
                         f"market_return={market_return:.6f}, excess_return={excess_return:.6f}, "
                         f"transaction_cost_ratio={transaction_cost_ratio:.6f}")
-            logger.info(f"Alpha_reward={alpha_reward:.4f}, exploration_bonus={exploration_bonus:.4f}, "
+            logger.debug(f"Alpha_reward={alpha_reward:.4f}, exploration_bonus={exploration_bonus:.4f}, "
                        f"concentration_penalty={concentration_penalty:.4f}, "
                        f"drawdown_penalty={drawdown_penalty:.4f}, final_reward={reward:.4f}")
-            logger.info(f"Weights: {[f'{w:.3f}' for w in weights]}, "
+            logger.debug(f"Weights: {[f'{w:.3f}' for w in weights]}, "
                        f"Weight_variance: {np.var(weights):.4f}")
         
         # 记录Alpha收益历史，用于后续分析
@@ -816,7 +819,11 @@ class PortfolioEnvironment(gym.Env):
                 if pd.isna(price) or price <= 0:
                     # 如果价格无效，使用前一期价格或抛出异常
                     if self.previous_prices is not None and i < len(self.previous_prices):
-                        logger.warning(f"股票{symbol}在{date}的价格无效: {price}，使用前期价格: {self.previous_prices[i]}")
+                        # 只在第一次遇到该股票的无效价格时警告
+                        warning_key = f"{symbol}_{date}"
+                        if warning_key not in self._warned_invalid_prices:
+                            logger.warning(f"股票{symbol}在{date}的价格无效: {price}，使用前期价格: {self.previous_prices[i]}")
+                            self._warned_invalid_prices.add(warning_key)
                         new_current_prices[i] = self.previous_prices[i]
                     else:
                         raise RuntimeError(f"股票{symbol}在{date}的价格无效: {price}，且无前期价格可用")

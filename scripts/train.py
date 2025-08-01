@@ -47,7 +47,8 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
 
 def create_training_components(model_config: dict, trading_config: dict, output_dir: str):
     """创建训练所需的组件"""
-    print("初始化训练组件...")
+    logger = logging.getLogger(__name__)
+    logger.info("初始化训练组件...")
 
     # 创建数据组件
     data_interface = QlibDataInterface()
@@ -55,7 +56,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     data_processor = DataProcessor()
 
     # 加载和处理数据
-    print("加载股票数据...")
+    logger.info("加载股票数据...")
     # 从nested配置中提取参数
     trading_env = trading_config.get("trading", {}).get("environment", {})
     backtest_config = trading_config.get("backtest", {})
@@ -74,7 +75,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     )
 
     # 特征工程
-    print("执行特征工程...")
+    logger.info("执行特征工程...")
     if market_data.empty:
         raise ValueError(f"无法获取股票数据: symbols={stock_pool}, "
                         f"start_date={start_date}, end_date={end_date}")
@@ -100,7 +101,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     normalized_data = feature_engineer.normalize_features(processed_data)
 
     # 数据分割
-    print("分割训练/验证数据...")
+    logger.debug("分割训练/验证数据...")
     split_config = SplitConfig(
         train_ratio=0.7,
         validation_ratio=0.2,
@@ -137,12 +138,12 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     )
 
     # 创建模型
-    print("初始化Transformer和SAC智能体...")
+    logger.debug("初始化Transformer和SAC智能体...")
     transformer = TimeSeriesTransformer(transformer_config)
     sac_agent = SACAgent(sac_config)
 
     # 创建交易环境
-    print("创建交易环境...")
+    logger.debug("创建交易环境...")
     portfolio_config = PortfolioConfig(
         stock_pool=stock_pool,
         initial_cash=trading_env.get("initial_cash", 1000000.0),
