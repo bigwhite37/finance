@@ -205,16 +205,43 @@ class PortfolioEnvironment(gym.Env):
         )
         
         if not self.benchmark_data.empty:
-            # 如果基准数据是多层索引，需要展平
+            logger.debug(f"原始基准数据结构: index={self.benchmark_data.index.names}, columns={list(self.benchmark_data.columns)}")
+            logger.debug(f"基准数据前5行:\n{self.benchmark_data.head()}")
+            
+            # 如果基准数据是多层索引，需要展平为单一时间序列
             if isinstance(self.benchmark_data.index, pd.MultiIndex):
+                # 对于基准指数，我们只需要时间序列数据，不需要多层索引
                 # 重置索引，保留datetime作为索引
                 self.benchmark_data = self.benchmark_data.reset_index()
-                if 'datetime' in self.benchmark_data.columns:
-                    self.benchmark_data = self.benchmark_data.set_index('datetime')
-                elif 'date' in self.benchmark_data.columns:
-                    self.benchmark_data = self.benchmark_data.set_index('date')
+                
+                # 找到时间列
+                time_col = None
+                for col in ['datetime', 'date']:
+                    if col in self.benchmark_data.columns:
+                        time_col = col
+                        break
+                
+                if time_col:
+                    self.benchmark_data = self.benchmark_data.set_index(time_col)
+                    # 如果有多个股票（虽然基准应该只有一个），取第一个
+                    if 'instrument' in self.benchmark_data.columns:
+                        # 只保留基准指数的数据
+                        benchmark_instruments = self.benchmark_data['instrument'].unique()
+                        if len(benchmark_instruments) > 0:
+                            self.benchmark_data = self.benchmark_data[
+                                self.benchmark_data['instrument'] == benchmark_instruments[0]
+                            ].drop('instrument', axis=1)
+                else:
+                    logger.warning("无法找到时间列，基准数据可能格式不正确")
+                    self.benchmark_data = None
             
-            logger.debug(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
+            if self.benchmark_data is not None:
+                # 确保数据按时间排序
+                self.benchmark_data = self.benchmark_data.sort_index()
+                logger.debug(f"处理后基准数据结构: index={self.benchmark_data.index.name}, columns={list(self.benchmark_data.columns)}")
+                logger.debug(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
+            else:
+                logger.warning("基准数据处理失败，将使用默认市场收益率")
         else:
             logger.warning("基准数据为空，将使用默认市场收益率")
             self.benchmark_data = None
@@ -632,39 +659,63 @@ class PortfolioEnvironment(gym.Env):
         使用真实的市场基准指数（如沪深300）作为基准
         这样智能体需要真正跑赢市场才能获得正奖励
         """
-        if not hasattr(self, 'benchmark_data') or self.benchmark_data is None:
+        if not hasattr(self, 'benchmark_data') or self.benchmark_data is None or self.benchmark_data.empty:
             # 如果没有基准数据，使用固定的市场平均收益率
             return 0.0001  # 假设市场日均收益率为0.01%
         
-        if self.current_step == 0:
+        if self.current_step <= 1:
             return 0.0  # 第一步没有前一期数据
         
-        # 获取基准指数的前一期和当期价格，处理边界情况
-        current_idx = min(self.start_idx + self.current_step - 1, len(self.benchmark_data) - 1)  # -1因为current_step已经+1了
-        previous_idx = max(0, current_idx - 1)
+        # 重要修复：正确计算基准数据的索引
+        # current_step在step方法开始时已经+1，所以这里需要正确对应
+        # 当前步骤对应的数据索引应该是 start_idx + current_step - 1
+        current_data_idx = self.start_idx + self.current_step - 1
+        previous_data_idx = self.start_idx + self.current_step - 2
         
         # 检查索引有效性
-        if current_idx >= len(self.benchmark_data):
-            raise RuntimeError(f"基准数据索引超出范围: 请求索引={current_idx}, 数据长度={len(self.benchmark_data)}")
+        if current_data_idx >= len(self.benchmark_data) or previous_data_idx < 0:
+            logger.warning(f"基准数据索引超出范围: current_idx={current_data_idx}, previous_idx={previous_data_idx}, 数据长度={len(self.benchmark_data)}")
+            return 0.0001  # 返回默认市场收益率
         
-        if current_idx == previous_idx:
-            # 如果是第一个数据点，返回0收益率
-            return 0.0
+        # 处理多层索引的情况
+        if isinstance(self.benchmark_data.index, pd.MultiIndex):
+            # 如果是多层索引，需要找到对应的数据
+            try:
+                # 获取当前和前一期的基准价格
+                current_benchmark_price = self.benchmark_data.iloc[current_data_idx]['close']
+                previous_benchmark_price = self.benchmark_data.iloc[previous_data_idx]['close']
+            except (IndexError, KeyError) as e:
+                logger.warning(f"无法获取基准数据: {e}")
+                return 0.0001
+        else:
+            # 单层索引的情况
+            if 'close' not in self.benchmark_data.columns:
+                logger.warning(f"基准数据缺少'close'列，可用列: {list(self.benchmark_data.columns)}")
+                return 0.0001
+            
+            try:
+                current_benchmark_price = self.benchmark_data.iloc[current_data_idx]['close']
+                previous_benchmark_price = self.benchmark_data.iloc[previous_data_idx]['close']
+            except IndexError as e:
+                logger.warning(f"基准数据索引错误: {e}")
+                return 0.0001
         
-        if 'close' not in self.benchmark_data.columns:
-            raise RuntimeError(f"基准数据缺少'close'列，可用列: {list(self.benchmark_data.columns)}")
-        
-        current_benchmark_price = self.benchmark_data.iloc[current_idx]['close']
-        previous_benchmark_price = self.benchmark_data.iloc[previous_idx]['close']
-        
+        # 检查价格有效性
+        if pd.isna(current_benchmark_price) or pd.isna(previous_benchmark_price):
+            logger.warning(f"基准价格包含NaN: current={current_benchmark_price}, previous={previous_benchmark_price}")
+            return 0.0001
+            
         if previous_benchmark_price <= 1e-8:
-            raise RuntimeError(f"基准数据前期价格无效: {previous_benchmark_price}")
+            logger.warning(f"基准数据前期价格无效: {previous_benchmark_price}")
+            return 0.0001
         
+        # 计算基准收益率
         market_return = (current_benchmark_price - previous_benchmark_price) / previous_benchmark_price
         
         # 确保市场收益率不是NaN或无穷值
         if np.isnan(market_return) or np.isinf(market_return):
-            raise RuntimeError(f"计算出的市场收益率无效: {market_return}")
+            logger.warning(f"计算出的市场收益率无效: {market_return}")
+            return 0.0001
             
         return market_return
     
