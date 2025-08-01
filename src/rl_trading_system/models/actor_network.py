@@ -81,7 +81,8 @@ class Actor(nn.Module):
         
         # 对输出层使用较小的初始化
         nn.init.uniform_(self.mean_head.weight, -3e-3, 3e-3)
-        nn.init.uniform_(self.mean_head.bias, -3e-3, 3e-3)
+        # 为均值头设置不同的初始偏置，打破对称性
+        nn.init.uniform_(self.mean_head.bias, -0.1, 0.1)
         nn.init.uniform_(self.log_std_head.weight, -3e-3, 3e-3)
         nn.init.uniform_(self.log_std_head.bias, -3e-3, 3e-3)
         
@@ -96,12 +97,27 @@ class Actor(nn.Module):
             mean: 动作均值 [batch_size, action_dim]
             log_std: 动作对数标准差 [batch_size, action_dim]
         """
+        # 检查输入是否包含NaN或无穷值
+        if torch.any(torch.isnan(state)) or torch.any(torch.isinf(state)):
+            # 将NaN和无穷值替换为零
+            state = torch.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         # 共享特征提取
         features = self.shared_layers(state)
+        
+        # 检查特征是否包含NaN
+        if torch.any(torch.isnan(features)):
+            features = torch.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # 计算均值和对数标准差
         mean = self.mean_head(features)
         log_std = self.log_std_head(features)
+        
+        # 确保输出没有NaN值
+        if torch.any(torch.isnan(mean)):
+            mean = torch.nan_to_num(mean, nan=0.0, posinf=1e6, neginf=-1e6)
+        if torch.any(torch.isnan(log_std)):
+            log_std = torch.nan_to_num(log_std, nan=self.config.log_std_min, posinf=self.config.log_std_max, neginf=self.config.log_std_min)
         
         # 限制log_std的范围以确保数值稳定性
         log_std = torch.clamp(log_std, self.config.log_std_min, self.config.log_std_max)
@@ -168,11 +184,19 @@ class Actor(nn.Module):
         Returns:
             weights: 投资组合权重 [batch_size, action_dim]
         """
-        # 将tanh输出从[-1,1]映射到[0,1]
-        action_positive = (action_tanh + 1.0) / 2.0
+        # 使用更低的温度参数来增强权重差异，鼓励更多样化的投资组合
+        temperature = 0.5  # 降低温度以增强探索和权重差异
         
-        # 使用softmax确保权重和为1
-        weights = F.softmax(action_positive, dim=1)
+        # 在softmax之前添加偏置，打破对称性
+        bias = torch.randn_like(action_tanh) * 0.1  # 小的随机偏置
+        action_biased = action_tanh + bias
+        
+        weights = F.softmax(action_biased / temperature, dim=1)
+        
+        # 确保权重没有NaN值
+        if torch.any(torch.isnan(weights)):
+            # 如果出现NaN，回退到均匀分布
+            weights = torch.ones_like(weights) / weights.size(1)
         
         return weights
     
@@ -193,10 +217,13 @@ class Actor(nn.Module):
         # 从投资组合权重反推tanh前的值
         # 这是一个近似过程，因为softmax变换不可逆
         action_normalized = action / (action.sum(dim=1, keepdim=True) + self.config.epsilon)
-        action_positive = action_normalized * 2.0 - 1.0
+        
+        # 使用逆softmax近似（通过对数）
+        action_log = torch.log(action_normalized + self.config.epsilon)
+        action_centered = action_log - action_log.mean(dim=1, keepdim=True)
         
         # 限制在tanh的有效范围内
-        action_positive = torch.clamp(action_positive, -0.999, 0.999)
+        action_positive = torch.clamp(action_centered, -0.999, 0.999)
         action_raw = torch.atanh(action_positive)
         
         # 计算正态分布的对数概率

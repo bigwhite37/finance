@@ -426,9 +426,14 @@ class MultiProcessReplayBuffer(BaseReplayBuffer):
         """添加经验（多进程版本）"""
         try:
             self.experience_queue.put_nowait(experience)
-        except:
-            # 队列满时的处理
-            pass
+        except queue.Full:
+            # 队列满时，移除最旧的经验
+            try:
+                self.experience_queue.get_nowait()
+                self.experience_queue.put_nowait(experience)
+            except queue.Empty:
+                # 如果队列为空，直接添加
+                self.experience_queue.put_nowait(experience)
     
     def sample(self) -> List[Experience]:
         """采样批次（多进程版本）"""

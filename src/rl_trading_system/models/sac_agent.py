@@ -50,7 +50,7 @@ class SACConfig:
     # 训练参数
     batch_size: int = 256
     buffer_capacity: int = 1000000
-    learning_starts: int = 10000  # 开始学习的最小经验数
+    learning_starts: int = 100   # 开始学习的最小经验数（降低以便测试时更早开始学习）
     train_freq: int = 1  # 训练频率
     target_update_freq: int = 1  # 目标网络更新频率
     gradient_steps: int = 1  # 每次更新的梯度步数

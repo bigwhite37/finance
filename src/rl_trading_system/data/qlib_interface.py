@@ -183,8 +183,8 @@ class QlibDataInterface(DataInterface):
             import qlib
             from qlib.data import D
             
-            # 定义需要获取的字段
-            fields = ['$open', '$high', '$low', '$close', '$volume', '$amount']
+            # 定义需要获取的字段（只获取有数据的字段）
+            fields = ['$open', '$high', '$low', '$close', '$volume']
             
             # 获取数据
             data = D.features(formatted_symbols, fields, 
@@ -202,9 +202,16 @@ class QlibDataInterface(DataInterface):
                 '$high': 'high', 
                 '$low': 'low',
                 '$close': 'close',
-                '$volume': 'volume',
-                '$amount': 'amount'
+                '$volume': 'volume'
             }
+            
+            # 如果amount字段存在且有数据，则添加到映射中
+            if '$amount' in data.columns and not data['$amount'].isnull().all():
+                column_mapping['$amount'] = 'amount'
+            else:
+                # 如果amount字段不存在或全为空，则计算amount = close * volume
+                data['$amount'] = data['$close'] * data['$volume']
+                column_mapping['$amount'] = 'amount'
             data = data.rename(columns=column_mapping)
             
             # 将索引中的Qlib格式符号转换回原始格式

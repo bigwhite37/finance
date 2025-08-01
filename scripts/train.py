@@ -47,7 +47,8 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
 
 def create_training_components(model_config: dict, trading_config: dict, output_dir: str):
     """创建训练所需的组件"""
-    print("初始化训练组件...")
+    logger = logging.getLogger(__name__)
+    logger.info("初始化训练组件...")
 
     # 创建数据组件
     data_interface = QlibDataInterface()
@@ -55,14 +56,14 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     data_processor = DataProcessor()
 
     # 加载和处理数据
-    print("加载股票数据...")
+    logger.info("加载股票数据...")
     # 从nested配置中提取参数
     trading_env = trading_config.get("trading", {}).get("environment", {})
     backtest_config = trading_config.get("backtest", {})
     
-    stock_pool = trading_env.get("stock_pool", ["000001.SZ", "000002.SZ", "600000.SH"])
+    stock_pool = trading_env.get("stock_pool")
     if not stock_pool:  # 如果stock_pool为空列表，使用默认值
-        stock_pool = ["000001.SZ", "000002.SZ", "600000.SH"]
+        raise RuntimeError(f"empty tock_pool: {stock_pool}")
     
     start_date = backtest_config.get("start_date", "2020-01-01")
     end_date = backtest_config.get("end_date", "2023-12-31")
@@ -74,7 +75,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     )
 
     # 特征工程
-    print("执行特征工程...")
+    logger.info("执行特征工程...")
     if market_data.empty:
         raise ValueError(f"无法获取股票数据: symbols={stock_pool}, "
                         f"start_date={start_date}, end_date={end_date}")
@@ -100,7 +101,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     normalized_data = feature_engineer.normalize_features(processed_data)
 
     # 数据分割
-    print("分割训练/验证数据...")
+    logger.debug("分割训练/验证数据...")
     split_config = SplitConfig(
         train_ratio=0.7,
         validation_ratio=0.2,
@@ -137,12 +138,12 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     )
 
     # 创建模型
-    print("初始化Transformer和SAC智能体...")
+    logger.debug("初始化Transformer和SAC智能体...")
     transformer = TimeSeriesTransformer(transformer_config)
     sac_agent = SACAgent(sac_config)
 
     # 创建交易环境
-    print("创建交易环境...")
+    logger.debug("创建交易环境...")
     portfolio_config = PortfolioConfig(
         stock_pool=stock_pool,
         initial_cash=trading_env.get("initial_cash", 1000000.0),
@@ -228,14 +229,23 @@ def main():
         model_config = config_manager.load_config(str(model_config_path))
         trading_config = config_manager.load_config(str(data_config_path))
 
+        # 调试：打印配置内容
+        logger_instance.debug(f"模型配置内容: {model_config}")
+        logger_instance.debug(f"交易配置内容: {trading_config}")
+
         # 覆盖配置参数
         if args.episodes:
+            if "training" not in model_config:
+                model_config["training"] = {}
             model_config["training"]["n_episodes"] = args.episodes
 
         logger_instance.info("训练配置:")
         logger_instance.info(f"  模型配置文件: {args.config}")
         logger_instance.info(f"  交易配置文件: {args.data_config}")
-        logger_instance.info(f"  训练轮数: {model_config['training']['n_episodes']}")
+        
+        # 安全地获取训练轮数
+        n_episodes = model_config.get("model", {}).get("training", {}).get("n_episodes", 100)
+        logger_instance.info(f"  训练轮数: {n_episodes}")
         logger_instance.info(f"  输出目录: {args.output_dir}")
         logger_instance.info(f"  设备: {device}")
 

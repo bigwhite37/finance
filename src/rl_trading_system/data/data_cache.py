@@ -95,8 +95,9 @@ class DataCache:
                 # 删除损坏的缓存文件
                 try:
                     os.remove(cache_path)
-                except:
-                    pass
+                except OSError as e:
+                    logger.warning(f"无法删除缓存文件 {cache_path}: {e}")
+                    raise
         
         return None
     
@@ -218,8 +219,9 @@ class DataCache:
                         
                         if self._is_expired(cache_item['timestamp'], cache_item['ttl']):
                             os.remove(file_path)
-                    except:
+                    except (OSError, json.JSONDecodeError) as e:
                         # 如果文件损坏，直接删除
+                        logger.warning(f"缓存文件损坏，删除: {file_path}, 错误: {e}")
                         os.remove(file_path)
             
             logger.info(f"清理了{len(expired_keys)}个过期缓存")

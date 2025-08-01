@@ -272,7 +272,7 @@ class FeatureEngineer:
         
         # 计算EPS增长率（如果有相关数据）
         if 'eps' in data.columns:
-            result['eps_growth'] = data['eps'].pct_change(periods=4)  # 年度增长率
+            result['eps_growth'] = data['eps'].pct_change(periods=4, fill_method=None)  # 年度增长率
         
         return result
     
@@ -332,9 +332,15 @@ class FeatureEngineer:
             result['turnover_rate'] = data['volume'] / data['volume'].rolling(window=20).mean()
         
         # Amihud非流动性指标
-        returns = data['close'].pct_change().abs()
+        returns = data['close'].pct_change(fill_method=None).abs()
         dollar_volume = data['amount']
-        result['amihud_illiquidity'] = returns / dollar_volume
+        # 安全处理除零情况：当成交量为0或NaN时，设置流动性指标为无穷大（表示完全不流动）
+        with np.errstate(divide='ignore', invalid='ignore'):
+            amihud = returns / dollar_volume
+            # 将无穷大和NaN替换为一个很大的数值，表示极低的流动性
+            result['amihud_illiquidity'] = np.where(
+                np.isfinite(amihud), amihud, 1e6
+            )
         
         # 买卖价差（简化计算）
         result['bid_ask_spread'] = (data['high'] - data['low']) / data['close']
@@ -346,15 +352,23 @@ class FeatureEngineer:
         result = pd.DataFrame(index=data.index)
         
         # 已实现波动率
-        returns = data['close'].pct_change()
+        returns = data['close'].pct_change(fill_method=None)
         result['realized_volatility'] = returns.rolling(window=20).std() * np.sqrt(252)
         
-        # Garman-Klass波动率估计
-        gk_vol = np.log(data['high'] / data['low']) ** 2 - (2 * np.log(2) - 1) * np.log(data['close'] / data['open']) ** 2
+        # Garman-Klass波动率估计（安全处理对数计算）
+        high_low_ratio = data['high'] / data['low']
+        close_open_ratio = data['close'] / data['open']
+        
+        # 安全计算对数，避免log(1)=0和log(<=0)的问题
+        log_hl = high_low_ratio.apply(lambda x: np.log(x) if x > 1 else 0)
+        log_co = close_open_ratio.apply(lambda x: np.log(x) if x > 0 and x != 1 else 0)
+        
+        gk_vol = log_hl ** 2 - (2 * np.log(2) - 1) * log_co ** 2
         result['garman_klass_volatility'] = gk_vol.rolling(window=20).mean() * 252
         
-        # Parkinson波动率估计
-        parkinson_vol = np.log(data['high'] / data['low']) ** 2 / (4 * np.log(2))
+        # Parkinson波动率估计（安全处理）
+        log_hl_parkinson = high_low_ratio.apply(lambda x: np.log(x) if x > 1 else 0)
+        parkinson_vol = log_hl_parkinson ** 2 / (4 * np.log(2))
         result['parkinson_volatility'] = parkinson_vol.rolling(window=20).mean() * 252
         
         return result
@@ -364,11 +378,11 @@ class FeatureEngineer:
         result = pd.DataFrame(index=data.index)
         
         # 价格动量
-        result['price_momentum_1m'] = data['close'].pct_change(periods=20)  # 1个月
-        result['price_momentum_3m'] = data['close'].pct_change(periods=60)  # 3个月
+        result['price_momentum_1m'] = data['close'].pct_change(periods=20, fill_method=None)  # 1个月
+        result['price_momentum_3m'] = data['close'].pct_change(periods=60, fill_method=None)  # 3个月
         
         # 成交量动量
-        result['volume_momentum'] = data['volume'].pct_change(periods=20)
+        result['volume_momentum'] = data['volume'].pct_change(periods=20, fill_method=None)
         
         return result
     
@@ -685,17 +699,17 @@ class FeatureEngineer:
             logger.info("计算技术指标...")
             technical_features = self.calculate_technical_indicators(data)
             
-            logger.info("计算微观结构特征...")
+            logger.debug("计算微观结构特征...")
             microstructure_features = self.calculate_microstructure_features(data)
             
-            logger.info("计算波动率特征...")
+            logger.debug("计算波动率特征...")
             volatility_features = self.calculate_volatility_features(data)
             
-            logger.info("计算动量特征...")
+            logger.debug("计算动量特征...")
             momentum_features = self.calculate_momentum_features(data)
             
             # 合并所有特征
-            logger.info("合并特征...")
+            logger.debug("合并特征...")
             all_features = self.combine_features([
                 data,
                 technical_features,
@@ -705,11 +719,11 @@ class FeatureEngineer:
             ])
             
             # 处理缺失值
-            logger.info("处理缺失值...")
+            logger.debug("处理缺失值...")
             clean_features = self.handle_missing_values(all_features, method='ffill_bfill_zero')
             
             # 标准化特征
-            logger.info("标准化特征...")
+            logger.debug("标准化特征...")
             normalized_features = self.normalize_features(clean_features)
             
             logger.info(f"特征计算完成，共生成 {len(normalized_features.columns)} 个特征")

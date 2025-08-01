@@ -235,3 +235,5 @@ htmlcov/
 *.profile
 
 node_modules/
+tasks.md
+*.txt

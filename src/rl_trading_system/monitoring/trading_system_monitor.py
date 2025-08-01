@@ -304,7 +304,8 @@ class PrometheusExporter:
             req = urllib.request.Request(f"http://localhost:{self.port}/metrics")
             with urllib.request.urlopen(req, timeout=1) as response:
                 return response.getcode() == 200
-        except:
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            logger.debug(f"健康检查失败: {e}")
             return False
 
 

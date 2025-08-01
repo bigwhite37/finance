@@ -563,8 +563,9 @@ class ModelVersionManager:
         try:
             # 尝试使用torch.load
             return torch.load(file_path, map_location='cpu')
-        except:
+        except (torch.serialization.pickle.UnpicklingError, RuntimeError) as e:
             # 回退到pickle
+            logger.warning(f"torch.load失败，尝试pickle: {e}")
             with open(file_path, 'rb') as f:
                 return pickle.load(f)
     
