@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """训练配置"""
     n_episodes: int = 5000
-    max_steps_per_episode: int = 252
+    max_steps_per_episode: int = 180  # 降低以匹配实际数据长度
     batch_size: int = 256
     learning_rate: float = 3e-4
     buffer_size: int = 1000000
@@ -311,12 +311,12 @@ class RLTrainer:
                     next_state=next_state_tensor,
                     done=done
                 )
-                self.agent.replay_buffer.add(experience)
+                self.agent.add_experience(experience)
                 
-                # 定期更新智能体
-                if (episode_num > self.config.warmup_episodes and 
-                    step % self.config.update_frequency == 0):
-                    self._update_agent()
+                # 调试日志：验证total_env_steps是否正确更新
+                if step % 50 == 0:  # 每50步记录一次
+                    logger.debug(f"Episode {episode_num}, Step {step}: total_env_steps = {self.agent.total_env_steps}, can_update = {self.agent.can_update()}")
+                
             
             obs = next_obs
             

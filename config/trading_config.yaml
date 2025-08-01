@@ -5,9 +5,9 @@ trading:
     stock_pool: []              # 股票池，将在运行时填充，可通过 TRADING_ENVIRONMENT_STOCK_POOL 覆盖
     lookback_window: 60         # 回看窗口，可通过 TRADING_ENVIRONMENT_LOOKBACK_WINDOW 覆盖
     initial_cash: 1000000.0     # 初始资金，可通过 TRADING_ENVIRONMENT_INITIAL_CASH 覆盖
-    commission_rate: 0.001      # 手续费率 0.1%，可通过 TRADING_ENVIRONMENT_COMMISSION_RATE 覆盖
-    stamp_tax_rate: 0.001       # 印花税率 0.1%，可通过 TRADING_ENVIRONMENT_STAMP_TAX_RATE 覆盖
-    risk_aversion: 0.1          # 风险厌恶系数，可通过 TRADING_ENVIRONMENT_RISK_AVERSION 覆盖
+    commission_rate: 0.0005     # 手续费率 0.05%，可通过 TRADING_ENVIRONMENT_COMMISSION_RATE 覆盖
+    stamp_tax_rate: 0.0005      # 印花税率 0.05%，可通过 TRADING_ENVIRONMENT_STAMP_TAX_RATE 覆盖
+    risk_aversion: 0.01         # 风险厌恶系数（降低以减少过度惩罚），可通过 TRADING_ENVIRONMENT_RISK_AVERSION 覆盖
     max_drawdown_penalty: 1.0   # 最大回撤惩罚，可通过 TRADING_ENVIRONMENT_MAX_DRAWDOWN_PENALTY 覆盖
     
   cost_model:

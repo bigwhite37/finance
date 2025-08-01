@@ -196,10 +196,13 @@ class PortfolioEnvironment(gym.Env):
         
         # 更新最大步数
         if isinstance(self.price_data.index, pd.MultiIndex) and 'datetime' in self.price_data.index.names:
-            self.max_steps = len(self.price_data.index.get_level_values('datetime').unique())
+            unique_dates = self.price_data.index.get_level_values('datetime').unique()
+            self.max_steps = len(unique_dates)
+            self._max_steps = self.max_steps  # 保存实际数据长度
         else:
             # 如果没有多层索引，使用数据长度除以股票数量
             self.max_steps = len(self.price_data) // len(self.config.stock_pool) if len(self.config.stock_pool) > 0 else len(self.price_data)
+            self._max_steps = self.max_steps
         
         logger.info(f"加载市场数据完成: {len(self.price_data)}条记录, {self.max_steps}个交易日")
     
@@ -423,6 +426,10 @@ class PortfolioEnvironment(gym.Env):
         # 计算投资组合加权收益率
         portfolio_return = np.dot(self.current_positions, stock_returns)
         
+        # 调试日志：记录收益计算详情
+        if self.current_step % 50 == 0:
+            logger.debug(f"Step {self.current_step}: stock_returns={stock_returns}, positions={self.current_positions}, portfolio_return={portfolio_return}")
+        
         return portfolio_return
     
     def _update_portfolio_value(self, portfolio_return: float, transaction_cost: float):
@@ -442,19 +449,44 @@ class PortfolioEnvironment(gym.Env):
     def _calculate_reward(self, portfolio_return: float, 
                          transaction_cost: float, weights: np.ndarray) -> float:
         """计算奖励函数"""
-        # 净收益
-        net_return = portfolio_return - transaction_cost / self.total_value
+        # 净收益（放大100倍以提供更强的信号）
+        net_return = (portfolio_return - transaction_cost / self.total_value) * 100
         
-        # 风险惩罚（基于权重集中度）
+        # 大幅降低风险惩罚（原来过重）
         concentration = np.sum(weights ** 2)  # Herfindahl指数
-        risk_penalty = self.config.risk_aversion * concentration
+        risk_penalty = self.config.risk_aversion * concentration * 0.1  # 降低10倍
         
-        # 回撤惩罚
+        # 降低回撤惩罚
         current_drawdown = self._calculate_current_drawdown()
-        drawdown_penalty = self.config.max_drawdown_penalty * max(0, current_drawdown - 0.1)
+        drawdown_penalty = self.config.max_drawdown_penalty * max(0, current_drawdown - 0.2) * 0.5  # 降低阈值和惩罚
         
-        # 总奖励
+        # 基础奖励
         reward = net_return - risk_penalty - drawdown_penalty
+        
+        # 添加基准奖励（鼓励持有而非空仓）
+        if np.sum(weights) > 0.5:  # 如果总持仓超过50%
+            holding_bonus = 0.1
+            reward += holding_bonus
+        
+        # 夏普比率奖励（如果有足够的历史数据）
+        if len(self.returns_history) >= 30:
+            recent_returns = np.array(self.returns_history[-30:])
+            if np.std(recent_returns) > 1e-8:
+                sharpe_bonus = np.mean(recent_returns) / np.std(recent_returns) * 1.0  # 增加奖励
+                reward += sharpe_bonus
+        
+        # 移除不交易惩罚（可能导致过度交易）
+        
+        # 多样化奖励（鼓励分散投资）
+        active_positions = np.sum(weights > 0.01)  # 权重超过1%的持仓
+        if active_positions >= 2:  # 至少持有2只股票
+            diversification_bonus = 0.05 * min(active_positions, len(self.config.stock_pool))  # 增加奖励
+            reward += diversification_bonus
+        
+        # 调试日志
+        if self.current_step % 50 == 0:
+            logger.debug(f"Step {self.current_step}: net_return={net_return:.4f}, risk_penalty={risk_penalty:.4f}, "
+                        f"drawdown_penalty={drawdown_penalty:.4f}, final_reward={reward:.4f}")
         
         return float(reward)
     
@@ -556,18 +588,20 @@ class PortfolioEnvironment(gym.Env):
     
     def _is_done(self) -> bool:
         """判断回合是否结束"""
-        # 基本结束条件：达到最大步数
-        if self.current_step >= self.max_steps:
+        # 数据用尽检查（优先级最高）
+        if (self.feature_data is not None and 
+            self.start_idx + self.current_step >= len(self.feature_data)):
+            logger.debug(f"数据用尽，结束episode: step={self.current_step}, data_len={len(self.feature_data)}")
+            return True
+        
+        # 基本结束条件：达到实际数据的最大步数
+        if self.current_step >= self._max_steps:
+            logger.debug(f"达到最大步数，结束episode: step={self.current_step}, max_steps={self._max_steps}")
             return True
         
         # 风险控制：总价值过低
         if self.total_value < self.config.initial_cash * 0.5:
             logger.warning(f"总价值过低，强制结束: {self.total_value}")
-            return True
-        
-        # 数据用尽
-        if (self.feature_data is not None and 
-            self.start_idx + self.current_step >= len(self.feature_data)):
             return True
         
         return False
