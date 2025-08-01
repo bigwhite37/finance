@@ -146,9 +146,6 @@ class PortfolioEnvironment(gym.Env):
         # 初始化环境状态变量
         self._initialize_state_variables()
         
-        # 初始化警告跟踪
-        self._warned_invalid_prices = set()  # 跟踪已经警告过的股票-日期组合
-        
         # 加载历史数据
         self._load_market_data()
         
@@ -183,16 +180,20 @@ class PortfolioEnvironment(gym.Env):
             raise ValueError("必须指定开始日期和结束日期才能加载市场数据")
         
         # 从数据接口加载真实数据
-        self.price_data = self.data_interface.get_price_data(
+        raw_price_data = self.data_interface.get_price_data(
             symbols=self.config.stock_pool,
             start_date=self.start_date,
             end_date=self.end_date
         )
         
         # 如果没有获取到数据，抛出异常
-        if self.price_data.empty:
+        if raw_price_data.empty:
             raise ValueError(f"无法获取股票数据: symbols={self.config.stock_pool}, "
                            f"start_date={self.start_date}, end_date={self.end_date}")
+        
+        # 数据清洗：处理缺失值
+        self.price_data = self._clean_price_data(raw_price_data)
+        logger.info(f"数据清洗完成: 原始数据{len(raw_price_data)}条记录，清洗后{len(self.price_data)}条记录")
         
         # 加载基准指数数据（沪深300）
         benchmark_symbol = "000300.SH"  # 沪深300指数
@@ -232,8 +233,7 @@ class PortfolioEnvironment(gym.Env):
                                 self.benchmark_data['instrument'] == benchmark_instruments[0]
                             ].drop('instrument', axis=1)
                 else:
-                    logger.warning("无法找到时间列，基准数据可能格式不正确")
-                    self.benchmark_data = None
+                    raise RuntimeError("无法找到时间列，基准数据格式不正确")
             
             if self.benchmark_data is not None:
                 # 确保数据按时间排序
@@ -241,13 +241,37 @@ class PortfolioEnvironment(gym.Env):
                 logger.debug(f"处理后基准数据结构: index={self.benchmark_data.index.name}, columns={list(self.benchmark_data.columns)}")
                 logger.debug(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
             else:
-                logger.warning("基准数据处理失败，将使用默认市场收益率")
+                raise RuntimeError("基准数据处理失败")
         else:
-            logger.warning("基准数据为空，将使用默认市场收益率")
-            self.benchmark_data = None
+            raise RuntimeError("基准数据为空，无法加载基准指数数据")
         
         # 计算特征
         self.feature_data = self.feature_engineer.calculate_features(self.price_data)
+        
+        # 动态计算每只股票的特征数
+        if not self.feature_data.empty:
+            total_features = self.feature_data.shape[1]
+            self.n_features_per_stock = total_features // self.n_stocks
+            logger.info(f"动态计算特征维度: 总特征={total_features}, 股票数={self.n_stocks}, 每股特征={self.n_features_per_stock}")
+            
+            # 重新定义观察空间
+            self.observation_space = spaces.Dict({
+                'features': spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(self.config.lookback_window, self.n_stocks, self.n_features_per_stock),
+                    dtype=np.float32
+                ),
+                'positions': spaces.Box(
+                    low=0, high=1,
+                    shape=(self.n_stocks,),
+                    dtype=np.float32
+                ),
+                'market_state': spaces.Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(self.n_market_features,),
+                    dtype=np.float32
+                )
+            })
         
         # 更新最大步数
         if isinstance(self.price_data.index, pd.MultiIndex):
@@ -272,6 +296,160 @@ class PortfolioEnvironment(gym.Env):
             self._max_steps = self.max_steps
         
         logger.info(f"加载市场数据完成: {len(self.price_data)}条记录, {self.max_steps}个交易日")
+    
+    def _clean_price_data(self, raw_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        清洗价格数据，处理缺失值和节假日数据
+        
+        Args:
+            raw_data: 原始价格数据
+            
+        Returns:
+            清洗后的价格数据
+            
+        Raises:
+            RuntimeError: 当数据质量问题无法修复时
+        """
+        if raw_data.empty:
+            raise RuntimeError("原始价格数据为空，无法进行清洗")
+        
+        # 检查数据结构
+        if not isinstance(raw_data.index, pd.MultiIndex):
+            raise RuntimeError("价格数据必须是多层索引格式 (datetime, instrument)")
+        
+        # 找到日期层级
+        datetime_level = None
+        instrument_level = None
+        for level_name in raw_data.index.names:
+            if level_name and ('time' in level_name.lower() or 'date' in level_name.lower()):
+                datetime_level = level_name
+            elif level_name and ('instrument' in level_name.lower() or 'symbol' in level_name.lower()):
+                instrument_level = level_name
+        
+        if not datetime_level or not instrument_level:
+            raise RuntimeError(f"无法识别数据索引层级: {raw_data.index.names}")
+        
+        # 复制数据进行清洗
+        cleaned_data = raw_data.copy()
+        
+        # 第一步：找到所有股票都有有效数据的第一个交易日
+        valid_start_date = self._find_first_valid_trading_date(cleaned_data, datetime_level, instrument_level)
+        
+        # 第二步：从有效开始日期截取数据
+        all_dates = cleaned_data.index.get_level_values(datetime_level).unique().sort_values()
+        valid_dates = all_dates[all_dates >= valid_start_date]
+        
+        if len(valid_dates) == 0:
+            raise RuntimeError("没有找到任何有效的交易日数据")
+        
+        # 过滤数据，只保留有效日期范围内的数据
+        cleaned_data = cleaned_data.loc[cleaned_data.index.get_level_values(datetime_level).isin(valid_dates)]
+        
+        # 第三步：按股票分组进行数据清洗
+        for symbol in self.config.stock_pool:
+            try:
+                # 提取单只股票的数据
+                symbol_data = cleaned_data.xs(symbol, level=instrument_level)
+                
+                # 检查是否有任何有效数据
+                if symbol_data.isnull().all().all():
+                    raise RuntimeError(f"股票{symbol}没有任何有效的价格数据")
+                
+                # 现在第一个交易日应该是有效的，但为了安全起见再次检查
+                first_day_data = symbol_data.iloc[0]
+                if first_day_data.isnull().any():
+                    raise RuntimeError(f"数据清洗后第一个交易日仍然无效，股票: {symbol}, 日期: {symbol_data.index[0]}")
+                
+                # 前向填充缺失值（处理中间的节假日）
+                filled_data = symbol_data.ffill()
+                
+                # 检查填充后是否还有NaN
+                if filled_data.isnull().any().any():
+                    # 如果还有NaN，说明数据有问题，抛出异常
+                    nan_info = filled_data.isnull().sum()
+                    raise RuntimeError(f"股票{symbol}前向填充后仍有缺失值: {nan_info.to_dict()}")
+                
+                # 将填充后的数据放回原DataFrame
+                for col in filled_data.columns:
+                    cleaned_data.loc[(symbol, slice(None)), col] = filled_data[col].values
+                    
+            except KeyError:
+                raise RuntimeError(f"股票{symbol}在价格数据中不存在")
+        
+        # 最终验证：确保没有NaN值
+        if cleaned_data.isnull().any().any():
+            nan_summary = cleaned_data.isnull().sum()
+            raise RuntimeError(f"数据清洗失败，仍存在缺失值: {nan_summary.to_dict()}")
+        
+        logger.info(f"价格数据清洗成功: {len(self.config.stock_pool)}只股票, "
+                   f"{len(cleaned_data.index.get_level_values(datetime_level).unique())}个交易日, "
+                   f"有效开始日期: {valid_start_date}")
+        
+        return cleaned_data
+    
+    def _find_first_valid_trading_date(self, data: pd.DataFrame, datetime_level: str, instrument_level: str) -> pd.Timestamp:
+        """
+        找到所有股票都有有效数据的第一个交易日
+        
+        Args:
+            data: 原始数据
+            datetime_level: 日期层级名称
+            instrument_level: 股票层级名称
+            
+        Returns:
+            第一个有效交易日的日期
+            
+        Raises:
+            RuntimeError: 如果找不到有效的交易日
+        """
+        all_dates = data.index.get_level_values(datetime_level).unique().sort_values()
+        
+        for date in all_dates:
+            # 检查这个日期是否所有股票都有有效数据
+            date_data = data.xs(date, level=datetime_level)
+            
+            # 检查是否所有股票在这个日期都有数据
+            missing_symbols = set(self.config.stock_pool) - set(date_data.index)
+            if missing_symbols:
+                logger.debug(f"日期{date}缺少股票数据: {missing_symbols}")
+                continue
+            
+            # 检查是否所有股票的数据都是有效的（非NaN）
+            all_valid = True
+            for symbol in self.config.stock_pool:
+                if symbol not in date_data.index:
+                    logger.debug(f"日期{date}股票{symbol}不在数据中")
+                    all_valid = False
+                    break
+                
+                symbol_row = date_data.loc[symbol]
+                # 检查关键价格字段是否有效
+                key_fields = ['open', 'high', 'low', 'close', 'volume']
+                for field in key_fields:
+                    if field in symbol_row.index:
+                        value = symbol_row[field]
+                        if pd.isna(value):
+                            logger.debug(f"日期{date}股票{symbol}字段{field}为NaN")
+                            all_valid = False
+                            break
+                        elif value <= 0:
+                            logger.debug(f"日期{date}股票{symbol}字段{field}值无效: {value}")
+                            all_valid = False
+                            break
+                    else:
+                        logger.debug(f"日期{date}股票{symbol}缺少字段{field}")
+                        all_valid = False
+                        break
+                
+                if not all_valid:
+                    break
+            
+            if all_valid:
+                logger.info(f"找到第一个有效交易日: {date}")
+                return date
+        
+        # 如果没有找到任何有效的交易日，抛出异常
+        raise RuntimeError("没有找到任何所有股票都有有效数据的交易日")
     
     def reset(self) -> Dict[str, np.ndarray]:
         """
@@ -579,8 +757,8 @@ class PortfolioEnvironment(gym.Env):
         else:
             transaction_cost_ratio = 0.0
         
-        # Alpha奖励：超额收益减去交易成本，放大100倍提供更强信号
-        alpha_reward = (excess_return - transaction_cost_ratio) * 100
+        # Alpha奖励：超额收益减去交易成本，显著放大以鼓励探索
+        alpha_reward = (excess_return - transaction_cost_ratio) * 1000
         
         # 确保Alpha奖励不是NaN或无穷值
         if np.isnan(alpha_reward) or np.isinf(alpha_reward):
@@ -660,8 +838,8 @@ class PortfolioEnvironment(gym.Env):
         这样智能体需要真正跑赢市场才能获得正奖励
         """
         if not hasattr(self, 'benchmark_data') or self.benchmark_data is None or self.benchmark_data.empty:
-            # 如果没有基准数据，使用固定的市场平均收益率
-            return 0.0001  # 假设市场日均收益率为0.01%
+            # 如果没有基准数据，抛出异常
+            raise RuntimeError("基准数据不可用，无法计算市场基准收益率")
         
         if self.current_step <= 1:
             return 0.0  # 第一步没有前一期数据
@@ -674,8 +852,7 @@ class PortfolioEnvironment(gym.Env):
         
         # 检查索引有效性
         if current_data_idx >= len(self.benchmark_data) or previous_data_idx < 0:
-            logger.warning(f"基准数据索引超出范围: current_idx={current_data_idx}, previous_idx={previous_data_idx}, 数据长度={len(self.benchmark_data)}")
-            return 0.0001  # 返回默认市场收益率
+            raise RuntimeError(f"基准数据索引超出范围: current_idx={current_data_idx}, previous_idx={previous_data_idx}, 数据长度={len(self.benchmark_data)}")
         
         # 处理多层索引的情况
         if isinstance(self.benchmark_data.index, pd.MultiIndex):
@@ -685,8 +862,8 @@ class PortfolioEnvironment(gym.Env):
                 current_benchmark_price = self.benchmark_data.iloc[current_data_idx]['close']
                 previous_benchmark_price = self.benchmark_data.iloc[previous_data_idx]['close']
             except (IndexError, KeyError) as e:
-                logger.warning(f"无法获取基准数据: {e}")
-                return 0.0001
+                logger.error(f"无法获取基准数据: {e}")
+                raise RuntimeError(f"基准数据访问失败: {e}")
         else:
             # 单层索引的情况
             if 'close' not in self.benchmark_data.columns:
@@ -697,25 +874,22 @@ class PortfolioEnvironment(gym.Env):
                 current_benchmark_price = self.benchmark_data.iloc[current_data_idx]['close']
                 previous_benchmark_price = self.benchmark_data.iloc[previous_data_idx]['close']
             except IndexError as e:
-                logger.warning(f"基准数据索引错误: {e}")
-                return 0.0001
+                logger.error(f"基准数据索引错误: {e}")
+                raise RuntimeError(f"基准数据索引访问失败: {e}")
         
         # 检查价格有效性
         if pd.isna(current_benchmark_price) or pd.isna(previous_benchmark_price):
-            logger.warning(f"基准价格包含NaN: current={current_benchmark_price}, previous={previous_benchmark_price}")
-            return 0.0001
+            raise RuntimeError(f"基准价格包含NaN: current={current_benchmark_price}, previous={previous_benchmark_price}")
             
         if previous_benchmark_price <= 1e-8:
-            logger.warning(f"基准数据前期价格无效: {previous_benchmark_price}")
-            return 0.0001
+            raise RuntimeError(f"基准数据前期价格无效: {previous_benchmark_price}")
         
         # 计算基准收益率
         market_return = (current_benchmark_price - previous_benchmark_price) / previous_benchmark_price
         
         # 确保市场收益率不是NaN或无穷值
         if np.isnan(market_return) or np.isinf(market_return):
-            logger.warning(f"计算出的市场收益率无效: {market_return}")
-            return 0.0001
+            raise RuntimeError(f"计算出的市场收益率无效: {market_return}")
             
         return market_return
     
@@ -866,21 +1040,11 @@ class PortfolioEnvironment(gym.Env):
                     raise RuntimeError(f"价格数据缺少'close'列，可用列: {list(current_day_data.columns)}")
                 
                 price = current_day_data.loc[symbol, 'close']
-                # 确保价格是有效的数值
+                # 数据已经在加载时清洗过，这里应该不会有无效价格
                 if pd.isna(price) or price <= 0:
-                    # 如果价格无效，使用前一期价格或抛出异常
-                    if self.previous_prices is not None and i < len(self.previous_prices):
-                        # 只在第一次遇到该股票的无效价格时警告
-                        warning_key = f"{symbol}_{date}"
-                        if warning_key not in self._warned_invalid_prices:
-                            logger.warning(f"股票{symbol}在{date}的价格无效: {price}，使用前期价格: {self.previous_prices[i]}")
-                            self._warned_invalid_prices.add(warning_key)
-                        new_current_prices[i] = self.previous_prices[i]
-                    else:
-                        raise RuntimeError(f"股票{symbol}在{date}的价格无效: {price}，且无前期价格可用")
-                else:
-                    # 只有当价格有效时才设置
-                    new_current_prices[i] = float(price)
+                    raise RuntimeError(f"股票{symbol}在{date}的价格无效: {price}，数据清洗失败")
+                
+                new_current_prices[i] = float(price)
             else:
                 raise RuntimeError(f"股票{symbol}在{date}没有价格数据")
         

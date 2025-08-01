@@ -28,8 +28,49 @@ class MockDataInterface(DataInterface):
     
     def get_price_data(self, symbols: List[str], 
                       start_date: str, end_date: str) -> pd.DataFrame:
-        # 返回空DataFrame，让环境使用模拟数据
-        return pd.DataFrame()
+        """生成模拟价格数据"""
+        import pandas as pd
+        import numpy as np
+        from datetime import datetime, timedelta
+        
+        # 生成日期范围
+        start = datetime.strptime(start_date, '%Y-%m-%d')
+        end = datetime.strptime(end_date, '%Y-%m-%d')
+        date_range = pd.date_range(start=start, end=end, freq='D')
+        
+        # 过滤掉周末（简化处理）
+        date_range = [d for d in date_range if d.weekday() < 5]
+        
+        data = []
+        for date in date_range:
+            for symbol in symbols:
+                # 生成模拟价格数据
+                base_price = 100.0 + hash(symbol) % 50
+                daily_return = np.random.normal(0, 0.02)  # 2%的日波动率
+                
+                open_price = base_price * (1 + daily_return)
+                high_price = open_price * (1 + abs(np.random.normal(0, 0.01)))
+                low_price = open_price * (1 - abs(np.random.normal(0, 0.01)))
+                close_price = open_price * (1 + np.random.normal(0, 0.005))
+                
+                row = {
+                    'datetime': date,
+                    'instrument': symbol,
+                    'open': max(0.01, open_price),
+                    'high': max(0.01, high_price),
+                    'low': max(0.01, low_price),
+                    'close': max(0.01, close_price),
+                    'volume': np.random.randint(1000000, 10000000),
+                    'amount': np.random.randint(100000000, 1000000000)
+                }
+                data.append(row)
+        
+        if not data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data)
+        df = df.set_index(['datetime', 'instrument'])
+        return df
     
     def get_fundamental_data(self, symbols: List[str], 
                            start_date: str, end_date: str) -> pd.DataFrame:
@@ -59,7 +100,12 @@ class TestPortfolioEnvironment:
     @pytest.fixture
     def portfolio_env(self, env_config, mock_data_interface):
         """投资组合环境fixture"""
-        return PortfolioEnvironment(env_config, mock_data_interface)
+        return PortfolioEnvironment(
+            config=env_config, 
+            data_interface=mock_data_interface,
+            start_date='2020-01-01',
+            end_date='2020-12-31'
+        )
     
     def test_environment_initialization(self, portfolio_env, env_config):
         """测试环境初始化"""
@@ -488,7 +534,12 @@ class TestPortfolioEnvironment:
         )
         
         mock_data_interface = MockDataInterface()
-        env = PortfolioEnvironment(config, mock_data_interface)
+        env = PortfolioEnvironment(
+            config=config, 
+            data_interface=mock_data_interface,
+            start_date='2020-01-01',
+            end_date='2020-12-31'
+        )
         obs = env.reset()
         
         # 检查维度正确性
@@ -513,7 +564,12 @@ class TestPortfolioEnvironment:
         )
         
         mock_data_interface = MockDataInterface()
-        env = PortfolioEnvironment(config, mock_data_interface)
+        env = PortfolioEnvironment(
+            config=config, 
+            data_interface=mock_data_interface,
+            start_date='2020-01-01',
+            end_date='2020-12-31'
+        )
         obs = env.reset()
         
         # 检查特征维度

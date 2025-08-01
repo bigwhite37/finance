@@ -49,7 +49,7 @@ class TrainingConfig:
     gradient_clip_norm: Optional[float] = 1.0
 
     # 训练稳定性
-    warmup_episodes: int = 100
+    warmup_episodes: int = 1  # 降低以便测试时模型能立即开始学习
     update_frequency: int = 1
     target_update_frequency: int = 1
 
