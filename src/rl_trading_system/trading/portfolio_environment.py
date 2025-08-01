@@ -420,11 +420,20 @@ class PortfolioEnvironment(gym.Env):
         # 计算各股票收益率
         stock_returns = np.zeros(self.n_stocks)
         for i in range(self.n_stocks):
-            if self.previous_prices[i] > 0:
-                stock_returns[i] = (self.current_prices[i] - self.previous_prices[i]) / self.previous_prices[i]
+            if self.previous_prices[i] > 1e-8:  # 避免除零
+                return_val = (self.current_prices[i] - self.previous_prices[i]) / self.previous_prices[i]
+                # 确保收益率不是NaN或无穷值
+                if np.isnan(return_val) or np.isinf(return_val):
+                    stock_returns[i] = 0.0
+                else:
+                    stock_returns[i] = return_val
         
         # 计算投资组合加权收益率
         portfolio_return = np.dot(self.current_positions, stock_returns)
+        
+        # 确保投资组合收益率不是NaN或无穷值
+        if np.isnan(portfolio_return) or np.isinf(portfolio_return):
+            portfolio_return = 0.0
         
         # 调试日志：记录收益计算详情
         if self.current_step % 50 == 0:
@@ -449,8 +458,17 @@ class PortfolioEnvironment(gym.Env):
     def _calculate_reward(self, portfolio_return: float, 
                          transaction_cost: float, weights: np.ndarray) -> float:
         """计算奖励函数"""
-        # 净收益（放大100倍以提供更强的信号）
-        net_return = (portfolio_return - transaction_cost / self.total_value) * 100
+        # 安全地计算净收益（放大100倍以提供更强的信号）
+        if self.total_value > 1e-8:
+            transaction_cost_ratio = transaction_cost / self.total_value
+        else:
+            transaction_cost_ratio = 0.0
+        
+        net_return = (portfolio_return - transaction_cost_ratio) * 100
+        
+        # 确保净收益不是NaN或无穷值
+        if np.isnan(net_return) or np.isinf(net_return):
+            net_return = 0.0
         
         # 大幅降低风险惩罚（原来过重）
         concentration = np.sum(weights ** 2)  # Herfindahl指数
@@ -471,9 +489,14 @@ class PortfolioEnvironment(gym.Env):
         # 夏普比率奖励（如果有足够的历史数据）
         if len(self.returns_history) >= 30:
             recent_returns = np.array(self.returns_history[-30:])
-            if np.std(recent_returns) > 1e-8:
-                sharpe_bonus = np.mean(recent_returns) / np.std(recent_returns) * 1.0  # 增加奖励
-                reward += sharpe_bonus
+            # 安全地计算夏普比率
+            if not np.any(np.isnan(recent_returns)) and np.std(recent_returns) > 1e-8:
+                mean_return = np.mean(recent_returns)
+                std_return = np.std(recent_returns)
+                if not (np.isnan(mean_return) or np.isnan(std_return) or np.isinf(mean_return) or np.isinf(std_return)):
+                    sharpe_bonus = mean_return / std_return * 1.0  # 增加奖励
+                    if not (np.isnan(sharpe_bonus) or np.isinf(sharpe_bonus)):
+                        reward += sharpe_bonus
         
         # 移除不交易惩罚（可能导致过度交易）
         
@@ -482,6 +505,10 @@ class PortfolioEnvironment(gym.Env):
         if active_positions >= 2:  # 至少持有2只股票
             diversification_bonus = 0.05 * min(active_positions, len(self.config.stock_pool))  # 增加奖励
             reward += diversification_bonus
+        
+        # 确保最终奖励不是NaN或无穷值
+        if np.isnan(reward) or np.isinf(reward):
+            reward = 0.0
         
         # 调试日志
         if self.current_step % 50 == 0:
@@ -540,18 +567,52 @@ class PortfolioEnvironment(gym.Env):
             raise ValueError("没有可用的特征数据，无法生成观察")
         
         # 市场状态特征（简化实现）
+        # 安全地计算总收益率，避免除零
+        total_return = (self.total_value / self.config.initial_cash - 1) if self.config.initial_cash > 0 else 0.0
+        
+        # 安全地计算波动率，避免NaN
+        volatility = 0.0
+        if len(self.returns_history) >= 30:
+            recent_returns = np.array(self.returns_history[-30:])
+            if not np.any(np.isnan(recent_returns)) and len(recent_returns) > 1:
+                volatility = np.std(recent_returns)
+                if np.isnan(volatility) or np.isinf(volatility):
+                    volatility = 0.0
+        
+        # 安全地计算近期平均收益，避免NaN
+        recent_mean_return = 0.0
+        if len(self.returns_history) >= 10:
+            recent_returns = np.array(self.returns_history[-10:])
+            if not np.any(np.isnan(recent_returns)):
+                recent_mean_return = np.mean(recent_returns)
+                if np.isnan(recent_mean_return) or np.isinf(recent_mean_return):
+                    recent_mean_return = 0.0
+        
+        # 安全地计算现金比例，避免除零
+        cash_ratio = 0.0
+        if self.total_value > 1e-8:
+            cash_ratio = self.cash / self.total_value
+            if np.isnan(cash_ratio) or np.isinf(cash_ratio):
+                cash_ratio = 0.0
+        
         market_state = np.array([
-            self.total_value / self.config.initial_cash - 1,  # 总收益率
-            self._calculate_current_drawdown(),               # 当前回撤
-            np.sum(self.current_positions ** 2),            # 持仓集中度
-            np.sum(self.current_positions > 1e-6),          # 活跃持仓数
-            self.current_step / self.max_steps,             # 时间进度
-            np.std(self.returns_history[-30:]) if len(self.returns_history) >= 30 else 0,  # 波动率
-            np.mean(self.returns_history[-10:]) if len(self.returns_history) >= 10 else 0,  # 近期收益
+            total_return,                                   # 总收益率
+            self._calculate_current_drawdown(),             # 当前回撤
+            np.sum(self.current_positions ** 2),          # 持仓集中度
+            np.sum(self.current_positions > 1e-6),        # 活跃持仓数
+            self.current_step / self.max_steps,           # 时间进度
+            volatility,                                    # 波动率
+            recent_mean_return,                           # 近期收益
             len(self.trade_history) / max(self.current_step, 1),  # 交易频率
-            self.cash / self.total_value,                    # 现金比例
-            1.0 if self.current_step % 5 == 0 else 0.0     # 周期性特征
+            cash_ratio,                                   # 现金比例
+            1.0 if self.current_step % 5 == 0 else 0.0   # 周期性特征
         ], dtype=np.float32)
+        
+        # 确保所有市场状态特征都是有限值
+        market_state = np.nan_to_num(market_state, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # 确保特征数据也没有NaN或无穷值
+        features = np.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return {
             'features': features.astype(np.float32),

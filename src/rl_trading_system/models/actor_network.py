@@ -96,12 +96,27 @@ class Actor(nn.Module):
             mean: 动作均值 [batch_size, action_dim]
             log_std: 动作对数标准差 [batch_size, action_dim]
         """
+        # 检查输入是否包含NaN或无穷值
+        if torch.any(torch.isnan(state)) or torch.any(torch.isinf(state)):
+            # 将NaN和无穷值替换为零
+            state = torch.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         # 共享特征提取
         features = self.shared_layers(state)
+        
+        # 检查特征是否包含NaN
+        if torch.any(torch.isnan(features)):
+            features = torch.nan_to_num(features, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # 计算均值和对数标准差
         mean = self.mean_head(features)
         log_std = self.log_std_head(features)
+        
+        # 确保输出没有NaN值
+        if torch.any(torch.isnan(mean)):
+            mean = torch.nan_to_num(mean, nan=0.0, posinf=1e6, neginf=-1e6)
+        if torch.any(torch.isnan(log_std)):
+            log_std = torch.nan_to_num(log_std, nan=self.config.log_std_min, posinf=self.config.log_std_max, neginf=self.config.log_std_min)
         
         # 限制log_std的范围以确保数值稳定性
         log_std = torch.clamp(log_std, self.config.log_std_min, self.config.log_std_max)
