@@ -328,10 +328,7 @@ class RLTrainer:
     def _update_agent(self) -> Dict[str, float]:
         """更新智能体参数"""
         if hasattr(self.agent, 'update'):
-            return self.agent.update(
-                replay_buffer=getattr(self.agent, 'replay_buffer', None),
-                batch_size=self.config.batch_size
-            )
+            return self.agent.update(update_actor=True)
         return {}
     
     def _validate(self) -> float:
