@@ -237,3 +237,5 @@ htmlcov/
 node_modules/
 tasks.md
 *.txt
+
+final_backtest_results/
