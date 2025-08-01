@@ -19,8 +19,8 @@ model:
     lr_alpha: 0.0003            # Alpha学习率，可通过 MODEL_SAC_LR_ALPHA 覆盖
     gamma: 0.99                 # 折扣因子，可通过 MODEL_SAC_GAMMA 覆盖
     tau: 0.005                  # 软更新系数，可通过 MODEL_SAC_TAU 覆盖
-    alpha: 0.2                  # 熵正则化系数，可通过 MODEL_SAC_ALPHA 覆盖
-    target_entropy: -100.0      # 目标熵，可通过 MODEL_SAC_TARGET_ENTROPY 覆盖
+    alpha: 0.1                  # 熵正则化系数，可通过 MODEL_SAC_ALPHA 覆盖
+    target_entropy: -3.0        # 目标熵（约等于-动作维度），可通过 MODEL_SAC_TARGET_ENTROPY 覆盖
     buffer_size: 1000000        # 经验回放缓冲区大小，可通过 MODEL_SAC_BUFFER_SIZE 覆盖
     batch_size: 256             # 批次大小，可通过 MODEL_SAC_BATCH_SIZE 覆盖
     

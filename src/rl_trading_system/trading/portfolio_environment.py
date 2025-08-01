@@ -191,17 +191,54 @@ class PortfolioEnvironment(gym.Env):
             raise ValueError(f"无法获取股票数据: symbols={self.config.stock_pool}, "
                            f"start_date={self.start_date}, end_date={self.end_date}")
         
+        # 加载基准指数数据（沪深300）
+        benchmark_symbol = "000300.SH"  # 沪深300指数
+        logger.info(f"加载基准指数数据: {benchmark_symbol}")
+        
+        self.benchmark_data = self.data_interface.get_price_data(
+            symbols=[benchmark_symbol],
+            start_date=self.start_date,
+            end_date=self.end_date
+        )
+        
+        if not self.benchmark_data.empty:
+            # 如果基准数据是多层索引，需要展平
+            if isinstance(self.benchmark_data.index, pd.MultiIndex):
+                # 重置索引，保留datetime作为索引
+                self.benchmark_data = self.benchmark_data.reset_index()
+                if 'datetime' in self.benchmark_data.columns:
+                    self.benchmark_data = self.benchmark_data.set_index('datetime')
+                elif 'date' in self.benchmark_data.columns:
+                    self.benchmark_data = self.benchmark_data.set_index('date')
+            
+            logger.info(f"基准数据加载成功: {len(self.benchmark_data)}条记录")
+        else:
+            logger.warning("基准数据为空，将使用默认市场收益率")
+            self.benchmark_data = None
+        
         # 计算特征
         self.feature_data = self.feature_engineer.calculate_features(self.price_data)
         
         # 更新最大步数
-        if isinstance(self.price_data.index, pd.MultiIndex) and 'datetime' in self.price_data.index.names:
-            unique_dates = self.price_data.index.get_level_values('datetime').unique()
-            self.max_steps = len(unique_dates)
-            self._max_steps = self.max_steps  # 保存实际数据长度
+        if isinstance(self.price_data.index, pd.MultiIndex):
+            # 找到日期层级
+            datetime_level = None
+            for level_name in self.price_data.index.names:
+                if level_name and ('time' in level_name.lower() or 'date' in level_name.lower()):
+                    datetime_level = level_name
+                    break
+            
+            if datetime_level:
+                unique_dates = self.price_data.index.get_level_values(datetime_level).unique()
+                self.max_steps = len(unique_dates)
+                self._max_steps = self.max_steps  # 保存实际数据长度
+            else:
+                # 如果没有找到日期层级，使用数据长度除以股票数量
+                self.max_steps = len(self.price_data) // len(self.config.stock_pool) if len(self.config.stock_pool) > 0 else len(self.price_data)
+                self._max_steps = self.max_steps
         else:
-            # 如果没有多层索引，使用数据长度除以股票数量
-            self.max_steps = len(self.price_data) // len(self.config.stock_pool) if len(self.config.stock_pool) > 0 else len(self.price_data)
+            # 如果没有多层索引，使用数据长度
+            self.max_steps = len(self.price_data)
             self._max_steps = self.max_steps
         
         logger.info(f"加载市场数据完成: {len(self.price_data)}条记录, {self.max_steps}个交易日")
@@ -216,18 +253,35 @@ class PortfolioEnvironment(gym.Env):
         self._initialize_state_variables()
         
         # 如果有历史数据，从随机位置开始
-        if self.feature_data is not None:
-            max_start = max(0, len(self.feature_data) - self.max_steps - self.config.lookback_window)
-            self.start_idx = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+        # 使用价格数据的实际日期数量来计算起始索引
+        if self.price_data is not None and isinstance(self.price_data.index, pd.MultiIndex):
+            # 找到日期层级
+            datetime_level = None
+            for level_name in self.price_data.index.names:
+                if level_name and ('time' in level_name.lower() or 'date' in level_name.lower()):
+                    datetime_level = level_name
+                    break
+            
+            if datetime_level:
+                unique_dates = self.price_data.index.get_level_values(datetime_level).unique()
+                available_dates = len(unique_dates)
+                # 确保有足够的数据进行一个完整的episode
+                max_start = max(0, available_dates - self.max_steps)
+                self.start_idx = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+            else:
+                self.start_idx = 0
         else:
             self.start_idx = 0
         
-        # 更新当前价格
+        # 初始化价格：在reset时设置初始价格，但不设置previous_prices
+        # 这样第一步的收益率会是0，这是正确的
         self._update_current_prices()
+        # 在reset时，previous_prices应该为None，这样第一步收益率为0
+        self.previous_prices = None
         
         observation = self._get_observation()
         
-        logger.debug(f"环境重置完成，起始索引: {self.start_idx}")
+        logger.info(f"环境重置完成，起始索引: {self.start_idx}, 初始价格: {self.current_prices}")
         
         return observation
     
@@ -241,7 +295,11 @@ class PortfolioEnvironment(gym.Env):
         Returns:
             (观察, 奖励, 是否结束, 信息字典)
         """
-        # 更新当前价格（在计算收益和成本之前）
+        # 先更新步数，然后更新价格
+        # 这样价格更新会使用正确的时间索引
+        self.current_step += 1
+        
+        # 更新当前价格（使用新的时间步）
         self._update_current_prices()
         
         # 标准化动作
@@ -258,7 +316,7 @@ class PortfolioEnvironment(gym.Env):
         # 执行交易
         self._execute_trades(target_weights)
         
-        # 获取当期收益
+        # 获取当期收益（基于价格变化和持仓）
         portfolio_return = self._calculate_portfolio_return()
         
         # 更新投资组合价值
@@ -267,8 +325,7 @@ class PortfolioEnvironment(gym.Env):
         # 计算奖励
         reward = self._calculate_reward(portfolio_return, transaction_cost, target_weights)
         
-        # 更新状态
-        self.current_step += 1
+        # 获取下一个观察
         next_observation = self._get_observation()
         done = self._is_done()
         
@@ -414,7 +471,12 @@ class PortfolioEnvironment(gym.Env):
     
     def _calculate_portfolio_return(self) -> float:
         """计算投资组合收益率"""
-        if self.current_prices is None or self.previous_prices is None:
+        if self.current_prices is None:
+            logger.warning("当前价格为None，无法计算收益率")
+            return 0.0
+            
+        if self.previous_prices is None:
+            logger.debug("前期价格为None，第一步收益率为0")
             return 0.0
         
         # 计算各股票收益率
@@ -424,20 +486,30 @@ class PortfolioEnvironment(gym.Env):
                 return_val = (self.current_prices[i] - self.previous_prices[i]) / self.previous_prices[i]
                 # 确保收益率不是NaN或无穷值
                 if np.isnan(return_val) or np.isinf(return_val):
+                    logger.warning(f"股票{i}收益率异常: current={self.current_prices[i]}, previous={self.previous_prices[i]}")
                     stock_returns[i] = 0.0
                 else:
                     stock_returns[i] = return_val
+            else:
+                logger.warning(f"股票{i}前期价格过小: {self.previous_prices[i]}")
+                stock_returns[i] = 0.0
         
         # 计算投资组合加权收益率
         portfolio_return = np.dot(self.current_positions, stock_returns)
         
         # 确保投资组合收益率不是NaN或无穷值
         if np.isnan(portfolio_return) or np.isinf(portfolio_return):
+            logger.warning(f"投资组合收益率异常: {portfolio_return}")
             portfolio_return = 0.0
         
         # 调试日志：记录收益计算详情
         if self.current_step % 50 == 0:
-            logger.debug(f"Step {self.current_step}: stock_returns={stock_returns}, positions={self.current_positions}, portfolio_return={portfolio_return}")
+            logger.info(f"Step {self.current_step} 收益计算详情:")
+            logger.info(f"  当前价格: {self.current_prices}")
+            logger.info(f"  前期价格: {self.previous_prices}")
+            logger.info(f"  个股收益率: {stock_returns}")
+            logger.info(f"  持仓权重: {self.current_positions}")
+            logger.info(f"  投资组合收益率: {portfolio_return}")
         
         return portfolio_return
     
@@ -457,65 +529,141 @@ class PortfolioEnvironment(gym.Env):
     
     def _calculate_reward(self, portfolio_return: float, 
                          transaction_cost: float, weights: np.ndarray) -> float:
-        """计算奖励函数"""
-        # 安全地计算净收益（放大100倍以提供更强的信号）
+        """
+        计算增强的Alpha奖励函数（超额收益 + 早期学习引导）
+        
+        核心理念：
+        1. 主要奖励：超额收益（跑赢基准）
+        2. 辅助奖励：鼓励模型探索不同权重分配
+        3. 避免过度惩罚，给模型更多学习机会
+        """
+        # 计算市场基准收益率（等权重组合作为简化基准）
+        market_return = self._calculate_market_benchmark_return()
+        
+        # 计算超额收益（Alpha）
+        excess_return = portfolio_return - market_return
+        
+        # 计算交易成本比率
         if self.total_value > 1e-8:
             transaction_cost_ratio = transaction_cost / self.total_value
         else:
             transaction_cost_ratio = 0.0
         
-        net_return = (portfolio_return - transaction_cost_ratio) * 100
+        # Alpha奖励：超额收益减去交易成本，放大100倍提供更强信号
+        alpha_reward = (excess_return - transaction_cost_ratio) * 100
         
-        # 确保净收益不是NaN或无穷值
-        if np.isnan(net_return) or np.isinf(net_return):
-            net_return = 0.0
+        # 确保Alpha奖励不是NaN或无穷值
+        if np.isnan(alpha_reward) or np.isinf(alpha_reward):
+            alpha_reward = 0.0
         
-        # 大幅降低风险惩罚（原来过重）
-        concentration = np.sum(weights ** 2)  # Herfindahl指数
-        risk_penalty = self.config.risk_aversion * concentration * 0.1  # 降低10倍
+        # 早期学习引导奖励：鼓励权重差异化
+        exploration_bonus = 0.0
+        weight_variance = np.var(weights)  # 权重方差，衡量差异化程度
+        if weight_variance > 0.01:  # 当权重有一定差异时给予奖励
+            exploration_bonus = min(weight_variance * 20.0, 2.0)  # 最多奖励2.0
         
-        # 降低回撤惩罚
+        # 增量学习奖励：基于个股表现差异
+        if self.current_prices is not None and self.previous_prices is not None:
+            # 计算各股票单独收益率
+            individual_returns = []
+            for i in range(self.n_stocks):
+                if self.previous_prices[i] > 1e-8:
+                    ret = (self.current_prices[i] - self.previous_prices[i]) / self.previous_prices[i]
+                    if not (np.isnan(ret) or np.isinf(ret)):
+                        individual_returns.append(ret)
+            
+            # 如果股票表现有差异，奖励选择较好股票的行为
+            if len(individual_returns) >= 2:
+                returns_array = np.array(individual_returns[:self.n_stocks])
+                if np.std(returns_array) > 1e-6:  # 有表现差异
+                    # 计算权重与收益的相关性（简化）
+                    best_stock_idx = np.argmax(returns_array)
+                    worst_stock_idx = np.argmin(returns_array)
+                    
+                    # 奖励更多配置在表现好的股票上
+                    selection_bonus = (weights[best_stock_idx] - weights[worst_stock_idx]) * 10.0
+                    # 限制奖励范围
+                    selection_bonus = np.clip(selection_bonus, -1.0, 3.0)
+                    exploration_bonus += selection_bonus
+        
+        # 轻微的风险控制（避免过度集中）
+        concentration_penalty = 0.0
+        if np.max(weights) > 0.9:  # 提高阈值，单股票权重超过90%时才惩罚
+            concentration_penalty = (np.max(weights) - 0.9) * 10.0
+        
+        # 轻微的回撤控制
+        drawdown_penalty = 0.0
         current_drawdown = self._calculate_current_drawdown()
-        drawdown_penalty = self.config.max_drawdown_penalty * max(0, current_drawdown - 0.2) * 0.5  # 降低阈值和惩罚
+        if current_drawdown > 0.5:  # 提高阈值，回撤超过50%时才惩罚
+            drawdown_penalty = (current_drawdown - 0.5) * 5.0
         
-        # 基础奖励
-        reward = net_return - risk_penalty - drawdown_penalty
-        
-        # 添加基准奖励（鼓励持有而非空仓）
-        if np.sum(weights) > 0.5:  # 如果总持仓超过50%
-            holding_bonus = 0.1
-            reward += holding_bonus
-        
-        # 夏普比率奖励（如果有足够的历史数据）
-        if len(self.returns_history) >= 30:
-            recent_returns = np.array(self.returns_history[-30:])
-            # 安全地计算夏普比率
-            if not np.any(np.isnan(recent_returns)) and np.std(recent_returns) > 1e-8:
-                mean_return = np.mean(recent_returns)
-                std_return = np.std(recent_returns)
-                if not (np.isnan(mean_return) or np.isnan(std_return) or np.isinf(mean_return) or np.isinf(std_return)):
-                    sharpe_bonus = mean_return / std_return * 1.0  # 增加奖励
-                    if not (np.isnan(sharpe_bonus) or np.isinf(sharpe_bonus)):
-                        reward += sharpe_bonus
-        
-        # 移除不交易惩罚（可能导致过度交易）
-        
-        # 多样化奖励（鼓励分散投资）
-        active_positions = np.sum(weights > 0.01)  # 权重超过1%的持仓
-        if active_positions >= 2:  # 至少持有2只股票
-            diversification_bonus = 0.05 * min(active_positions, len(self.config.stock_pool))  # 增加奖励
-            reward += diversification_bonus
+        # 最终奖励：Alpha + 探索奖励 - 风险惩罚
+        reward = alpha_reward + exploration_bonus - concentration_penalty - drawdown_penalty
         
         # 确保最终奖励不是NaN或无穷值
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
         
-        # 调试日志
-        if self.current_step % 50 == 0:
-            logger.debug(f"Step {self.current_step}: net_return={net_return:.4f}, risk_penalty={risk_penalty:.4f}, "
-                        f"drawdown_penalty={drawdown_penalty:.4f}, final_reward={reward:.4f}")
+        # 调试日志（增加详细信息）
+        if self.current_step % 50 == 0:  # 更频繁的日志
+            logger.info(f"Step {self.current_step}: portfolio_return={portfolio_return:.6f}, "
+                        f"market_return={market_return:.6f}, excess_return={excess_return:.6f}, "
+                        f"transaction_cost_ratio={transaction_cost_ratio:.6f}")
+            logger.info(f"Alpha_reward={alpha_reward:.4f}, exploration_bonus={exploration_bonus:.4f}, "
+                       f"concentration_penalty={concentration_penalty:.4f}, "
+                       f"drawdown_penalty={drawdown_penalty:.4f}, final_reward={reward:.4f}")
+            logger.info(f"Weights: {[f'{w:.3f}' for w in weights]}, "
+                       f"Weight_variance: {np.var(weights):.4f}")
+        
+        # 记录Alpha收益历史，用于后续分析
+        if not hasattr(self, 'alpha_history'):
+            self.alpha_history = []
+        self.alpha_history.append(excess_return)
         
         return float(reward)
+    
+    def _calculate_market_benchmark_return(self) -> float:
+        """
+        计算市场基准收益率
+        
+        使用真实的市场基准指数（如沪深300）作为基准
+        这样智能体需要真正跑赢市场才能获得正奖励
+        """
+        if not hasattr(self, 'benchmark_data') or self.benchmark_data is None:
+            # 如果没有基准数据，使用固定的市场平均收益率
+            return 0.0001  # 假设市场日均收益率为0.01%
+        
+        if self.current_step == 0:
+            return 0.0  # 第一步没有前一期数据
+        
+        # 获取基准指数的前一期和当期价格，处理边界情况
+        current_idx = min(self.start_idx + self.current_step - 1, len(self.benchmark_data) - 1)  # -1因为current_step已经+1了
+        previous_idx = max(0, current_idx - 1)
+        
+        # 检查索引有效性
+        if current_idx >= len(self.benchmark_data):
+            raise RuntimeError(f"基准数据索引超出范围: 请求索引={current_idx}, 数据长度={len(self.benchmark_data)}")
+        
+        if current_idx == previous_idx:
+            # 如果是第一个数据点，返回0收益率
+            return 0.0
+        
+        if 'close' not in self.benchmark_data.columns:
+            raise RuntimeError(f"基准数据缺少'close'列，可用列: {list(self.benchmark_data.columns)}")
+        
+        current_benchmark_price = self.benchmark_data.iloc[current_idx]['close']
+        previous_benchmark_price = self.benchmark_data.iloc[previous_idx]['close']
+        
+        if previous_benchmark_price <= 1e-8:
+            raise RuntimeError(f"基准数据前期价格无效: {previous_benchmark_price}")
+        
+        market_return = (current_benchmark_price - previous_benchmark_price) / previous_benchmark_price
+        
+        # 确保市场收益率不是NaN或无穷值
+        if np.isnan(market_return) or np.isinf(market_return):
+            raise RuntimeError(f"计算出的市场收益率无效: {market_return}")
+            
+        return market_return
     
     def _calculate_current_drawdown(self) -> float:
         """计算当前回撤"""
@@ -622,30 +770,72 @@ class PortfolioEnvironment(gym.Env):
     
     def _update_current_prices(self):
         """更新当前价格"""
-        if self.price_data is not None:
-            # 保存前一期价格
-            self.previous_prices = self.current_prices.copy() if self.current_prices is not None else None
+        if self.price_data is None:
+            raise RuntimeError("没有可用的价格数据，无法更新当前价格")
+        
+        # 保存前一期价格
+        self.previous_prices = self.current_prices.copy() if self.current_prices is not None else None
+        
+        # 获取当前价格
+        current_date_idx = self.start_idx + self.current_step
+        
+        # 找到正确的日期层级名称
+        datetime_level = None
+        for level_name in self.price_data.index.names:
+            if level_name and ('time' in level_name.lower() or 'date' in level_name.lower()):
+                datetime_level = level_name
+                break
+        
+        if not datetime_level:
+            raise RuntimeError(f"价格数据中未找到日期层级，可用层级: {self.price_data.index.names}")
+        
+        unique_dates = self.price_data.index.get_level_values(datetime_level).unique()
+        
+        if current_date_idx >= len(unique_dates):
+            # 如果超出数据范围，使用最后一个可用日期的数据
+            current_date_idx = len(unique_dates) - 1
             
-            # 获取当前价格
-            current_date_idx = self.start_idx + self.current_step
-            if current_date_idx < len(self.price_data.index.get_level_values('datetime').unique()):
-                date = self.price_data.index.get_level_values('datetime').unique()[current_date_idx]
-                current_day_data = self.price_data.xs(date, level='datetime')
+        date = unique_dates[current_date_idx]
+        
+        # 检查日期是否存在于价格数据中
+        if date not in self.price_data.index.get_level_values(datetime_level):
+            raise RuntimeError(f"价格数据中不存在日期: {date}")
+        
+        current_day_data = self.price_data.xs(date, level=datetime_level)
+        
+        # 初始化当前价格数组
+        new_current_prices = np.zeros(self.n_stocks)
+        
+        for i, symbol in enumerate(self.config.stock_pool):
+            if symbol in current_day_data.index:
+                if 'close' not in current_day_data.columns:
+                    raise RuntimeError(f"价格数据缺少'close'列，可用列: {list(current_day_data.columns)}")
                 
-                self.current_prices = np.zeros(self.n_stocks)
-                for i, symbol in enumerate(self.config.stock_pool):
-                    if symbol in current_day_data.index:
-                        self.current_prices[i] = current_day_data.loc[symbol, 'close']
+                price = current_day_data.loc[symbol, 'close']
+                # 确保价格是有效的数值
+                if pd.isna(price) or price <= 0:
+                    # 如果价格无效，使用前一期价格或抛出异常
+                    if self.previous_prices is not None and i < len(self.previous_prices):
+                        logger.warning(f"股票{symbol}在{date}的价格无效: {price}，使用前期价格: {self.previous_prices[i]}")
+                        new_current_prices[i] = self.previous_prices[i]
                     else:
-                        # 如果没有数据，使用前一期价格
-                        self.current_prices[i] = self.previous_prices[i] if self.previous_prices is not None else 10.0
+                        raise RuntimeError(f"股票{symbol}在{date}的价格无效: {price}，且无前期价格可用")
+                else:
+                    # 只有当价格有效时才设置
+                    new_current_prices[i] = float(price)
             else:
-                # 如果超出数据范围，保持前一期价格
-                if self.current_prices is None:
-                    self.current_prices = np.array([10.0 + i for i in range(self.n_stocks)])
-        else:
-            # 如果没有价格数据，抛出异常
-            raise ValueError("没有可用的价格数据，无法更新当前价格")
+                raise RuntimeError(f"股票{symbol}在{date}没有价格数据")
+        
+        self.current_prices = new_current_prices
+        
+        # 调试日志：记录价格更新详情
+        if self.current_step % 50 == 0:
+            logger.debug(f"Step {self.current_step}: 价格更新 - 日期: {date}")
+            logger.debug(f"当前价格: {self.current_prices}")
+            if self.previous_prices is not None:
+                logger.debug(f"前期价格: {self.previous_prices}")
+                price_changes = (self.current_prices - self.previous_prices) / self.previous_prices
+                logger.debug(f"价格变化率: {price_changes}")
     
     def _is_done(self) -> bool:
         """判断回合是否结束"""

@@ -280,7 +280,13 @@ class RLTrainer:
 
         for step in range(self.config.max_steps_per_episode):
             # 选择动作
-            action = self.agent.get_action(obs, deterministic=not training)
+            action_tensor = self.agent.get_action(obs, deterministic=not training)
+            
+            # 将PyTorch张量转换为numpy数组传递给环境
+            if isinstance(action_tensor, torch.Tensor):
+                action = action_tensor.detach().cpu().numpy()
+            else:
+                action = action_tensor
 
             # 执行动作
             next_obs, reward, done, info = self.environment.step(action)
@@ -306,7 +312,7 @@ class RLTrainer:
 
                 experience = Experience(
                     state=state_tensor,
-                    action=action,
+                    action=action_tensor,  # 使用原始张量而不是numpy数组
                     reward=reward,
                     next_state=next_state_tensor,
                     done=done
