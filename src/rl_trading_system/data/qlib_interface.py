@@ -52,6 +52,66 @@ class QlibDataInterface(DataInterface):
             logger.error(f"Qlib初始化失败: {e}")
             raise
     
+    def _convert_to_qlib_format(self, symbols: List[str]) -> List[str]:
+        """
+        将标准股票代码格式转换为Qlib内部格式
+        
+        Args:
+            symbols: 标准格式股票代码列表，如 ['000001.SZ', '600000.SH']
+            
+        Returns:
+            Qlib格式股票代码列表，如 ['sz000001', 'sh600000']
+        """
+        qlib_symbols = []
+        for symbol in symbols:
+            if '.' in symbol:
+                code, exchange = symbol.split('.')
+                if exchange.upper() == 'SZ':
+                    qlib_symbols.append(f'sz{code.lower()}')
+                elif exchange.upper() == 'SH':
+                    qlib_symbols.append(f'sh{code.lower()}')
+                else:
+                    logger.warning(f"未知交易所代码: {exchange}，使用原始格式")
+                    qlib_symbols.append(symbol.lower())
+            else:
+                # 如果没有交易所后缀，假设是深交所
+                qlib_symbols.append(f'sz{symbol.lower()}')
+        
+        logger.info(f"股票代码格式转换: {symbols} -> {qlib_symbols}")
+        return qlib_symbols
+    
+    def _convert_index_to_original_format(self, data: pd.DataFrame, 
+                                        original_symbols: List[str], 
+                                        qlib_symbols: List[str]) -> pd.DataFrame:
+        """
+        将数据框索引中的Qlib格式符号转换回原始格式
+        
+        Args:
+            data: 包含Qlib格式符号的数据框
+            original_symbols: 原始符号列表
+            qlib_symbols: Qlib格式符号列表
+            
+        Returns:
+            索引已转换为原始格式的数据框
+        """
+        if data.empty:
+            return data
+            
+        # 创建符号映射字典 qlib -> original
+        symbol_mapping = dict(zip(qlib_symbols, original_symbols))
+        
+        # 如果数据有多层索引且包含instrument层级
+        if isinstance(data.index, pd.MultiIndex) and 'instrument' in data.index.names:
+            # 重置索引，转换instrument列，然后重新设置索引
+            data_reset = data.reset_index()
+            data_reset['instrument'] = data_reset['instrument'].map(symbol_mapping).fillna(data_reset['instrument'])
+            data = data_reset.set_index(['instrument', 'datetime'])
+        elif 'instrument' in data.columns:
+            # 如果instrument是列
+            data['instrument'] = data['instrument'].map(symbol_mapping).fillna(data['instrument'])
+        
+        return data
+    
     def get_stock_list(self, market: str = 'A') -> List[str]:
         """
         获取股票列表
@@ -106,8 +166,8 @@ class QlibDataInterface(DataInterface):
         if not self.validate_date_range(start_date, end_date):
             raise ValueError("日期范围无效")
         
-        # 格式化股票代码以匹配qlib的要求
-        formatted_symbols = [s.replace('.', '').lower() for s in symbols]
+        # 转换为Qlib内部格式：000001.SZ -> sz000001, 600000.SH -> sh600000
+        formatted_symbols = self._convert_to_qlib_format(symbols)
 
         cache_key = self._get_cache_key('get_price_data', 
                                        symbols=tuple(formatted_symbols),
@@ -147,6 +207,9 @@ class QlibDataInterface(DataInterface):
             }
             data = data.rename(columns=column_mapping)
             
+            # 将索引中的Qlib格式符号转换回原始格式
+            data = self._convert_index_to_original_format(data, symbols, formatted_symbols)
+            
             # 标准化数据格式
             data = self.standardize_dataframe(data, 'price')
             
@@ -185,8 +248,8 @@ class QlibDataInterface(DataInterface):
         if not self.validate_date_range(start_date, end_date):
             raise ValueError("日期范围无效")
         
-        # 格式化股票代码以匹配qlib的要求
-        formatted_symbols = [s.replace('.', '').lower() for s in symbols]
+        # 转换为Qlib内部格式
+        formatted_symbols = self._convert_to_qlib_format(symbols)
 
         cache_key = self._get_cache_key('get_fundamental_data',
                                        symbols=tuple(formatted_symbols),
@@ -225,6 +288,9 @@ class QlibDataInterface(DataInterface):
                 logger.warning(f"未获取到基本面数据: symbols={symbols}, "
                              f"start_date={start_date}, end_date={end_date}")
                 return pd.DataFrame()
+            
+            # 将索引中的Qlib格式符号转换回原始格式
+            data = self._convert_index_to_original_format(data, symbols, formatted_symbols)
             
             # 标准化数据格式
             data = self.standardize_dataframe(data, 'fundamental')

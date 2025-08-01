@@ -146,6 +146,24 @@ class DataInterface(ABC):
         if missing_columns:
             logger.warning(f"缺少必要列: {missing_columns}")
         
+        # 确保索引包含datetime和instrument层级
+        if not isinstance(df.index, pd.MultiIndex):
+            logger.warning("数据没有多层索引，这可能导致后续处理失败")
+        else:
+            # 检查索引名称
+            index_names = df.index.names
+            if 'datetime' not in index_names or 'instrument' not in index_names:
+                logger.warning(f"索引层级名称不标准，当前为: {index_names}")
+                # 尝试重命名索引
+                if len(index_names) >= 2:
+                    new_names = index_names.copy()
+                    if index_names[0] != 'datetime':
+                        new_names[0] = 'datetime'
+                    if index_names[1] != 'instrument':
+                        new_names[1] = 'instrument'
+                    df.index.names = new_names
+                    logger.info(f"索引重命名为: {new_names}")
+        
         return df
     
     def enable_cache(self, enabled: bool = True):

@@ -280,7 +280,7 @@ class RLTrainer:
         
         for step in range(self.config.max_steps_per_episode):
             # 选择动作
-            action = self.agent.act(obs, deterministic=not training)
+            action = self.agent.get_action(obs, deterministic=not training)
             
             # 执行动作
             next_obs, reward, done, info = self.environment.step(action)
@@ -290,8 +290,28 @@ class RLTrainer:
             
             # 如果是训练模式，存储经验并更新智能体
             if training and hasattr(self.agent, 'replay_buffer'):
-                # 存储经验到回放缓冲区
-                self.agent.replay_buffer.add(obs, action, reward, next_obs, done)
+                # 创建经验对象并存储到回放缓冲区
+                from ..models.replay_buffer import Experience
+                
+                # 将字典观察转换为张量（如果需要）
+                if isinstance(obs, dict):
+                    state_tensor = self.agent._flatten_dict_observation(obs)
+                else:
+                    state_tensor = obs
+                    
+                if isinstance(next_obs, dict):
+                    next_state_tensor = self.agent._flatten_dict_observation(next_obs)
+                else:
+                    next_state_tensor = next_obs
+                
+                experience = Experience(
+                    state=state_tensor,
+                    action=action,
+                    reward=reward,
+                    next_state=next_state_tensor,
+                    done=done
+                )
+                self.agent.replay_buffer.add(experience)
                 
                 # 定期更新智能体
                 if (episode_num > self.config.warmup_episodes and 

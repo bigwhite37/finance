@@ -1,0 +1,2 @@
+flake8 src scripts tests || exit 1            # 含 bugbear B001 检查   [oai_citation:9‡GitHub](https://github.com/PyCQA/flake8-bugbear?utm_source=chatgpt.com)
+bandit -r src -x tests -lll || exit 1 # 检测 try/except pass   [oai_citation:10‡bandit.readthedocs.io](https://bandit.readthedocs.io/en/latest/plugins/b110_try_except_pass.html?utm_source=chatgpt.com)

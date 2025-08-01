@@ -203,33 +203,85 @@ class SACAgent(nn.Module):
         """当前温度参数"""
         return torch.exp(self.log_alpha)
     
+    def _flatten_dict_observation(self, obs):
+        """
+        将字典观察转换为扁平化的张量
+        
+        Args:
+            obs: 字典观察或张量
+            
+        Returns:
+            torch.Tensor: 扁平化的状态张量
+        """
+        if isinstance(obs, dict):
+            # 处理字典观察
+            features = []
+            
+            # 添加特征数据（展平）
+            if 'features' in obs:
+                feat = obs['features']
+                if isinstance(feat, np.ndarray):
+                    feat = torch.from_numpy(feat)
+                features.append(feat.flatten())
+            
+            # 添加持仓信息
+            if 'positions' in obs:
+                pos = obs['positions'] 
+                if isinstance(pos, np.ndarray):
+                    pos = torch.from_numpy(pos)
+                features.append(pos.flatten())
+            
+            # 添加市场状态
+            if 'market_state' in obs:
+                market = obs['market_state']
+                if isinstance(market, np.ndarray):
+                    market = torch.from_numpy(market)
+                features.append(market.flatten())
+            
+            # 拼接所有特征
+            if features:
+                return torch.cat(features, dim=0).float()
+            else:
+                raise ValueError("观察字典中没有找到有效特征")
+        else:
+            # 如果不是字典，直接返回张量
+            if isinstance(obs, np.ndarray):
+                return torch.from_numpy(obs).float()
+            elif isinstance(obs, torch.Tensor):
+                return obs.float()
+            else:
+                raise ValueError(f"不支持的观察类型: {type(obs)}")
+    
     def get_action(self, 
-                   state: torch.Tensor, 
+                   state, 
                    deterministic: bool = False,
                    return_log_prob: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         获取动作
         
         Args:
-            state: 状态张量 [batch_size, state_dim] 或 [state_dim]
+            state: 状态张量或字典观察
             deterministic: 是否使用确定性策略
             return_log_prob: 是否返回对数概率
             
         Returns:
             action: 动作张量
-            log_prob: 对数概率（如果return_log_prob=True）
+            log_prob: 对数概率（如果return_log_prob=True）  
         """
+        # 处理不同类型的观察
+        state_tensor = self._flatten_dict_observation(state)
+        
         # 确保状态是批次格式
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
             squeeze_output = True
         else:
             squeeze_output = False
         
-        state = state.to(self.device)
+        state_tensor = state_tensor.to(self.device)
         
         with torch.no_grad():
-            action, log_prob = self.actor.get_action(state, deterministic=deterministic)
+            action, log_prob = self.actor.get_action(state_tensor, deterministic=deterministic)
         
         if squeeze_output:
             action = action.squeeze(0)

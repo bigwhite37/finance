@@ -1,0 +1,19 @@
+{
+    "env": {
+        "CLAUDE_LOCALE": "zh-CN"
+    },
+    "permissions": {
+        "deny": [
+            "Write(* try:*except*)",
+            "Write(* except *: pass*)"
+        ]
+    },
+    "hooks": {
+        "PreToolUse": {
+            "Write": "bash .claude/pre_checks.sh"
+        },
+        "PostToolUse": {
+            "Write": "bash .claude/post_checks.sh"
+        }
+    }
+}

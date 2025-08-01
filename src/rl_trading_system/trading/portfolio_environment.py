@@ -99,7 +99,7 @@ class PortfolioEnvironment(gym.Env):
         
         # 环境状态
         self.n_stocks = len(config.stock_pool)
-        self.n_features = 50  # 默认50个特征
+        self.n_features_per_stock = 12  # 每只股票12个特征
         self.n_market_features = 10  # 默认10个市场特征
         
         # 初始化交易成本模型
@@ -115,7 +115,7 @@ class PortfolioEnvironment(gym.Env):
         self.observation_space = spaces.Dict({
             'features': spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(config.lookback_window, self.n_stocks, self.n_features),
+                shape=(config.lookback_window, self.n_stocks, self.n_features_per_stock),
                 dtype=np.float32
             ),
             'positions': spaces.Box(
@@ -136,6 +136,12 @@ class PortfolioEnvironment(gym.Env):
             shape=(self.n_stocks,),
             dtype=np.float32
         )
+        
+        # 初始化市场数据变量（在_initialize_state_variables之前）
+        self.market_data = None
+        self.feature_data = None
+        self.price_data = None
+        self.current_prices = None
         
         # 初始化环境状态变量
         self._initialize_state_variables()
@@ -165,18 +171,13 @@ class PortfolioEnvironment(gym.Env):
         # T+1规则相关
         self.t_plus_1_restrictions = {}  # 记录当日买入无法卖出的股票
         
-        # 市场数据相关
-        self.market_data = None
-        self.feature_data = None
-        self.price_data = None
+        # 价格相关（重置时需要清除）
         self.current_prices = None
     
     def _load_market_data(self):
         """加载市场数据"""
         if not self.start_date or not self.end_date:
-            # 如果没有指定日期范围，生成模拟数据
-            self._generate_mock_data()
-            return
+            raise ValueError("必须指定开始日期和结束日期才能加载市场数据")
         
         # 从数据接口加载真实数据
         self.price_data = self.data_interface.get_price_data(
@@ -185,79 +186,22 @@ class PortfolioEnvironment(gym.Env):
             end_date=self.end_date
         )
         
+        # 如果没有获取到数据，抛出异常
+        if self.price_data.empty:
+            raise ValueError(f"无法获取股票数据: symbols={self.config.stock_pool}, "
+                           f"start_date={self.start_date}, end_date={self.end_date}")
+        
         # 计算特征
         self.feature_data = self.feature_engineer.calculate_features(self.price_data)
         
         # 更新最大步数
-        self.max_steps = len(self.price_data.index.get_level_values('datetime').unique())
+        if isinstance(self.price_data.index, pd.MultiIndex) and 'datetime' in self.price_data.index.names:
+            self.max_steps = len(self.price_data.index.get_level_values('datetime').unique())
+        else:
+            # 如果没有多层索引，使用数据长度除以股票数量
+            self.max_steps = len(self.price_data) // len(self.config.stock_pool) if len(self.config.stock_pool) > 0 else len(self.price_data)
         
         logger.info(f"加载市场数据完成: {len(self.price_data)}条记录, {self.max_steps}个交易日")
-    
-    def _generate_mock_data(self):
-        """生成模拟数据（用于测试）"""
-        dates = pd.date_range(start='2023-01-01', periods=self.max_steps, freq='D')
-        
-        # 生成模拟价格数据
-        np.random.seed(42)  # 确保可重现性
-        
-        mock_data = []
-        for date in dates:
-            for i, symbol in enumerate(self.config.stock_pool):
-                # 生成价格数据
-                base_price = 10.0 + i  # 基础价格
-                daily_return = np.random.normal(0.001, 0.02)  # 日收益率
-                
-                price = base_price * (1 + daily_return)
-                volume = np.random.randint(1000000, 10000000)
-                
-                mock_data.append({
-                    'datetime': date,
-                    'instrument': symbol,
-                    'open': price * np.random.uniform(0.99, 1.01),
-                    'high': price * np.random.uniform(1.00, 1.05),
-                    'low': price * np.random.uniform(0.95, 1.00),
-                    'close': price,
-                    'volume': volume,
-                    'amount': price * volume
-                })
-        
-        self.price_data = pd.DataFrame(mock_data).set_index(['datetime', 'instrument'])
-        
-        # 生成模拟特征数据
-        self._generate_mock_features()
-        
-        logger.info("生成模拟数据完成")
-    
-    def _generate_mock_features(self):
-        """生成模拟特征数据"""
-        feature_data = []
-        
-        for date_idx in range(len(self.price_data.index.get_level_values('datetime').unique())):
-            for stock_idx, symbol in enumerate(self.config.stock_pool):
-                # 生成技术指标特征
-                technical_features = np.random.randn(20).astype(np.float32)
-                
-                # 生成基本面特征
-                fundamental_features = np.random.randn(20).astype(np.float32)
-                
-                # 生成市场微观结构特征
-                microstructure_features = np.random.randn(10).astype(np.float32)
-                
-                # 合并所有特征
-                all_features = np.concatenate([
-                    technical_features,
-                    fundamental_features,
-                    microstructure_features
-                ])
-                
-                feature_data.append(all_features)
-        
-        # 重塑为 [time_steps, n_stocks, n_features]
-        self.feature_data = np.array(feature_data).reshape(
-            -1, self.n_stocks, self.n_features
-        ).astype(np.float32)
-        
-        logger.info(f"生成模拟特征数据: {self.feature_data.shape}")
     
     def reset(self) -> Dict[str, np.ndarray]:
         """
@@ -524,14 +468,15 @@ class PortfolioEnvironment(gym.Env):
         """获取当前观察状态"""
         # 获取历史特征数据
         if self.feature_data is not None:
-            start_idx = max(0, self.start_idx + self.current_step - self.config.lookback_window)
-            end_idx = self.start_idx + self.current_step
+            # 计算特征数据的索引范围，确保至少返回一些数据
+            end_idx = self.start_idx + self.current_step + 1  # +1 确保至少有一行数据
+            start_idx = max(0, end_idx - self.config.lookback_window)
             
             if end_idx > len(self.feature_data):
                 # 如果超出数据范围，使用最后可用的数据
-                features = self.feature_data[-self.config.lookback_window:]
+                features = self.feature_data[-self.config.lookback_window:].values
             else:
-                features = self.feature_data[start_idx:end_idx]
+                features = self.feature_data[start_idx:end_idx].values
             
             # 确保特征数据有正确的维度
             if len(features) < self.config.lookback_window:
@@ -540,11 +485,27 @@ class PortfolioEnvironment(gym.Env):
                                   self.config.lookback_window - len(features), 
                                   axis=0)
                 features = np.concatenate([padding, features], axis=0)
+            
+            # 将特征重塑为 (lookback_window, n_stocks, n_features_per_stock)
+            # 假设特征按股票顺序排列：[stock1_feat1, stock1_feat2, ..., stock2_feat1, ...]
+            n_features_total = features.shape[1]  # 总特征数 (36)
+            expected_total = self.n_stocks * self.n_features_per_stock  # 3 * 12 = 36
+            
+            if n_features_total == expected_total:
+                # 重塑为 (lookback_window, n_stocks, n_features_per_stock)
+                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
+            else:
+                # 如果特征数不匹配，截断或填充到预期大小
+                if n_features_total > expected_total:
+                    features = features[:, :expected_total]
+                else:
+                    # 用零填充不足的特征
+                    padding_features = np.zeros((features.shape[0], expected_total - n_features_total))
+                    features = np.concatenate([features, padding_features], axis=1)
+                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
         else:
-            # 生成随机特征（用于测试）
-            features = np.random.randn(
-                self.config.lookback_window, self.n_stocks, self.n_features
-            ).astype(np.float32)
+            # 如果没有特征数据，抛出异常
+            raise ValueError("没有可用的特征数据，无法生成观察")
         
         # 市场状态特征（简化实现）
         market_state = np.array([
@@ -590,14 +551,8 @@ class PortfolioEnvironment(gym.Env):
                 if self.current_prices is None:
                     self.current_prices = np.array([10.0 + i for i in range(self.n_stocks)])
         else:
-            # 生成模拟价格
-            self.previous_prices = self.current_prices.copy() if self.current_prices is not None else None
-            if self.current_prices is None:
-                self.current_prices = np.array([10.0 + i for i in range(self.n_stocks)])
-            else:
-                # 模拟价格变动
-                returns = np.random.normal(0.001, 0.02, self.n_stocks)
-                self.current_prices = self.current_prices * (1 + returns)
+            # 如果没有价格数据，抛出异常
+            raise ValueError("没有可用的价格数据，无法更新当前价格")
     
     def _is_done(self) -> bool:
         """判断回合是否结束"""

@@ -415,7 +415,7 @@ class FeatureEngineer:
         
         Args:
             data: 输入数据
-            method: 处理方法，'ffill', 'bfill', 'mean', 'median', 'drop'
+            method: 处理方法，'ffill', 'bfill', 'mean', 'median', 'drop', 'ffill_bfill_zero'
             
         Returns:
             处理后的数据
@@ -429,6 +429,9 @@ class FeatureEngineer:
             result = result.ffill()
         elif method == 'bfill':
             result = result.bfill()
+        elif method == 'ffill_bfill_zero':
+            # 三步处理：先前向填充，再后向填充，最后用0填充剩余的NaN
+            result = result.ffill().bfill().fillna(0)
         elif method == 'mean':
             imputer = SimpleImputer(strategy='mean')
             numeric_columns = result.select_dtypes(include=[np.number]).columns
@@ -662,3 +665,56 @@ class FeatureEngineer:
             fundamental_factors=fundamental_factors,
             market_microstructure=market_microstructure
         )
+    
+    def calculate_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        为投资组合环境计算特征的主要方法
+        
+        Args:
+            data: 价格数据DataFrame，包含open, high, low, close, volume, amount列
+            
+        Returns:
+            包含所有特征的DataFrame
+        """
+        if data.empty:
+            logger.warning("输入数据为空，返回空DataFrame")
+            return pd.DataFrame()
+        
+        try:
+            # 计算各种特征
+            logger.info("计算技术指标...")
+            technical_features = self.calculate_technical_indicators(data)
+            
+            logger.info("计算微观结构特征...")
+            microstructure_features = self.calculate_microstructure_features(data)
+            
+            logger.info("计算波动率特征...")
+            volatility_features = self.calculate_volatility_features(data)
+            
+            logger.info("计算动量特征...")
+            momentum_features = self.calculate_momentum_features(data)
+            
+            # 合并所有特征
+            logger.info("合并特征...")
+            all_features = self.combine_features([
+                data,
+                technical_features,
+                microstructure_features,
+                volatility_features,
+                momentum_features
+            ])
+            
+            # 处理缺失值
+            logger.info("处理缺失值...")
+            clean_features = self.handle_missing_values(all_features, method='ffill_bfill_zero')
+            
+            # 标准化特征
+            logger.info("标准化特征...")
+            normalized_features = self.normalize_features(clean_features)
+            
+            logger.info(f"特征计算完成，共生成 {len(normalized_features.columns)} 个特征")
+            return normalized_features
+            
+        except Exception as e:
+            logger.error(f"特征计算失败: {e}")
+            raise
