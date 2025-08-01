@@ -195,6 +195,10 @@ class PortfolioEnvironment(gym.Env):
         self.price_data = self._clean_price_data(raw_price_data)
         logger.info(f"数据清洗完成: 原始数据{len(raw_price_data)}条记录，清洗后{len(self.price_data)}条记录")
         
+        # 提取可用的交易日期
+        datetime_level = 'datetime' if 'datetime' in self.price_data.index.names else 1
+        self.dates = self.price_data.index.get_level_values(datetime_level).unique().sort_values()
+        
         # 加载基准指数数据（沪深300）
         benchmark_symbol = "000300.SH"  # 沪深300指数
         logger.debug(f"加载基准指数数据: {benchmark_symbol}")
@@ -250,9 +254,8 @@ class PortfolioEnvironment(gym.Env):
         
         # 动态计算每只股票的特征数
         if not self.feature_data.empty:
-            total_features = self.feature_data.shape[1]
-            self.n_features_per_stock = total_features // self.n_stocks
-            logger.info(f"动态计算特征维度: 总特征={total_features}, 股票数={self.n_stocks}, 每股特征={self.n_features_per_stock}")
+            self.n_features_per_stock = self.feature_data.shape[1]  # 每只股票都有相同的特征数
+            logger.info(f"动态计算特征维度: 每只股票特征数={self.n_features_per_stock}, 股票数={self.n_stocks}")
             
             # 重新定义观察空间
             self.observation_space = spaces.Dict({
@@ -921,23 +924,43 @@ class PortfolioEnvironment(gym.Env):
                                   axis=0)
                 features = np.concatenate([padding, features], axis=0)
             
-            # 将特征重塑为 (lookback_window, n_stocks, n_features_per_stock)
-            # 假设特征按股票顺序排列：[stock1_feat1, stock1_feat2, ..., stock2_feat1, ...]
-            n_features_total = features.shape[1]  # 总特征数 (36)
-            expected_total = self.n_stocks * self.n_features_per_stock  # 3 * 12 = 36
+            # 从MultiIndex DataFrame中为每只股票提取特征
+            # feature_data的结构是 (instrument, datetime) -> features
+            # 需要为每只股票、每个时间步提取特征
+            stock_features_list = []
             
-            if n_features_total == expected_total:
-                # 重塑为 (lookback_window, n_stocks, n_features_per_stock)
-                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
+            # 获取当前时间窗口的日期
+            end_idx = self.start_idx + self.current_step + 1
+            start_idx = max(0, end_idx - self.config.lookback_window)
+            
+            if end_idx > len(self.dates):
+                current_dates = self.dates[-self.config.lookback_window:]
             else:
-                # 如果特征数不匹配，截断或填充到预期大小
-                if n_features_total > expected_total:
-                    features = features[:, :expected_total]
-                else:
-                    # 用零填充不足的特征
-                    padding_features = np.zeros((features.shape[0], expected_total - n_features_total))
-                    features = np.concatenate([features, padding_features], axis=1)
-                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
+                current_dates = self.dates[start_idx:end_idx]
+            
+            for symbol in self.config.stock_pool:
+                stock_features = []
+                for date in current_dates:
+                    try:
+                        # 从MultiIndex DataFrame中提取特定股票和日期的特征
+                        if isinstance(self.feature_data.index, pd.MultiIndex):
+                            stock_date_features = self.feature_data.loc[(symbol, date)].values
+                        else:
+                            # 如果不是MultiIndex，尝试按日期索引
+                            stock_date_features = self.feature_data.loc[date].values
+                        stock_features.append(stock_date_features)
+                    except KeyError:
+                        # 如果找不到数据，使用零填充
+                        stock_features.append(np.zeros(self.n_features_per_stock))
+                
+                # 确保有正确的时间步数
+                while len(stock_features) < self.config.lookback_window:
+                    stock_features.insert(0, stock_features[0] if stock_features else np.zeros(self.n_features_per_stock))
+                
+                stock_features_list.append(np.array(stock_features))
+            
+            # 堆叠为 (lookback_window, n_stocks, n_features_per_stock)
+            features = np.stack(stock_features_list, axis=1)
         else:
             # 如果没有特征数据，抛出异常
             raise ValueError("没有可用的特征数据，无法生成观察")

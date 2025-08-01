@@ -22,6 +22,7 @@ from .replay_buffer import (
     ReplayBufferConfig,
     create_replay_buffer
 )
+from .transformer import TimeSeriesTransformer, TransformerConfig
 
 
 @dataclass
@@ -65,6 +66,10 @@ class SACConfig:
     device: str = 'cpu'
     seed: Optional[int] = None
     
+    # Transformer配置
+    use_transformer: bool = True  # 是否使用Transformer编码观察
+    transformer_config: Optional[TransformerConfig] = None
+    
     # 日志和保存
     log_interval: int = 1000
     save_interval: int = 10000
@@ -96,6 +101,11 @@ class SACAgent(nn.Module):
         if config.seed is not None:
             torch.manual_seed(config.seed)
             np.random.seed(config.seed)
+        
+        # 初始化Transformer（如果启用）
+        self.transformer = None
+        if config.use_transformer and config.transformer_config is not None:
+            self.transformer = TimeSeriesTransformer(config.transformer_config).to(self.device)
         
         # 初始化网络
         self._build_networks()
@@ -203,6 +213,100 @@ class SACAgent(nn.Module):
         """当前温度参数"""
         return torch.exp(self.log_alpha)
     
+    def preprocess_observation(self, obs):
+        """
+        预处理观察，准备送入Transformer
+        
+        Args:
+            obs: 字典观察或张量
+            
+        Returns:
+            torch.Tensor: 预处理后的观察张量
+        """
+        if isinstance(obs, dict):
+            # 提取特征数据
+            features = obs['features']  # (seq_len, n_stocks, n_features_per_stock)
+            
+            if isinstance(features, np.ndarray):
+                features = torch.from_numpy(features).float()
+            
+            # 确保特征是正确的维度：(batch_size, seq_len, n_stocks, n_features_per_stock)
+            if features.dim() == 3:
+                features = features.unsqueeze(0)  # 添加批次维度
+            
+            return features
+        else:
+            # 如果不是字典，直接返回
+            if isinstance(obs, np.ndarray):
+                obs = torch.from_numpy(obs).float()
+            return obs
+    
+    def encode_observation(self, obs, training=False):
+        """
+        编码观察为低维表示
+        
+        Args:
+            obs: 原始观察
+            training: 是否在训练模式（影响梯度计算）
+            
+        Returns:
+            torch.Tensor: 编码后的观察
+        """
+        if self.transformer is not None:
+            # 使用Transformer编码
+            processed_obs = self.preprocess_observation(obs)
+            
+            if training:
+                # 训练模式：保持梯度
+                encoded = self.transformer(processed_obs)
+            else:
+                # 推理模式：分离梯度以避免重复反向传播
+                with torch.no_grad():
+                    encoded = self.transformer(processed_obs)
+            
+            # 如果编码结果是3D的，需要展平或选择
+            if encoded.dim() == 3:
+                # 对股票维度进行平均池化，得到 (batch_size, d_model)
+                encoded = encoded.mean(dim=1)
+            
+            # 移除批次维度（如果只有一个样本）
+            if encoded.size(0) == 1:
+                encoded = encoded.squeeze(0)
+                
+            return encoded
+        else:
+            # 没有Transformer时，使用传统的展平方法
+            return self._flatten_dict_observation(obs)
+    
+    def get_action_from_encoded(self, encoded_obs, deterministic: bool = False):
+        """
+        从编码后的观察生成动作
+        
+        Args:
+            encoded_obs: 编码后的观察
+            deterministic: 是否使用确定性策略
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 动作和对数概率
+        """
+        # 确保是批次格式
+        if encoded_obs.dim() == 1:
+            encoded_obs = encoded_obs.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        encoded_obs = encoded_obs.to(self.device)
+        
+        with torch.no_grad():
+            action, log_prob = self.actor.get_action(encoded_obs, deterministic=deterministic)
+        
+        if squeeze_output:
+            action = action.squeeze(0)
+            log_prob = log_prob.squeeze(0)
+        
+        return action, log_prob
+
     def _flatten_dict_observation(self, obs):
         """
         将字典观察转换为扁平化的张量
@@ -268,8 +372,8 @@ class SACAgent(nn.Module):
             action: 动作张量
             log_prob: 对数概率（如果return_log_prob=True）  
         """
-        # 处理不同类型的观察
-        state_tensor = self._flatten_dict_observation(state)
+        # 处理不同类型的观察 - 使用新的编码方法（推理模式）
+        state_tensor = self.encode_observation(state, training=False)
         
         # 确保状态是批次格式
         if state_tensor.dim() == 1:

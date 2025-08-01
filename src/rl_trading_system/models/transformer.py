@@ -302,7 +302,7 @@ class TimeSeriesTransformer(nn.Module):
             raise IndexError(f"序列长度 {seq_len} 超过最大长度 {self.config.max_seq_len}")
         
         # 重塑输入：[batch_size * n_stocks, seq_len, n_features]
-        x = x.view(batch_size * n_stocks, seq_len, n_features)
+        x = x.reshape(batch_size * n_stocks, seq_len, n_features)
         
         # 输入投影
         x = self.input_projection(x)  # [batch_size * n_stocks, seq_len, d_model]
@@ -325,7 +325,7 @@ class TimeSeriesTransformer(nn.Module):
             x = encoder_layer(x, attention_mask)
         
         # 重塑回股票维度：[batch_size, n_stocks, seq_len, d_model]
-        x = x.view(batch_size, n_stocks, seq_len, self.config.d_model)
+        x = x.reshape(batch_size, n_stocks, seq_len, self.config.d_model)
         
         # 对每只股票应用时间注意力聚合
         stock_representations = []
@@ -358,7 +358,7 @@ class TimeSeriesTransformer(nn.Module):
         batch_size, seq_len, n_stocks, n_features = x.shape
         
         # 重塑输入
-        x = x.view(batch_size * n_stocks, seq_len, n_features)
+        x = x.reshape(batch_size * n_stocks, seq_len, n_features)
         
         # 输入投影和位置编码
         x = self.input_projection(x)
@@ -380,7 +380,7 @@ class TimeSeriesTransformer(nn.Module):
             x = encoder_layer(x, attention_mask)
         
         # 重塑并获取时间注意力权重
-        x = x.view(batch_size, n_stocks, seq_len, self.config.d_model)
+        x = x.reshape(batch_size, n_stocks, seq_len, self.config.d_model)
         
         temporal_attentions = []
         for i in range(n_stocks):
@@ -412,7 +412,7 @@ class TimeSeriesTransformer(nn.Module):
         batch_size, seq_len, n_stocks, n_features = x.shape
         
         # 重塑输入
-        x = x.view(batch_size * n_stocks, seq_len, n_features)
+        x = x.reshape(batch_size * n_stocks, seq_len, n_features)
         
         # 输入投影和位置编码
         x = self.input_projection(x)
@@ -431,7 +431,7 @@ class TimeSeriesTransformer(nn.Module):
             x = encoder_layer(x, attention_mask)
         
         # 重塑回原始形状
-        x = x.view(batch_size, seq_len, n_stocks, self.config.d_model)
+        x = x.reshape(batch_size, seq_len, n_stocks, self.config.d_model)
         
         return x
     

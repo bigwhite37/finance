@@ -300,14 +300,14 @@ class RLTrainer:
                 # 创建经验对象并存储到回放缓冲区
                 from ..models.replay_buffer import Experience
 
-                # 将字典观察转换为张量（如果需要）
+                # 将字典观察转换为编码张量（使用Transformer编码，推理模式）
                 if isinstance(obs, dict):
-                    state_tensor = self.agent._flatten_dict_observation(obs)
+                    state_tensor = self.agent.encode_observation(obs, training=False)
                 else:
                     state_tensor = obs
 
                 if isinstance(next_obs, dict):
-                    next_state_tensor = self.agent._flatten_dict_observation(next_obs)
+                    next_state_tensor = self.agent.encode_observation(next_obs, training=False)
                 else:
                     next_state_tensor = next_obs
 
