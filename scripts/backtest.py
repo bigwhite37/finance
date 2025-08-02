@@ -38,6 +38,10 @@ from rl_trading_system.config import ConfigManager
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer
 from rl_trading_system.models import SACAgent, SACConfig, TransformerConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
+from rl_trading_system.risk_control.risk_controller import RiskController, RiskControlConfig
+from rl_trading_system.utils.terminal_colors import (
+    ColorFormatter, print_banner, print_section
+)
 try:
     from .backtest_constants import BACKTEST_CONFIG, get_config_value
 except ImportError:
@@ -69,12 +73,12 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
     return logging.getLogger(__name__)
 
 
-def load_trained_model(model_path: str) -> SACAgent:
+def load_trained_model(model_path: str, config: Dict[str, Any] = None) -> SACAgent:
     """
     加载训练好的模型
 
     Args:
-        model_path: 模型文件路径
+        model_path: 模型文件路径或目录路径
 
     Returns:
         加载的SAC智能体
@@ -83,8 +87,53 @@ def load_trained_model(model_path: str) -> SACAgent:
     if not model_path.exists():
         raise FileNotFoundError(f"模型文件不存在: {model_path}")
 
-    # 加载模型数据（使用 weights_only=False 加载包含配置对象的检查点）
-    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    # 检查是否为新格式（目录）还是旧格式（单个文件）
+    if model_path.is_dir():
+        # 新格式：使用SAC智能体的load方法
+        # 先从config.json获取配置
+        config_file = model_path / 'config.json'
+        if not config_file.exists():
+            raise FileNotFoundError(f"模型配置文件不存在: {config_file}")
+
+        with open(config_file, 'r') as f:
+            config_dict = json.load(f)
+
+        # 重建SAC配置，修复缺失的transformer_config问题
+        sac_config = SACConfig(**config_dict)
+
+        # 修复：如果use_transformer=True但transformer_config缺失，从配置文件获取或设置默认配置
+        if sac_config.use_transformer and (not hasattr(sac_config, 'transformer_config') or sac_config.transformer_config is None):
+            logger = logging.getLogger(__name__)
+
+            # 优先使用配置文件中的Transformer配置
+            if config and 'model' in config and 'transformer' in config['model']:
+                transformer_dict = config['model']['transformer']
+                logger.info("从配置文件中加载Transformer配置")
+                sac_config.transformer_config = TransformerConfig(**transformer_dict)
+            else:
+                logger.info("配置文件中无Transformer配置，使用默认配置")
+                sac_config.transformer_config = TransformerConfig(
+                    d_model=sac_config.state_dim,  # 与state_dim一致
+                    n_heads=8,
+                    n_layers=4,
+                    d_ff=sac_config.state_dim * 2,
+                    dropout=0.1,
+                    max_seq_len=60,
+                    n_features=37  # 默认特征数，基于当前数据格式
+                )
+
+        # 创建智能体实例
+        agent = SACAgent(sac_config)
+
+        # 使用智能体的load方法加载模型
+        agent.load(model_path)
+
+        # 设置为评估模式
+        agent.eval()
+        return agent
+    else:
+        # 旧格式：直接加载pickle文件
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
     # 从检查点中获取配置
     sac_config = checkpoint['config']
@@ -115,6 +164,138 @@ def load_trained_model(model_path: str) -> SACAgent:
 
     return agent
 
+
+
+def validate_step_risk_metrics(environment: PortfolioEnvironment, step: int) -> Dict[str, Any]:
+    """
+    验证单步的风险指标
+
+    Args:
+        environment: 投资组合环境
+        step: 当前步数
+
+    Returns:
+        风险指标字典
+    """
+    risk_metrics = {
+        'step': step,
+        'violations_count': 0,
+        'violations': [],
+        'max_position_weight': 0.0,
+        'portfolio_concentration': 0.0,
+        'current_drawdown': 0.0
+    }
+
+    if environment.risk_controller is None:
+        return risk_metrics
+
+    # 构建当前投资组合状态进行风险评估
+    current_portfolio = environment._build_portfolio_for_risk_check()
+
+    # 执行风险评估 - assess_portfolio_risk返回字典，不是违规列表
+    risk_assessment = environment.risk_controller.assess_portfolio_risk(current_portfolio)
+
+    # 从风险评估结果中提取违规信息（如果有的话）
+    violations = []
+    if isinstance(risk_assessment, dict):
+        # assess_portfolio_risk返回字典格式，需要检查是否有违规指标
+        total_risk_score = risk_assessment.get('total_risk_score', 0)
+        risk_level = risk_assessment.get('risk_level')
+        
+        # 基于风险评分和等级生成违规记录
+        if total_risk_score > 6:  # 高风险阈值
+            violation_message = f"投资组合风险评分过高: {total_risk_score:.2f}"
+            violations.append({
+                'type': 'HIGH_RISK_SCORE',
+                'severity': risk_level.value if risk_level else 'HIGH',
+                'message': violation_message
+            })
+    elif isinstance(risk_assessment, list):
+        # 如果返回的是违规列表（某些版本可能如此）
+        for v in risk_assessment:
+            if hasattr(v, 'violation_type') and hasattr(v, 'severity') and hasattr(v, 'message'):
+                violations.append({
+                    'type': v.violation_type.value,
+                    'severity': v.severity.value,
+                    'message': v.message
+                })
+            elif isinstance(v, str):
+                # 处理字符串格式的违规
+                violations.append({
+                    'type': 'UNKNOWN',
+                    'severity': 'MEDIUM',
+                    'message': str(v)
+                })
+            elif isinstance(v, dict):
+                # 处理字典格式的违规
+                violations.append({
+                    'type': v.get('type', 'UNKNOWN'),
+                    'severity': v.get('severity', 'MEDIUM'),
+                    'message': v.get('message', str(v))
+                })
+
+    risk_metrics['violations_count'] = len(violations)
+    risk_metrics['violations'] = violations
+
+    # 计算基本风险指标
+    if environment.current_positions is not None:
+        risk_metrics['max_position_weight'] = float(np.max(environment.current_positions))
+        # 计算赫芬达尔指数（投资组合集中度）
+        weights_squared = environment.current_positions ** 2
+        risk_metrics['portfolio_concentration'] = float(np.sum(weights_squared))
+
+    risk_metrics['current_drawdown'] = float(environment._calculate_current_drawdown())
+
+    return risk_metrics
+
+
+def calculate_risk_summary(violations_history: List[Dict], metrics_history: List[Dict]) -> Dict[str, Any]:
+    """
+    计算风险指标汇总
+
+    Args:
+        violations_history: 风险违规历史
+        metrics_history: 风险指标历史
+
+    Returns:
+        风险汇总指标
+    """
+    summary = {
+        'total_violations': len(violations_history),
+        'avg_concentration': 0.0,
+        'max_drawdown': 0.0,
+        'avg_max_position_weight': 0.0,
+        'violation_types': {},
+        'high_risk_periods': 0
+    }
+
+    if not metrics_history:
+        return summary
+
+    # 计算平均值
+    concentrations = [m.get('portfolio_concentration', 0) for m in metrics_history if 'error' not in m]
+    if concentrations:
+        summary['avg_concentration'] = np.mean(concentrations)
+
+    drawdowns = [m.get('current_drawdown', 0) for m in metrics_history if 'error' not in m]
+    if drawdowns:
+        summary['max_drawdown'] = max(drawdowns)
+
+    max_weights = [m.get('max_position_weight', 0) for m in metrics_history if 'error' not in m]
+    if max_weights:
+        summary['avg_max_position_weight'] = np.mean(max_weights)
+
+    # 统计违规类型
+    for violation_record in violations_history:
+        for violation in violation_record.get('violations', []):
+            vtype = violation.get('type', 'unknown')
+            summary['violation_types'][vtype] = summary['violation_types'].get(vtype, 0) + 1
+
+    # 计算高风险时期
+    summary['high_risk_periods'] = len([m for m in metrics_history
+                                       if m.get('violations_count', 0) > 0 and 'error' not in m])
+
+    return summary
 
 
 def get_benchmark_data(symbol: str, start_date: str, end_date: str,
@@ -205,7 +386,7 @@ def calculate_performance_metrics(portfolio_returns: pd.Series,
     # 获取配置参数
     trading_days_per_year = get_config_value(config, 'trading_days_per_year', BACKTEST_CONFIG.DEFAULT_TRADING_DAYS_PER_YEAR)
     risk_free_rate = get_config_value(config, 'risk_free_rate', BACKTEST_CONFIG.DEFAULT_RISK_FREE_RATE)
-    
+
     # 年化收益率
     n_years = len(portfolio_returns) / trading_days_per_year
     annual_return_portfolio = (portfolio_cum.iloc[-1] ** (1/n_years)) - 1 if n_years > 0 else 0
@@ -384,7 +565,7 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
 
     # 加载模型
     logger.info(f"加载模型: {model_path}")
-    agent = load_trained_model(model_path)
+    agent = load_trained_model(model_path, config)
 
     # 提取配置参数
     backtest_config = config.get('backtest', {})
@@ -425,6 +606,10 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     portfolio_values = []
     dates = []
 
+    # 风险监控记录
+    risk_violations_history = []
+    risk_metrics_history = []
+
     done = False
     step = 0
 
@@ -445,12 +630,30 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             # 使用最后一个有效日期
             dates.append(environment.dates[-1])
 
+        # 风险验证：记录风险违规和风险指标
+        if hasattr(environment, 'risk_controller') and environment.risk_controller is not None:
+            step_risk_metrics = validate_step_risk_metrics(environment, step)
+            risk_metrics_history.append(step_risk_metrics)
+
+            # 检查是否有风险违规
+            if step_risk_metrics.get('violations_count', 0) > 0:
+                risk_violations_history.append({
+                    'step': step,
+                    'date': dates[-1] if dates else None,
+                    'violations': step_risk_metrics.get('violations', [])
+                })
+
         obs = next_obs
         step += 1
 
         progress_interval = get_config_value(config, 'progress_log_interval', BACKTEST_CONFIG.DEFAULT_PROGRESS_LOG_INTERVAL)
         if step % progress_interval == 0:
             logger.debug(f"回测进度: {step}步, 当前价值: {environment.total_value:.2f}")
+            # 输出风险监控信息
+            if risk_violations_history:
+                recent_violations = len([v for v in risk_violations_history if v['step'] > step - progress_interval])
+                if recent_violations > 0:
+                    logger.info(f"最近{progress_interval}步内检测到{recent_violations}次风险违规")
 
     # 计算收益率
     portfolio_values = pd.Series(portfolio_values, index=dates)
@@ -466,13 +669,23 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
         symbol_metrics = calculate_performance_metrics(portfolio_returns, bench_returns)
         metrics[symbol] = symbol_metrics
 
+    # 计算汇总风险指标
+    risk_summary = calculate_risk_summary(risk_violations_history, risk_metrics_history)
+
     logger.info("回测完成")
+    logger.info(f"风险监控摘要: 总违规次数 {risk_summary.get('total_violations', 0)}, "
+                f"平均集中度 {risk_summary.get('avg_concentration', 0):.3f}")
 
     return {
         'portfolio_returns': portfolio_returns,
         'portfolio_values': portfolio_values,
         'benchmark_returns': benchmark_returns,
         'metrics': metrics,
+        'risk_metrics': {
+            'violations_history': risk_violations_history,
+            'metrics_history': risk_metrics_history,
+            'summary': risk_summary
+        },
         'backtest_period': {
             'start_date': start_date,
             'end_date': end_date,
@@ -496,8 +709,13 @@ def main():
     parser.add_argument("--log-level", type=str, default="INFO",
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="日志级别")
+    parser.add_argument("--no-color", action="store_true",
+                       help="禁用彩色输出")
 
     args = parser.parse_args()
+
+    # 初始化彩色格式化器
+    formatter = ColorFormatter(enable_color=not args.no_color)
 
     # 创建输出目录
     output_dir = Path(args.output_dir)
@@ -507,12 +725,20 @@ def main():
     logger = setup_logging(str(output_dir), args.log_level)
 
     try:
+        # 打印标题横幅
+        print_banner(
+            "📈 量化交易策略回测",
+            f"模型评估与性能分析",
+            formatter
+        )
+
         # 加载配置
-        logger.info("加载配置文件...")
+        print_section("📁 加载配置文件", formatter)
         config_manager = ConfigManager()
 
         config_path = Path(args.config)
         if not config_path.exists():
+            print(formatter.error(f"❌ 配置文件不存在: {args.config}"))
             raise FileNotFoundError(f"配置文件不存在: {args.config}")
 
         config = config_manager.load_config(str(config_path))
@@ -523,17 +749,22 @@ def main():
         if args.end_date:
             config.setdefault('backtest', {})['end_date'] = args.end_date
 
-        logger.info("回测配置:")
-        logger.info(f"  模型路径: {args.model_path}")
-        logger.info(f"  配置文件: {args.config}")
-        logger.info(f"  输出目录: {args.output_dir}")
-        logger.info(f"  回测期间: {config.get('backtest', {}).get('start_date')} - {config.get('backtest', {}).get('end_date')}")
+        print(f"  {formatter.success('✅ 模型路径')}: {formatter.path(args.model_path)}")
+        print(f"  {formatter.success('✅ 配置文件')}: {formatter.path(args.config)}")
+        print(f"  {formatter.info('输出目录')}: {formatter.path(args.output_dir)}")
+
+        backtest_start = config.get('backtest', {}).get('start_date')
+        backtest_end = config.get('backtest', {}).get('end_date')
+        print(f"  {formatter.info('回测期间')}: {formatter.number(backtest_start)} - {formatter.number(backtest_end)}")
+        print()
 
         # 运行回测
+        print_section("🚀 执行回测", formatter)
+        print(f"  {formatter.info('正在运行回测分析...')}")
         results = run_backtest(args.model_path, config)
 
         # 保存结果
-        logger.info("保存回测结果...")
+        print_section("💾 保存回测结果", formatter)
 
         # 保存JSON结果（确保所有数值都是JSON可序列化的）
         def convert_to_json_serializable(obj):
@@ -550,14 +781,14 @@ def main():
                 return obj.tolist()
             else:
                 return obj
-        
+
         json_results = {
             'metrics': results['metrics'],
             'backtest_period': results['backtest_period'],
             'portfolio_final_value': float(results['portfolio_values'].iloc[-1]),
             'portfolio_total_return': float((results['portfolio_values'].iloc[-1] / results['portfolio_values'].iloc[0]) - 1)
         }
-        
+
         # 转换为JSON可序列化格式
         json_results = convert_to_json_serializable(json_results)
 
@@ -565,25 +796,56 @@ def main():
             json.dump(json_results, f, indent=2, ensure_ascii=False)
 
         # 创建可视化
-        logger.info("生成可视化图表...")
+        print(f"  {formatter.info('正在生成可视化图表...')}")
         fig = create_performance_visualization(results)
         fig.write_html(str(output_dir / BACKTEST_CONFIG.CHART_HTML_FILENAME))
 
         # 输出性能摘要
-        logger.info("回测结果摘要:")
-        main_benchmark = BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS[0]  # 使用默认基准列表的第一个作为主要基准
+        print_section("📊 回测结果摘要", formatter)
+        main_benchmark = BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS[0]
+
         if main_benchmark in results['metrics']:
             metrics = results['metrics'][main_benchmark]
-            logger.info(f"  投资组合年化收益率: {metrics['annual_return']*100:.2f}%")
-            logger.info(f"  基准年化收益率: {metrics['benchmark_annual_return']*100:.2f}%")
-            logger.info(f"  超额收益: {(metrics['annual_return'] - metrics['benchmark_annual_return'])*100:.2f}%")
-            logger.info(f"  投资组合夏普比率: {metrics['sharpe_ratio']:.3f}")
-            logger.info(f"  最大回撤: {metrics['max_drawdown']*100:.2f}%")
-            logger.info(f"  信息比率: {metrics['information_ratio']:.3f}")
-            logger.info(f"  Alpha: {metrics['alpha']*100:.2f}%")
-            logger.info(f"  Beta: {metrics['beta']:.3f}")
 
-        logger.info(f"回测完成，结果已保存到: {output_dir}")
+            # 核心性能指标
+            annual_return = metrics['annual_return'] * 100
+            benchmark_return = metrics['benchmark_annual_return'] * 100
+            excess_return = annual_return - benchmark_return
+
+            print(f"  {formatter.info('投资组合年化收益率')}: {formatter.success(f'{annual_return:+7.2f}%') if annual_return > 0 else formatter.error(f'{annual_return:+7.2f}%')}")
+            print(f"  {formatter.info('基准年化收益率')}: {formatter.number(f'{benchmark_return:+7.2f}%')}")
+            print(f"  {formatter.info('超额收益')}: {formatter.success(f'{excess_return:+7.2f}%') if excess_return > 0 else formatter.error(f'{excess_return:+7.2f}%')}")
+            print()
+
+            # 风险指标
+            sharpe = metrics['sharpe_ratio']
+            max_dd = metrics['max_drawdown'] * 100
+            info_ratio = metrics['information_ratio']
+
+            print(f"  {formatter.info('夏普比率')}: {formatter.success(f'{sharpe:7.3f}') if sharpe > 1 else formatter.warning(f'{sharpe:7.3f}')}")
+            print(f"  {formatter.info('最大回撤')}: {formatter.error(f'{max_dd:7.2f}%') if max_dd > 10 else formatter.warning(f'{max_dd:7.2f}%')}")
+            print(f"  {formatter.info('信息比率')}: {formatter.success(f'{info_ratio:7.3f}') if info_ratio > 0.5 else formatter.number(f'{info_ratio:7.3f}')}")
+            print()
+
+            # 额外指标
+            alpha = metrics['alpha'] * 100
+            beta = metrics['beta']
+            print(f"  {formatter.info('Alpha')}: {formatter.success(f'{alpha:+7.2f}%') if alpha > 0 else formatter.number(f'{alpha:+7.2f}%')}")
+            print(f"  {formatter.info('Beta')}: {formatter.number(f'{beta:7.3f}')}")
+
+        # 风险分析摘要
+        if 'risk_metrics' in results and results['risk_metrics']['summary']:
+            risk_summary = results['risk_metrics']['summary']
+            print()
+            print(f"  {formatter.info('风险违规次数')}: {formatter.warning(str(risk_summary.get('total_violations', 0)))}")
+            avg_concentration = risk_summary.get('avg_concentration', 0)
+            print(f"  {formatter.info('平均集中度')}: {formatter.number(f'{avg_concentration:.3f}')}")
+
+        print()
+        print(formatter.success(f"🎉 回测完成！结果已保存到: {formatter.path(str(output_dir))}"))
+        print()
+        print(f"  {formatter.info('📊 数据文件')}: {formatter.path(str(output_dir / BACKTEST_CONFIG.RESULTS_JSON_FILENAME))}")
+        print(f"  {formatter.info('📈 可视化图表')}: {formatter.path(str(output_dir / BACKTEST_CONFIG.CHART_HTML_FILENAME))}")
 
     except Exception as e:
         logger.error(f"回测过程中发生错误: {str(e)}")

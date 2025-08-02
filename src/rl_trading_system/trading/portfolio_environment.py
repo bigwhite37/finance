@@ -17,6 +17,10 @@ from ..data.interfaces import DataInterface
 from ..data.data_processor import DataProcessor
 from ..data.feature_engineer import FeatureEngineer
 from .transaction_cost_model import TransactionCostModel, CostParameters, TradeInfo
+from ..risk_control.risk_controller import (
+    RiskController, RiskControlConfig, Portfolio, Position, Trade, TradeDecision,
+    RiskViolationType, RiskLevel
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,10 @@ class PortfolioConfig:
     price_limit: float = 0.1                # 涨跌停限制
     t_plus_1: bool = True                   # T+1交易规则
     trading_days_per_year: int = 252        # 年交易日数
+    
+    # 风险控制配置
+    enable_risk_control: bool = True        # 启用风险控制
+    risk_config: Optional[RiskControlConfig] = None  # 风险控制配置
     
     def __post_init__(self):
         """配置验证"""
@@ -110,6 +118,26 @@ class PortfolioEnvironment(gym.Env):
             transfer_fee_rate=config.transfer_fee_rate
         )
         self.cost_model = TransactionCostModel(cost_params)
+        
+        # 初始化风险控制器
+        if config.enable_risk_control:
+            # 为强化学习训练优化的风险配置
+            risk_config = config.risk_config or RiskControlConfig(
+                max_position_weight=max(config.max_position_size, 0.4),    # 至少40%，适应小股票池
+                max_sector_exposure=0.8,                                   # 放宽行业暴露限制（考虑行业分类不准确）
+                stop_loss_threshold=0.1,                                   # 保持适度止损控制
+                max_daily_loss=0.05,                                       # 适度放宽日损失限制
+                max_drawdown=0.15,                                         # 适度放宽回撤限制
+                trade_size_limit=0.3,                                      # 放宽单笔交易限制，支持RL探索
+                frequency_limit=200,                                       # 提高交易频率限制
+                volume_anomaly_threshold=5.0,                              # 降低交易量异常敏感度
+                price_anomaly_threshold=4.0                                # 降低价格异常敏感度
+            )
+            self.risk_controller = RiskController(risk_config)
+            logger.info("风险控制器已启用")
+        else:
+            self.risk_controller = None
+            logger.info("风险控制器已禁用")
         
         # 定义观察空间
         self.observation_space = spaces.Dict({
@@ -546,13 +574,16 @@ class PortfolioEnvironment(gym.Env):
         # 应用A股交易规则约束
         target_weights = self._apply_trading_constraints(target_weights)
         
+        # 风险检查：在执行交易前进行风险评估
+        risk_adjusted_weights = self._check_trading_risks(target_weights)
+        
         # 计算交易成本
         transaction_cost = self._calculate_transaction_cost(
-            self.current_positions, target_weights
+            self.current_positions, risk_adjusted_weights
         )
         
         # 执行交易
-        self._execute_trades(target_weights)
+        self._execute_trades(risk_adjusted_weights)
         
         # 获取当期收益（基于价格变化和持仓）
         portfolio_return = self._calculate_portfolio_return()
@@ -824,6 +855,9 @@ class PortfolioEnvironment(gym.Env):
                     selection_bonus = np.clip(selection_bonus, -1.0, 3.0)
                     exploration_bonus += selection_bonus
         
+        # 风险控制器风险惩罚
+        risk_penalty = self._calculate_risk_penalty(weights)
+        
         # 轻微的风险控制（避免过度集中）
         concentration_penalty = 0.0
         if np.max(weights) > 0.9:  # 提高阈值，单股票权重超过90%时才惩罚
@@ -835,8 +869,8 @@ class PortfolioEnvironment(gym.Env):
         if current_drawdown > 0.5:  # 提高阈值，回撤超过50%时才惩罚
             drawdown_penalty = (current_drawdown - 0.5) * 5.0
         
-        # 最终奖励：Alpha + 探索奖励 - 风险惩罚
-        reward = alpha_reward + exploration_bonus - concentration_penalty - drawdown_penalty
+        # 最终奖励：Alpha + 探索奖励 - 所有风险惩罚
+        reward = alpha_reward + exploration_bonus - concentration_penalty - drawdown_penalty - risk_penalty
         
         # 确保最终奖励不是NaN或无穷值
         if np.isnan(reward) or np.isinf(reward):
@@ -1263,6 +1297,220 @@ class PortfolioEnvironment(gym.Env):
             print(f"Drawdown: {self._calculate_current_drawdown():.4f}")
             print(f"Positions: {self.current_positions}")
             print("-" * 50)
+    
+    def _check_trading_risks(self, target_weights: np.ndarray) -> np.ndarray:
+        """
+        执行交易前的风险检查
+        
+        Args:
+            target_weights: 目标权重
+            
+        Returns:
+            风险调整后的权重
+        """
+        if self.risk_controller is None:
+            return target_weights
+            
+        try:
+            # 构建当前投资组合状态
+            current_portfolio = self._build_portfolio_for_risk_check()
+            
+            # 构建预期交易决策列表
+            proposed_trade_decisions = self._build_trade_decisions_for_risk_check(target_weights)
+            
+            # 执行风险检查
+            risk_violations = []
+            for trade_decision in proposed_trade_decisions:
+                trade_risk_result = self.risk_controller.check_trade_risk(trade_decision, current_portfolio)
+                if not trade_risk_result.get('approved', True):
+                    risk_violations.extend(trade_risk_result.get('violations', []))
+            
+            # 如果有严重风险违规，调整目标权重
+            critical_violations = [v for v in risk_violations if v.severity == RiskLevel.CRITICAL]
+            high_violations = [v for v in risk_violations if v.severity == RiskLevel.HIGH]
+            
+            if critical_violations:
+                # 危急风险：总是记录
+                logger.warning(f"检测到危急风险违规，强制调整交易计划: {[v.message for v in critical_violations]}")
+                return self._adjust_weights_for_risk_violations(target_weights, risk_violations)
+            elif high_violations:
+                # 高风险：每100步记录一次，避免日志洪水
+                if self.current_step % 100 == 0:
+                    logger.info(f"检测到高风险违规，调整交易计划: {[v.message for v in high_violations]}")
+                return self._adjust_weights_for_risk_violations(target_weights, risk_violations)
+            else:
+                # 中低级风险警告：每200步记录一次，且仅记录调试信息
+                if risk_violations and self.current_step % 200 == 0:
+                    logger.debug(f"检测到轻微风险警告: {len(risk_violations)}项")
+                return target_weights
+                
+        except (AttributeError, ValueError, KeyError) as e:
+            logger.error(f"风险检查失败: {e}")
+            # 风险检查失败时，抛出异常，不掩盖错误
+            raise RuntimeError(f"风险检查模块出现错误，无法继续交易: {e}") from e
+    
+    def _build_portfolio_for_risk_check(self) -> Portfolio:
+        """构建用于风险检查的投资组合对象"""
+        positions = []
+        current_time = datetime.now()
+        
+        for i, symbol in enumerate(self.config.stock_pool):
+            if self.current_positions[i] > 0:
+                # 获取当前价格
+                current_price = float(self.current_prices[i]) if self.current_prices is not None else 10.0
+                quantity = int(self.current_positions[i] * self.total_value / current_price)
+                
+                if quantity > 0:
+                    position = Position(
+                        symbol=symbol,
+                        quantity=quantity,
+                        current_price=current_price,
+                        sector="Unknown",  # 简化处理，实际应用中需要行业分类
+                        timestamp=current_time
+                    )
+                    positions.append(position)
+        
+        return Portfolio(
+            positions=positions,
+            cash=float(self.cash),
+            total_value=float(self.total_value),
+            timestamp=current_time
+        )
+    
+    def _build_trades_for_risk_check(self, target_weights: np.ndarray) -> List[Trade]:
+        """构建用于风险检查的交易列表"""
+        trades = []
+        current_time = datetime.now()
+        
+        for i, symbol in enumerate(self.config.stock_pool):
+            weight_diff = target_weights[i] - self.current_positions[i]
+            
+            if abs(weight_diff) > 0.001:  # 忽略微小变化
+                current_price = float(self.current_prices[i]) if self.current_prices is not None else 10.0
+                trade_value = abs(weight_diff) * self.total_value
+                quantity = trade_value / current_price
+                action = "BUY" if weight_diff > 0 else "SELL"
+                
+                trade = Trade(
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=current_price,
+                    timestamp=current_time,
+                    action=action,
+                    sector="Unknown"  # 简化处理
+                )
+                trades.append(trade)
+        
+        return trades
+    
+    def _build_trade_decisions_for_risk_check(self, target_weights: np.ndarray) -> List[TradeDecision]:
+        """构建用于风险检查的交易决策列表"""
+        trade_decisions = []
+        current_time = datetime.now()
+        
+        for i, symbol in enumerate(self.config.stock_pool):
+            weight_diff = target_weights[i] - self.current_positions[i]
+            
+            if abs(weight_diff) > 0.001:  # 忽略微小变化
+                current_price = float(self.current_prices[i]) if self.current_prices is not None else 10.0
+                trade_value = abs(weight_diff) * self.total_value
+                quantity = int(trade_value / current_price)
+                action = "BUY" if weight_diff > 0 else "SELL"
+                
+                trade_decision = TradeDecision(
+                    symbol=symbol,
+                    action=action,
+                    quantity=quantity,
+                    target_price=current_price,
+                    sector="Unknown",  # 简化处理
+                    timestamp=current_time,
+                    confidence=0.5,  # 默认置信度
+                    metadata={"weight_change": weight_diff}
+                )
+                trade_decisions.append(trade_decision)
+        
+        return trade_decisions
+    
+    def _adjust_weights_for_risk_violations(self, target_weights: np.ndarray, violations) -> np.ndarray:
+        """根据风险违规调整权重"""
+        adjusted_weights = target_weights.copy()
+        
+        for violation in violations:
+            if violation.violation_type == RiskViolationType.POSITION_CONCENTRATION:
+                # 对于持仓集中度违规，降低最大持仓权重
+                max_idx = np.argmax(adjusted_weights)
+                adjusted_weights[max_idx] = min(adjusted_weights[max_idx], self.config.max_position_size)
+                
+            elif violation.violation_type == RiskViolationType.STOP_LOSS:
+                # 对于止损违规，减少持仓
+                for i in range(len(adjusted_weights)):
+                    if adjusted_weights[i] > self.current_positions[i]:
+                        adjusted_weights[i] = self.current_positions[i] * 0.8  # 减少20%
+        
+        # 重新标准化权重
+        weight_sum = np.sum(adjusted_weights)
+        if weight_sum > 1.0:
+            adjusted_weights = adjusted_weights / weight_sum
+        
+        return adjusted_weights
+    
+    def _calculate_risk_penalty(self, weights: np.ndarray) -> float:
+        """
+        计算基于风险控制器的风险惩罚项
+        
+        Args:
+            weights: 目标权重
+            
+        Returns:
+            风险惩罚值（越高表示风险越大）
+        """
+        if self.risk_controller is None:
+            return 0.0
+            
+        try:
+            # 构建投资组合状态
+            current_portfolio = self._build_portfolio_for_risk_check()
+            
+            # 构建预期交易决策列表
+            proposed_trade_decisions = self._build_trade_decisions_for_risk_check(weights)
+            
+            # 执行投资组合风险评估
+            portfolio_risk_result = self.risk_controller.assess_portfolio_risk(current_portfolio)
+            
+            # 执行交易风险评估
+            trade_violations = []
+            for trade_decision in proposed_trade_decisions:
+                trade_risk_result = self.risk_controller.check_trade_risk(trade_decision, current_portfolio)
+                if not trade_risk_result.get('approved', True):
+                    trade_violations.extend(trade_risk_result.get('violations', []))
+            
+            # 计算风险惩罚
+            total_penalty = 0.0
+            
+            # 根据投资组合风险评分计算惩罚
+            portfolio_risk_score = portfolio_risk_result.get('risk_score', 0.0)
+            total_penalty += portfolio_risk_score * 0.5  # 投资组合基础风险惩罚
+            
+            # 根据交易违规级别计算惩罚
+            for violation in trade_violations:
+                if violation.severity == RiskLevel.CRITICAL:
+                    total_penalty += 5.0  # 严重风险
+                elif violation.severity == RiskLevel.HIGH:
+                    total_penalty += 2.0  # 高风险
+                elif violation.severity == RiskLevel.MEDIUM:
+                    total_penalty += 0.5  # 中等风险
+                elif violation.severity == RiskLevel.LOW:
+                    total_penalty += 0.1  # 低风险
+            
+            # 限制惩罚范围，避免过度惩罚影响学习
+            total_penalty = min(total_penalty, 10.0)
+            
+            return total_penalty
+            
+        except (AttributeError, ValueError, KeyError) as e:
+            logger.error(f"风险惩罚计算失败: {e}")
+            # 风险惩罚计算失败时，抛出异常，不掩盖错误
+            raise RuntimeError(f"风险惩罚计算模块出现错误，无法继续评估风险: {e}") from e
     
     def close(self):
         """关闭环境"""
