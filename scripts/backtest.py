@@ -38,6 +38,15 @@ from rl_trading_system.config import ConfigManager
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer
 from rl_trading_system.models import SACAgent, SACConfig, TransformerConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
+try:
+    from .backtest_constants import BACKTEST_CONFIG, get_config_value
+except ImportError:
+    # 当直接运行脚本时，使用绝对导入
+    import sys
+    from pathlib import Path
+    scripts_dir = Path(__file__).parent
+    sys.path.insert(0, str(scripts_dir))
+    from backtest_constants import BACKTEST_CONFIG, get_config_value
 
 
 def setup_logging(output_dir: str, log_level: str = "INFO"):
@@ -107,66 +116,6 @@ def load_trained_model(model_path: str) -> SACAgent:
     return agent
 
 
-def convert_observation_for_model(obs: Dict[str, np.ndarray], model_config: SACConfig) -> Dict[str, np.ndarray]:
-    """
-    将回测环境观察转换为与训练时一致的维度
-    
-    Args:
-        obs: 回测环境产生的原始观察
-        model_config: 模型配置
-        
-    Returns:
-        转换后的观察，维度与训练时一致
-    """
-    logger = logging.getLogger(__name__)
-    
-    # 计算当前观察的展平维度
-    original_features = obs['features']
-    lookback_window, n_stocks, original_n_features = original_features.shape
-    current_flattened_dim = (lookback_window * n_stocks * original_n_features + 
-                            len(obs['positions']) + len(obs['market_state']))
-    
-    expected_total_dim = model_config.state_dim
-    
-    # 如果维度已经匹配，直接返回
-    if current_flattened_dim == expected_total_dim:
-        logger.debug(f"观察维度已匹配：{current_flattened_dim}")
-        return obs
-    
-    # 如果期望维度太小，可能是Transformer输出维度，不进行转换，让上层处理
-    positions_dim = len(obs['positions'])
-    market_state_dim = len(obs['market_state'])
-    min_required_dim = positions_dim + market_state_dim + 1  # 至少需要1个特征维度
-    
-    if expected_total_dim < min_required_dim:
-        logger.debug(f"期望维度{expected_total_dim}过小，可能使用Transformer，返回原始观察")
-        return obs
-    
-    # 计算特征部分的期望维度
-    expected_features_dim = expected_total_dim - positions_dim - market_state_dim
-    
-    # 计算训练时每只股票的特征数
-    expected_n_features_per_stock = expected_features_dim // (lookback_window * n_stocks)
-    
-    if expected_n_features_per_stock <= 0:
-        logger.warning(f"无法计算有效的特征维度：期望总维度{expected_total_dim}，位置维度{positions_dim}，市场状态维度{market_state_dim}，返回原始观察")
-        return obs
-    
-    if expected_n_features_per_stock > original_n_features:
-        logger.warning(f"模型期望每股{expected_n_features_per_stock}个特征，但观察只有{original_n_features}个特征，返回原始观察")
-        return obs
-    
-    logger.debug(f"观察维度转换：{original_n_features}特征/股 -> {expected_n_features_per_stock}特征/股")
-    
-    # 截取前N个最重要的特征（假设特征按重要性排序）
-    reduced_features = original_features[:, :, :expected_n_features_per_stock]
-    
-    return {
-        'features': reduced_features.astype(np.float32),
-        'positions': obs['positions'].astype(np.float32),
-        'market_state': obs['market_state'].astype(np.float32)
-    }
-
 
 def get_benchmark_data(symbol: str, start_date: str, end_date: str,
                       data_interface: QlibDataInterface) -> pd.Series:
@@ -230,17 +179,21 @@ def compare_with_benchmarks(portfolio_returns: pd.Series,
 
 
 def calculate_performance_metrics(portfolio_returns: pd.Series,
-                                benchmark_returns: pd.Series) -> Dict[str, float]:
+                                benchmark_returns: pd.Series,
+                                config: Dict[str, Any] = None) -> Dict[str, float]:
     """
     计算性能指标
 
     Args:
         portfolio_returns: 投资组合收益率
         benchmark_returns: 基准收益率
+        config: 配置字典，包含交易日数和无风险利率等参数
 
     Returns:
         性能指标字典
     """
+    if config is None:
+        config = {}
     # 计算累计收益
     portfolio_cum = (1 + portfolio_returns).cumprod()
     benchmark_cum = (1 + benchmark_returns).cumprod()
@@ -249,17 +202,18 @@ def calculate_performance_metrics(portfolio_returns: pd.Series,
     total_return_portfolio = portfolio_cum.iloc[-1] - 1
     total_return_benchmark = benchmark_cum.iloc[-1] - 1
 
+    # 获取配置参数
+    trading_days_per_year = get_config_value(config, 'trading_days_per_year', BACKTEST_CONFIG.DEFAULT_TRADING_DAYS_PER_YEAR)
+    risk_free_rate = get_config_value(config, 'risk_free_rate', BACKTEST_CONFIG.DEFAULT_RISK_FREE_RATE)
+    
     # 年化收益率
-    n_years = len(portfolio_returns) / 252  # 假设252个交易日/年
+    n_years = len(portfolio_returns) / trading_days_per_year
     annual_return_portfolio = (portfolio_cum.iloc[-1] ** (1/n_years)) - 1 if n_years > 0 else 0
     annual_return_benchmark = (benchmark_cum.iloc[-1] ** (1/n_years)) - 1 if n_years > 0 else 0
 
     # 波动率
-    volatility_portfolio = portfolio_returns.std() * np.sqrt(252)
-    volatility_benchmark = benchmark_returns.std() * np.sqrt(252)
-
-    # 夏普比率（假设无风险利率为3%）
-    risk_free_rate = 0.03
+    volatility_portfolio = portfolio_returns.std() * np.sqrt(trading_days_per_year)
+    volatility_benchmark = benchmark_returns.std() * np.sqrt(trading_days_per_year)
     sharpe_portfolio = (annual_return_portfolio - risk_free_rate) / volatility_portfolio if volatility_portfolio > 0 else 0
     sharpe_benchmark = (annual_return_benchmark - risk_free_rate) / volatility_benchmark if volatility_benchmark > 0 else 0
 
@@ -275,7 +229,7 @@ def calculate_performance_metrics(portfolio_returns: pd.Series,
 
     # 超额收益和跟踪误差
     excess_returns = portfolio_returns - benchmark_returns
-    tracking_error = excess_returns.std() * np.sqrt(252)
+    tracking_error = excess_returns.std() * np.sqrt(trading_days_per_year)
 
     # 信息比率
     information_ratio = (annual_return_portfolio - annual_return_benchmark) / tracking_error if tracking_error > 0 else 0
@@ -346,24 +300,18 @@ def create_performance_visualization(results: Dict[str, Any]) -> go.Figure:
     )
 
     # 添加基准收益曲线
-    colors = ['red', 'green', 'orange', 'purple']
     for i, (symbol, returns) in enumerate(benchmark_returns.items()):
         benchmark_cum = (1 + returns).cumprod()
 
-        # 基准名称映射
-        name_map = {
-            '000300.SH': '沪深300',
-            '000905.SH': '中证500',
-            '000852.SH': '中证1000'
-        }
-        display_name = name_map.get(symbol, symbol)
+        # 使用配置中的基准名称映射
+        display_name = BACKTEST_CONFIG.BENCHMARK_NAME_MAP.get(symbol, symbol)
 
         fig.add_trace(
             go.Scatter(
                 x=benchmark_cum.index,
                 y=(benchmark_cum - 1) * 100,
                 name=display_name,
-                line=dict(color=colors[i % len(colors)], width=1.5, dash='dash'),
+                line=dict(color=BACKTEST_CONFIG.CHART_COLORS[i % len(BACKTEST_CONFIG.CHART_COLORS)], width=1.5, dash='dash'),
                 hovertemplate=f'{display_name}<br>日期: %{{x}}<br>累计收益: %{{y:.2f}}%<extra></extra>'
             ),
             row=1, col=1
@@ -405,7 +353,7 @@ def create_performance_visualization(results: Dict[str, Any]) -> go.Figure:
     # 更新布局
     fig.update_layout(
         title='量化交易策略回测结果',
-        height=800,
+        height=BACKTEST_CONFIG.CHART_HEIGHT,
         showlegend=True,
         legend=dict(x=0, y=1, bgcolor='rgba(255,255,255,0.8)'),
         hovermode='x unified'
@@ -445,7 +393,7 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     start_date = backtest_config.get('start_date', '2020-01-01')
     end_date = backtest_config.get('end_date', '2023-12-31')
     initial_cash = backtest_config.get('initial_cash', 1000000)
-    stock_pool = trading_env.get('stock_pool', ['600519.SH', '600036.SH', '601318.SH'])
+    stock_pool = trading_env.get('stock_pool', BACKTEST_CONFIG.DEFAULT_STOCK_POOL)
 
     # 创建数据接口和特征工程器
     data_interface = QlibDataInterface()
@@ -455,9 +403,9 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     portfolio_config = PortfolioConfig(
         stock_pool=stock_pool,
         initial_cash=initial_cash,
-        commission_rate=trading_env.get('commission_rate', 0.001),
-        stamp_tax_rate=trading_env.get('stamp_tax_rate', 0.001),
-        max_position_size=trading_env.get('max_position_size', 0.1)
+        commission_rate=trading_env.get('commission_rate', BACKTEST_CONFIG.DEFAULT_COMMISSION_RATE),
+        stamp_tax_rate=trading_env.get('stamp_tax_rate', BACKTEST_CONFIG.DEFAULT_STAMP_TAX_RATE),
+        max_position_size=trading_env.get('max_position_size', BACKTEST_CONFIG.DEFAULT_MAX_POSITION_SIZE)
     )
 
     # 创建环境
@@ -481,11 +429,8 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     step = 0
 
     while not done:
-        # 转换观察以匹配训练时的维度
-        converted_obs = convert_observation_for_model(obs, agent.config)
-        
-        # 使用模型选择动作
-        action = agent.get_action(converted_obs, deterministic=True)
+        # 直接使用原始观察，让SAC agent内部的Transformer处理维度转换
+        action = agent.get_action(obs, deterministic=True)
 
         # 执行动作
         next_obs, reward, done, info = environment.step(action)
@@ -503,7 +448,8 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
         obs = next_obs
         step += 1
 
-        if step % 50 == 0:
+        progress_interval = get_config_value(config, 'progress_log_interval', BACKTEST_CONFIG.DEFAULT_PROGRESS_LOG_INTERVAL)
+        if step % progress_interval == 0:
             logger.debug(f"回测进度: {step}步, 当前价值: {environment.total_value:.2f}")
 
     # 计算收益率
@@ -511,7 +457,7 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     portfolio_returns = portfolio_values.pct_change().dropna()
 
     # 获取基准数据
-    benchmark_symbols = ['000300.SH', '000905.SH', '000852.SH']  # 沪深300, 中证500, 中证1000
+    benchmark_symbols = get_config_value(config, 'benchmark_symbols', BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS)
     benchmark_returns = compare_with_benchmarks(portfolio_returns, benchmark_symbols)
 
     # 计算性能指标
@@ -615,17 +561,17 @@ def main():
         # 转换为JSON可序列化格式
         json_results = convert_to_json_serializable(json_results)
 
-        with open(output_dir / "backtest_results.json", 'w', encoding='utf-8') as f:
+        with open(output_dir / BACKTEST_CONFIG.RESULTS_JSON_FILENAME, 'w', encoding='utf-8') as f:
             json.dump(json_results, f, indent=2, ensure_ascii=False)
 
         # 创建可视化
         logger.info("生成可视化图表...")
         fig = create_performance_visualization(results)
-        fig.write_html(str(output_dir / "performance_chart.html"))
+        fig.write_html(str(output_dir / BACKTEST_CONFIG.CHART_HTML_FILENAME))
 
         # 输出性能摘要
         logger.info("回测结果摘要:")
-        main_benchmark = '000300.SH'  # 使用沪深300作为主要基准
+        main_benchmark = BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS[0]  # 使用默认基准列表的第一个作为主要基准
         if main_benchmark in results['metrics']:
             metrics = results['metrics'][main_benchmark]
             logger.info(f"  投资组合年化收益率: {metrics['annual_return']*100:.2f}%")

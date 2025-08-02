@@ -25,6 +25,9 @@ class FeatureEngineer:
         """初始化特征工程器"""
         self.scalers = {}
         self.feature_names = {}
+        # 特征缓存机制
+        self._feature_cache = {}
+        self._cache_enabled = False
         
     def calculate_technical_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -61,13 +64,18 @@ class FeatureEngineer:
                   bb_result, stoch_result, atr_result, volume_result]:
             result = result.join(df, how='outer')
         
+        # 添加基础价格特征以匹配已训练模型的37个特征期望
+        result['high_low_ratio'] = data['high'] / data['low']
+        result['close_open_ratio'] = data['close'] / data['open']
+        
         return result
     
     def calculate_sma(self, data: pd.DataFrame, window: int = 20) -> pd.DataFrame:
         """计算简单移动平均线"""
         result = pd.DataFrame(index=data.index)
         
-        windows = [5, 10, 20, 60]
+        # 只使用与已训练模型一致的SMA窗口
+        windows = [5, 10]
         for w in windows:
             if len(data) >= w:
                 result[f'sma_{w}'] = data['close'].rolling(window=w).mean()
@@ -82,26 +90,35 @@ class FeatureEngineer:
         result['ema_12'] = data['close'].ewm(span=12).mean()
         result['ema_26'] = data['close'].ewm(span=26).mean()
         
+        # 添加额外EMA以匹配已训练模型的37个特征期望
+        result['ema_50'] = data['close'].ewm(span=50).mean()
+        result['ema_100'] = data['close'].ewm(span=100).mean()
+        result['ema_200'] = data['close'].ewm(span=200).mean()
+        
         return result
     
     def calculate_rsi(self, data: pd.DataFrame, window: int = 14) -> pd.DataFrame:
         """计算相对强弱指数"""
         result = pd.DataFrame(index=data.index)
         
-        # 计算价格变化
-        delta = data['close'].diff()
+        # 计算多个窗口的RSI以匹配已训练模型的37个特征期望
+        windows = [7, 14, 21, 30]
         
-        # 分离上涨和下跌
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        
-        # 计算平均收益和损失
-        avg_gain = gain.rolling(window=window).mean()
-        avg_loss = loss.rolling(window=window).mean()
-        
-        # 计算RSI
-        rs = avg_gain / avg_loss
-        result['rsi_14'] = 100 - (100 / (1 + rs))
+        for w in windows:
+            # 计算价格变化
+            delta = data['close'].diff()
+            
+            # 分离上涨和下跌
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            
+            # 计算平均收益和损失
+            avg_gain = gain.rolling(window=w).mean()
+            avg_loss = loss.rolling(window=w).mean()
+            
+            # 计算RSI
+            rs = avg_gain / avg_loss
+            result[f'rsi_{w}'] = 100 - (100 / (1 + rs))
         
         return result
     
@@ -355,21 +372,21 @@ class FeatureEngineer:
         returns = data['close'].pct_change(fill_method=None)
         result['realized_volatility'] = returns.rolling(window=20).std() * np.sqrt(252)
         
-        # Garman-Klass波动率估计（安全处理对数计算）
+        # Garman-Klass波动率估计（优化：使用向量化操作）
         high_low_ratio = data['high'] / data['low']
         close_open_ratio = data['close'] / data['open']
         
-        # 安全计算对数，避免log(1)=0和log(<=0)的问题
-        log_hl = high_low_ratio.apply(lambda x: np.log(x) if x > 1 else 0)
-        log_co = close_open_ratio.apply(lambda x: np.log(x) if x > 0 and x != 1 else 0)
+        # 优化：使用numpy向量化操作代替apply lambda
+        log_hl = np.where(high_low_ratio > 1, np.log(high_low_ratio), 0)
+        log_co = np.where((close_open_ratio > 0) & (close_open_ratio != 1), np.log(close_open_ratio), 0)
         
         gk_vol = log_hl ** 2 - (2 * np.log(2) - 1) * log_co ** 2
-        result['garman_klass_volatility'] = gk_vol.rolling(window=20).mean() * 252
+        result['garman_klass_volatility'] = pd.Series(gk_vol, index=data.index).rolling(window=20).mean() * 252
         
-        # Parkinson波动率估计（安全处理）
-        log_hl_parkinson = high_low_ratio.apply(lambda x: np.log(x) if x > 1 else 0)
+        # Parkinson波动率估计（优化：使用向量化操作）
+        log_hl_parkinson = np.where(high_low_ratio > 1, np.log(high_low_ratio), 0)
         parkinson_vol = log_hl_parkinson ** 2 / (4 * np.log(2))
-        result['parkinson_volatility'] = parkinson_vol.rolling(window=20).mean() * 252
+        result['parkinson_volatility'] = pd.Series(parkinson_vol, index=data.index).rolling(window=20).mean() * 252
         
         return result
     
@@ -598,6 +615,69 @@ class FeatureEngineer:
         selected_features = features.columns[selector.get_support()].tolist()
         return selected_features
     
+    def enable_feature_cache(self):
+        """启用特征缓存"""
+        self._cache_enabled = True
+        logger.info("特征缓存已启用")
+    
+    def disable_feature_cache(self):
+        """禁用特征缓存"""
+        self._cache_enabled = False
+        logger.info("特征缓存已禁用")
+    
+    def clear_feature_cache(self):
+        """清除特征缓存"""
+        self._feature_cache.clear()
+        logger.info("特征缓存已清除")
+    
+    def _generate_cache_key(self, data: pd.DataFrame, method_name: str) -> str:
+        """生成缓存键"""
+        # 使用数据的形状、索引范围和方法名生成唯一键
+        if isinstance(data.index, pd.MultiIndex):
+            # 对于MultiIndex，使用第一层和第二层的最小最大值
+            level0_min = data.index.get_level_values(0).min()
+            level0_max = data.index.get_level_values(0).max()
+            level1_min = data.index.get_level_values(1).min()
+            level1_max = data.index.get_level_values(1).max()
+            key_parts = [method_name, str(data.shape), str(level0_min), str(level0_max), 
+                        str(level1_min), str(level1_max)]
+        else:
+            index_min = data.index.min()
+            index_max = data.index.max()
+            key_parts = [method_name, str(data.shape), str(index_min), str(index_max)]
+        
+        return "_".join(key_parts)
+    
+    def _get_cached_result(self, cache_key: str) -> Optional[pd.DataFrame]:
+        """获取缓存结果"""
+        if not self._cache_enabled:
+            return None
+        return self._feature_cache.get(cache_key)
+    
+    def _cache_result(self, cache_key: str, result: pd.DataFrame):
+        """缓存结果"""
+        if self._cache_enabled:
+            self._feature_cache[cache_key] = result.copy()
+    
+    def calculate_volatility_features_optimized(self, data: pd.DataFrame) -> pd.DataFrame:
+        """计算波动率特征（优化版本，支持缓存）"""
+        cache_key = self._generate_cache_key(data, "volatility_features")
+        
+        # 尝试从缓存获取结果
+        cached_result = self._get_cached_result(cache_key)
+        if cached_result is not None:
+            logger.debug(f"从缓存获取波动率特征，键: {cache_key}")
+            return cached_result
+        
+        # 计算新结果
+        result = self.calculate_volatility_features(data)
+        
+        # 缓存结果
+        self._cache_result(cache_key, result)
+        logger.debug(f"缓存波动率特征，键: {cache_key}")
+        
+        return result
+    
     def combine_features(self, feature_dfs: List[pd.DataFrame]) -> pd.DataFrame:
         """
         合并多个特征DataFrame
@@ -708,10 +788,9 @@ class FeatureEngineer:
             logger.debug("计算动量特征...")
             momentum_features = self.calculate_momentum_features(data)
             
-            # 合并所有特征
+            # 合并所有特征（不包含原始价格数据）
             logger.debug("合并特征...")
             all_features = self.combine_features([
-                data,
                 technical_features,
                 microstructure_features,
                 volatility_features,
