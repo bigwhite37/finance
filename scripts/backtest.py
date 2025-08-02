@@ -38,6 +38,7 @@ from rl_trading_system.config import ConfigManager
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer
 from rl_trading_system.models import SACAgent, SACConfig, TransformerConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
+from rl_trading_system.risk_control.risk_controller import RiskController, RiskControlConfig
 try:
     from .backtest_constants import BACKTEST_CONFIG, get_config_value
 except ImportError:
@@ -115,6 +116,111 @@ def load_trained_model(model_path: str) -> SACAgent:
 
     return agent
 
+
+
+def validate_step_risk_metrics(environment: PortfolioEnvironment, step: int) -> Dict[str, Any]:
+    """
+    验证单步的风险指标
+    
+    Args:
+        environment: 投资组合环境
+        step: 当前步数
+        
+    Returns:
+        风险指标字典
+    """
+    risk_metrics = {
+        'step': step,
+        'violations_count': 0,
+        'violations': [],
+        'max_position_weight': 0.0,
+        'portfolio_concentration': 0.0,
+        'current_drawdown': 0.0
+    }
+    
+    try:
+        if environment.risk_controller is None:
+            return risk_metrics
+            
+        # 构建当前投资组合状态进行风险评估
+        current_portfolio = environment._build_portfolio_for_risk_check()
+        
+        # 执行风险评估
+        violations = environment.risk_controller.assess_portfolio_risk(current_portfolio)
+        
+        risk_metrics['violations_count'] = len(violations)
+        risk_metrics['violations'] = [
+            {
+                'type': v.violation_type.value,
+                'severity': v.severity.value,
+                'message': v.message
+            } for v in violations
+        ]
+        
+        # 计算基本风险指标
+        if environment.current_positions is not None:
+            risk_metrics['max_position_weight'] = float(np.max(environment.current_positions))
+            # 计算赫芬达尔指数（投资组合集中度）
+            weights_squared = environment.current_positions ** 2
+            risk_metrics['portfolio_concentration'] = float(np.sum(weights_squared))
+        
+        risk_metrics['current_drawdown'] = float(environment._calculate_current_drawdown())
+        
+    except (AttributeError, ValueError, KeyError) as e:
+        # 风险验证失败时，抛出异常，不掩盖错误
+        logger.error(f"风险验证失败: {e}")
+        raise RuntimeError(f"回测风险验证模块出现错误，无法继续风险监控: {e}") from e
+        
+    return risk_metrics
+
+
+def calculate_risk_summary(violations_history: List[Dict], metrics_history: List[Dict]) -> Dict[str, Any]:
+    """
+    计算风险指标汇总
+    
+    Args:
+        violations_history: 风险违规历史
+        metrics_history: 风险指标历史
+        
+    Returns:
+        风险汇总指标
+    """
+    summary = {
+        'total_violations': len(violations_history),
+        'avg_concentration': 0.0,
+        'max_drawdown': 0.0,
+        'avg_max_position_weight': 0.0,
+        'violation_types': {},
+        'high_risk_periods': 0
+    }
+    
+    if not metrics_history:
+        return summary
+    
+    # 计算平均值
+    concentrations = [m.get('portfolio_concentration', 0) for m in metrics_history if 'error' not in m]
+    if concentrations:
+        summary['avg_concentration'] = np.mean(concentrations)
+    
+    drawdowns = [m.get('current_drawdown', 0) for m in metrics_history if 'error' not in m]
+    if drawdowns:
+        summary['max_drawdown'] = max(drawdowns)
+    
+    max_weights = [m.get('max_position_weight', 0) for m in metrics_history if 'error' not in m]
+    if max_weights:
+        summary['avg_max_position_weight'] = np.mean(max_weights)
+    
+    # 统计违规类型
+    for violation_record in violations_history:
+        for violation in violation_record.get('violations', []):
+            vtype = violation.get('type', 'unknown')
+            summary['violation_types'][vtype] = summary['violation_types'].get(vtype, 0) + 1
+    
+    # 计算高风险时期
+    summary['high_risk_periods'] = len([m for m in metrics_history 
+                                       if m.get('violations_count', 0) > 0 and 'error' not in m])
+    
+    return summary
 
 
 def get_benchmark_data(symbol: str, start_date: str, end_date: str,
@@ -424,6 +530,10 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
 
     portfolio_values = []
     dates = []
+    
+    # 风险监控记录
+    risk_violations_history = []
+    risk_metrics_history = []
 
     done = False
     step = 0
@@ -445,12 +555,30 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             # 使用最后一个有效日期
             dates.append(environment.dates[-1])
 
+        # 风险验证：记录风险违规和风险指标
+        if hasattr(environment, 'risk_controller') and environment.risk_controller is not None:
+            step_risk_metrics = validate_step_risk_metrics(environment, step)
+            risk_metrics_history.append(step_risk_metrics)
+            
+            # 检查是否有风险违规
+            if step_risk_metrics.get('violations_count', 0) > 0:
+                risk_violations_history.append({
+                    'step': step,
+                    'date': dates[-1] if dates else None,
+                    'violations': step_risk_metrics.get('violations', [])
+                })
+
         obs = next_obs
         step += 1
 
         progress_interval = get_config_value(config, 'progress_log_interval', BACKTEST_CONFIG.DEFAULT_PROGRESS_LOG_INTERVAL)
         if step % progress_interval == 0:
             logger.debug(f"回测进度: {step}步, 当前价值: {environment.total_value:.2f}")
+            # 输出风险监控信息
+            if risk_violations_history:
+                recent_violations = len([v for v in risk_violations_history if v['step'] > step - progress_interval])
+                if recent_violations > 0:
+                    logger.info(f"最近{progress_interval}步内检测到{recent_violations}次风险违规")
 
     # 计算收益率
     portfolio_values = pd.Series(portfolio_values, index=dates)
@@ -466,13 +594,23 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
         symbol_metrics = calculate_performance_metrics(portfolio_returns, bench_returns)
         metrics[symbol] = symbol_metrics
 
+    # 计算汇总风险指标
+    risk_summary = calculate_risk_summary(risk_violations_history, risk_metrics_history)
+    
     logger.info("回测完成")
+    logger.info(f"风险监控摘要: 总违规次数 {risk_summary.get('total_violations', 0)}, "
+                f"平均集中度 {risk_summary.get('avg_concentration', 0):.3f}")
 
     return {
         'portfolio_returns': portfolio_returns,
         'portfolio_values': portfolio_values,
         'benchmark_returns': benchmark_returns,
         'metrics': metrics,
+        'risk_metrics': {
+            'violations_history': risk_violations_history,
+            'metrics_history': risk_metrics_history,
+            'summary': risk_summary
+        },
         'backtest_period': {
             'start_date': start_date,
             'end_date': end_date,
