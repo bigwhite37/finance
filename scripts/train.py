@@ -23,6 +23,10 @@ from rl_trading_system.training import RLTrainer, TrainingConfig, create_split_s
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer, DataProcessor
 from rl_trading_system.models import TimeSeriesTransformer, SACAgent, TransformerConfig, SACConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
+from rl_trading_system.utils.terminal_colors import (
+    ColorFormatter, print_banner, print_section, print_model_recommendation,
+    print_training_stats, print_evaluation_results
+)
 
 
 def setup_logging(output_dir: str, log_level: str = "INFO"):
@@ -195,8 +199,13 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                        choices=["auto", "cpu", "cuda"],
                        help="训练设备")
+    parser.add_argument("--no-color", action="store_true",
+                       help="禁用彩色输出")
 
     args = parser.parse_args()
+    
+    # 初始化彩色格式化器
+    formatter = ColorFormatter(enable_color=not args.no_color)
 
     # 创建输出目录
     output_dir = Path(args.output_dir)
@@ -211,20 +220,27 @@ def main():
     else:
         device = args.device
 
-    logger_instance.info(f"使用设备: {device}")
+    # 打印标题横幅
+    print_banner(
+        "🚀 强化学习交易智能体训练",
+        f"SAC + Transformer | 设备: {device}",
+        formatter
+    )
 
     try:
         # 加载配置
-        logger_instance.info("加载配置文件...")
+        print_section("📁 加载配置文件", formatter)
         config_manager = ConfigManager()
 
         # 检查配置文件是否存在
         model_config_path = Path(args.config)
         if not model_config_path.exists():
+            print(formatter.error(f"❌ 模型配置文件不存在: {args.config}"))
             raise FileNotFoundError(f"模型配置文件不存在: {args.config}")
 
         data_config_path = Path(args.data_config)
         if not data_config_path.exists():
+            print(formatter.error(f"❌ 数据配置文件不存在: {args.data_config}"))
             raise FileNotFoundError(f"数据配置文件不存在: {args.data_config}")
 
         model_config = config_manager.load_config(str(model_config_path))
@@ -240,15 +256,15 @@ def main():
                 model_config["training"] = {}
             model_config["training"]["n_episodes"] = args.episodes
 
-        logger_instance.info("训练配置:")
-        logger_instance.info(f"  模型配置文件: {args.config}")
-        logger_instance.info(f"  交易配置文件: {args.data_config}")
+        print(f"  {formatter.success('✅ 模型配置文件')}: {formatter.path(args.config)}")
+        print(f"  {formatter.success('✅ 交易配置文件')}: {formatter.path(args.data_config)}")
         
         # 安全地获取训练轮数
         n_episodes = model_config.get("model", {}).get("training", {}).get("n_episodes", 100)
-        logger_instance.info(f"  训练轮数: {n_episodes}")
-        logger_instance.info(f"  输出目录: {args.output_dir}")
-        logger_instance.info(f"  设备: {device}")
+        print(f"  {formatter.info('训练轮数')}: {formatter.number(str(n_episodes))}")
+        print(f"  {formatter.info('输出目录')}: {formatter.path(args.output_dir)}")
+        print(f"  {formatter.info('训练设备')}: {formatter.highlight(device)}")
+        print()
 
         # 创建训练组件
         environment, agent, data_split, training_config = create_training_components(
@@ -272,23 +288,36 @@ def main():
                 logger_instance.warning(f"检查点文件不存在: {args.resume}")
 
         # 开始训练
-        logger_instance.info("开始训练强化学习交易智能体...")
+        print_section("🎯 开始训练", formatter)
+        print(f"  {formatter.info('正在训练强化学习交易智能体...')}")
+        print()
+        
         training_stats = trainer.train()
 
         # 输出训练统计
-        logger_instance.info("训练完成！统计信息:")
-        for key, value in training_stats.items():
-            logger_instance.info(f"  {key}: {value:.4f}")
+        print_training_stats(training_stats, formatter)
 
         # 运行最终评估
-        logger_instance.info("运行最终评估...")
+        print_section("📊 最终评估", formatter)
+        print(f"  {formatter.info('正在运行模型评估...')}")
         evaluation_stats = trainer.evaluate(n_episodes=20)
 
-        logger_instance.info("评估完成！统计信息:")
-        for key, value in evaluation_stats.items():
-            logger_instance.info(f"  {key}: {value:.4f}")
+        # 输出评估结果
+        print_evaluation_results(evaluation_stats, formatter)
 
-        logger_instance.info(f"训练结果已保存到: {output_dir}")
+        # 显示模型保存信息和使用建议
+        model_paths = {
+            'final_model': str(output_dir / "final_model_agent.pth"),
+        }
+        
+        # 检查是否有最佳模型
+        best_model_path = output_dir / "best_model_agent.pth"
+        if best_model_path.exists():
+            model_paths['best_model'] = str(best_model_path)
+        
+        print_model_recommendation(model_paths, formatter)
+        
+        print(formatter.success(f"🎉 训练完成！所有结果已保存到: {formatter.path(str(output_dir))}"))
 
     except Exception as e:
         logger_instance.error(f"训练过程中发生错误: {str(e)}")

@@ -121,11 +121,17 @@ class PortfolioEnvironment(gym.Env):
         
         # 初始化风险控制器
         if config.enable_risk_control:
+            # 为强化学习训练优化的风险配置
             risk_config = config.risk_config or RiskControlConfig(
-                max_position_weight=config.max_position_size,
-                stop_loss_threshold=0.05,
-                max_daily_loss=0.02,
-                max_drawdown=0.1
+                max_position_weight=max(config.max_position_size, 0.4),    # 至少40%，适应小股票池
+                max_sector_exposure=0.8,                                   # 放宽行业暴露限制（考虑行业分类不准确）
+                stop_loss_threshold=0.1,                                   # 保持适度止损控制
+                max_daily_loss=0.05,                                       # 适度放宽日损失限制
+                max_drawdown=0.15,                                         # 适度放宽回撤限制
+                trade_size_limit=0.3,                                      # 放宽单笔交易限制，支持RL探索
+                frequency_limit=200,                                       # 提高交易频率限制
+                volume_anomaly_threshold=5.0,                              # 降低交易量异常敏感度
+                price_anomaly_threshold=4.0                                # 降低价格异常敏感度
             )
             self.risk_controller = RiskController(risk_config)
             logger.info("风险控制器已启用")
@@ -1320,13 +1326,22 @@ class PortfolioEnvironment(gym.Env):
                     risk_violations.extend(trade_risk_result.get('violations', []))
             
             # 如果有严重风险违规，调整目标权重
-            if any(violation.severity in [RiskLevel.HIGH, RiskLevel.CRITICAL] for violation in risk_violations):
-                logger.warning(f"检测到严重风险违规，调整交易计划: {[v.message for v in risk_violations]}")
+            critical_violations = [v for v in risk_violations if v.severity == RiskLevel.CRITICAL]
+            high_violations = [v for v in risk_violations if v.severity == RiskLevel.HIGH]
+            
+            if critical_violations:
+                # 危急风险：总是记录
+                logger.warning(f"检测到危急风险违规，强制调整交易计划: {[v.message for v in critical_violations]}")
+                return self._adjust_weights_for_risk_violations(target_weights, risk_violations)
+            elif high_violations:
+                # 高风险：每100步记录一次，避免日志洪水
+                if self.current_step % 100 == 0:
+                    logger.info(f"检测到高风险违规，调整交易计划: {[v.message for v in high_violations]}")
                 return self._adjust_weights_for_risk_violations(target_weights, risk_violations)
             else:
-                # 记录中低级风险警告
-                if risk_violations:
-                    logger.info(f"检测到风险警告: {[v.message for v in risk_violations]}")
+                # 中低级风险警告：每200步记录一次，且仅记录调试信息
+                if risk_violations and self.current_step % 200 == 0:
+                    logger.debug(f"检测到轻微风险警告: {len(risk_violations)}项")
                 return target_weights
                 
         except (AttributeError, ValueError, KeyError) as e:

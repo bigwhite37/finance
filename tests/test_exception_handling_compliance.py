@@ -88,11 +88,12 @@ class TestExceptionHandlingCompliance:
         from rl_trading_system.trading.portfolio_environment import PortfolioEnvironment
         environment._check_trading_risks = PortfolioEnvironment._check_trading_risks.__get__(environment)
         environment._build_portfolio_for_risk_check = PortfolioEnvironment._build_portfolio_for_risk_check.__get__(environment)
-        environment._build_trades_for_risk_check = PortfolioEnvironment._build_trades_for_risk_check.__get__(environment)
+        environment._build_trade_decisions_for_risk_check = PortfolioEnvironment._build_trade_decisions_for_risk_check.__get__(environment)
         environment.config = portfolio_config
+        environment.current_step = 1  # 添加current_step属性
         
         # 模拟风险控制器方法失败
-        environment.risk_controller.check_trade_risks = Mock(side_effect=AttributeError("模拟的风险检查错误"))
+        environment.risk_controller.check_trade_risk = Mock(side_effect=AttributeError("模拟的风险检查错误"))
         
         # 验证异常被正确抛出而不是被吞掉
         with pytest.raises(RuntimeError) as exc_info:

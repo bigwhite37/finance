@@ -670,7 +670,7 @@ class SACAgent(nn.Module):
         path = Path(path)
         
         # 加载模型参数
-        checkpoint = torch.load(path / 'model.pt', map_location=self.device)
+        checkpoint = torch.load(path / 'model.pt', map_location=self.device, weights_only=False)
         
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
