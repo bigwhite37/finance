@@ -8,10 +8,10 @@ model:
     d_ff: 1024                  # 前馈网络维度，可通过 MODEL_TRANSFORMER_D_FF 覆盖
     dropout: 0.1                # Dropout率，可通过 MODEL_TRANSFORMER_DROPOUT 覆盖
     max_seq_len: 252            # 最大序列长度（一年交易日），可通过 MODEL_TRANSFORMER_MAX_SEQ_LEN 覆盖
-    n_features: 12              # 特征数量（每只股票12个特征），可通过 MODEL_TRANSFORMER_N_FEATURES 覆盖
+    n_features: 35              # 特征数量（每只股票35个特征），可通过 MODEL_TRANSFORMER_N_FEATURES 覆盖
   
   sac:
-    state_dim: 2173             # 状态维度 (60*3*12 + 3 + 10)，可通过 MODEL_SAC_STATE_DIM 覆盖
+    state_dim: 256              # 状态维度（Transformer输出维度），可通过 MODEL_SAC_STATE_DIM 覆盖
     action_dim: 3               # 动作维度（股票数量），可通过 MODEL_SAC_ACTION_DIM 覆盖
     hidden_dim: 512             # 隐藏层维度，可通过 MODEL_SAC_HIDDEN_DIM 覆盖
     lr_actor: 0.0003            # Actor学习率，可通过 MODEL_SAC_LR_ACTOR 覆盖

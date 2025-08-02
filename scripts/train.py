@@ -121,9 +121,9 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         n_features=model_config["model"]["transformer"]["n_features"]
     )
 
-    # 创建SAC配置
+    # 创建SAC配置，集成Transformer
     sac_config = SACConfig(
-        state_dim=model_config["model"]["sac"]["state_dim"],
+        state_dim=transformer_config.d_model,  # 使用Transformer输出维度作为SAC状态维度
         action_dim=model_config["model"]["sac"]["action_dim"],
         hidden_dim=model_config["model"]["sac"]["hidden_dim"],
         lr_actor=model_config["model"]["sac"]["lr_actor"],
@@ -134,12 +134,13 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         alpha=model_config["model"]["sac"]["alpha"],
         target_entropy=model_config["model"]["sac"]["target_entropy"],
         buffer_capacity=model_config["model"]["sac"]["buffer_size"],
-        batch_size=model_config["model"]["sac"]["batch_size"]
+        batch_size=model_config["model"]["sac"]["batch_size"],
+        use_transformer=True,  # 启用Transformer集成
+        transformer_config=transformer_config  # 传入Transformer配置
     )
 
-    # 创建模型
-    logger.debug("初始化Transformer和SAC智能体...")
-    transformer = TimeSeriesTransformer(transformer_config)
+    # 创建模型（SAC智能体内部集成了Transformer）
+    logger.debug("初始化SAC智能体（集成Transformer）...")
     sac_agent = SACAgent(sac_config)
 
     # 创建交易环境

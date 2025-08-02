@@ -195,6 +195,10 @@ class PortfolioEnvironment(gym.Env):
         self.price_data = self._clean_price_data(raw_price_data)
         logger.info(f"数据清洗完成: 原始数据{len(raw_price_data)}条记录，清洗后{len(self.price_data)}条记录")
         
+        # 提取可用的交易日期
+        datetime_level = 'datetime' if 'datetime' in self.price_data.index.names else 1
+        self.dates = self.price_data.index.get_level_values(datetime_level).unique().sort_values()
+        
         # 加载基准指数数据（沪深300）
         benchmark_symbol = "000300.SH"  # 沪深300指数
         logger.debug(f"加载基准指数数据: {benchmark_symbol}")
@@ -250,9 +254,8 @@ class PortfolioEnvironment(gym.Env):
         
         # 动态计算每只股票的特征数
         if not self.feature_data.empty:
-            total_features = self.feature_data.shape[1]
-            self.n_features_per_stock = total_features // self.n_stocks
-            logger.info(f"动态计算特征维度: 总特征={total_features}, 股票数={self.n_stocks}, 每股特征={self.n_features_per_stock}")
+            self.n_features_per_stock = self.feature_data.shape[1]  # 每只股票都有相同的特征数
+            logger.info(f"动态计算特征维度: 每只股票特征数={self.n_features_per_stock}, 股票数={self.n_stocks}")
             
             # 重新定义观察空间
             self.observation_space = spaces.Dict({
@@ -503,9 +506,36 @@ class PortfolioEnvironment(gym.Env):
         Returns:
             (观察, 奖励, 是否结束, 信息字典)
         """
-        # 先更新步数，然后更新价格
-        # 这样价格更新会使用正确的时间索引
+        # 先更新步数
         self.current_step += 1
+        
+        # 立即检查是否应该结束 - 避免在无效状态下执行后续操作
+        if self._is_done():
+            # 如果已经结束，返回最后的观察状态和信息
+            try:
+                final_observation = self._get_observation()
+            except (IndexError, RuntimeError, KeyError) as e:
+                # 如果无法获取观察，使用上一次的观察或创建空观察
+                logger.warning(f"无法获取最终观察状态: {e}")
+                final_observation = {
+                    'features': np.zeros((self.config.lookback_window, self.n_stocks, self.n_features_per_stock), dtype=np.float32),
+                    'positions': self.current_positions.astype(np.float32),
+                    'market_state': np.zeros(self.n_market_features, dtype=np.float32)
+                }
+            
+            # 构建最终信息字典
+            final_info = {
+                'portfolio_return': 0.0,
+                'transaction_cost': 0.0,
+                'positions': self.current_positions.copy(),
+                'total_value': float(self.total_value),
+                'cash': float(self.cash),
+                'drawdown': float(self._calculate_current_drawdown()),
+                'step': self.current_step,
+                'termination_reason': 'episode_completed'
+            }
+            
+            return final_observation, 0.0, True, final_info
         
         # 更新当前价格（使用新的时间步）
         self._update_current_prices()
@@ -844,15 +874,44 @@ class PortfolioEnvironment(gym.Env):
         if self.current_step <= 1:
             return 0.0  # 第一步没有前一期数据
         
-        # 重要修复：正确计算基准数据的索引
-        # current_step在step方法开始时已经+1，所以这里需要正确对应
-        # 当前步骤对应的数据索引应该是 start_idx + current_step - 1
-        current_data_idx = self.start_idx + self.current_step - 1
-        previous_data_idx = self.start_idx + self.current_step - 2
+        # 计算日期索引位置
+        current_date_idx = self.start_idx + self.current_step - 1
+        previous_date_idx = self.start_idx + self.current_step - 2
         
-        # 检查索引有效性
-        if current_data_idx >= len(self.benchmark_data) or previous_data_idx < 0:
-            raise RuntimeError(f"基准数据索引超出范围: current_idx={current_data_idx}, previous_idx={previous_data_idx}, 数据长度={len(self.benchmark_data)}")
+        # 严格的边界检查 - 如果索引无效，说明环境状态有问题，应该抛出异常
+        if hasattr(self, 'dates') and self.dates is not None:
+            if (current_date_idx >= len(self.dates) or 
+                previous_date_idx < 0 or 
+                current_date_idx < 0):
+                raise RuntimeError(f"无法计算基准收益率：日期索引超出边界。"
+                                 f"current_idx={current_date_idx}, previous_idx={previous_date_idx}, "
+                                 f"dates_len={len(self.dates)}, current_step={self.current_step}, "
+                                 f"start_idx={self.start_idx}。这表明环境边界检查失效。")
+            
+            # 获取对应的日期
+            current_date = self.dates[current_date_idx]
+            previous_date = self.dates[previous_date_idx]
+            
+            # 在基准数据中找到对应日期的索引
+            try:
+                current_data_idx = self.benchmark_data.index.get_loc(current_date)
+                previous_data_idx = self.benchmark_data.index.get_loc(previous_date)
+            except KeyError as e:
+                raise RuntimeError(f"基准数据中找不到日期：current={current_date}, previous={previous_date}。"
+                                 f"基准数据日期范围：{self.benchmark_data.index.min()} 到 {self.benchmark_data.index.max()}。"
+                                 f"原始错误：{e}")
+        else:
+            # 如果没有dates属性，使用原始索引计算
+            current_data_idx = current_date_idx
+            previous_data_idx = previous_date_idx
+        
+        # 基准数据边界检查
+        if (current_data_idx >= len(self.benchmark_data) or 
+            previous_data_idx < 0 or 
+            previous_data_idx >= len(self.benchmark_data)):
+            raise RuntimeError(f"基准数据索引超出边界：current_idx={current_data_idx}, "
+                             f"previous_idx={previous_data_idx}, benchmark_data_len={len(self.benchmark_data)}。"
+                             f"这表明基准数据与主数据不匹配。")
         
         # 处理多层索引的情况
         if isinstance(self.benchmark_data.index, pd.MultiIndex):
@@ -921,23 +980,43 @@ class PortfolioEnvironment(gym.Env):
                                   axis=0)
                 features = np.concatenate([padding, features], axis=0)
             
-            # 将特征重塑为 (lookback_window, n_stocks, n_features_per_stock)
-            # 假设特征按股票顺序排列：[stock1_feat1, stock1_feat2, ..., stock2_feat1, ...]
-            n_features_total = features.shape[1]  # 总特征数 (36)
-            expected_total = self.n_stocks * self.n_features_per_stock  # 3 * 12 = 36
+            # 从MultiIndex DataFrame中为每只股票提取特征
+            # feature_data的结构是 (instrument, datetime) -> features
+            # 需要为每只股票、每个时间步提取特征
+            stock_features_list = []
             
-            if n_features_total == expected_total:
-                # 重塑为 (lookback_window, n_stocks, n_features_per_stock)
-                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
+            # 获取当前时间窗口的日期
+            end_idx = self.start_idx + self.current_step + 1
+            start_idx = max(0, end_idx - self.config.lookback_window)
+            
+            if end_idx > len(self.dates):
+                current_dates = self.dates[-self.config.lookback_window:]
             else:
-                # 如果特征数不匹配，截断或填充到预期大小
-                if n_features_total > expected_total:
-                    features = features[:, :expected_total]
-                else:
-                    # 用零填充不足的特征
-                    padding_features = np.zeros((features.shape[0], expected_total - n_features_total))
-                    features = np.concatenate([features, padding_features], axis=1)
-                features = features.reshape(features.shape[0], self.n_stocks, self.n_features_per_stock)
+                current_dates = self.dates[start_idx:end_idx]
+            
+            for symbol in self.config.stock_pool:
+                stock_features = []
+                for date in current_dates:
+                    try:
+                        # 从MultiIndex DataFrame中提取特定股票和日期的特征
+                        if isinstance(self.feature_data.index, pd.MultiIndex):
+                            stock_date_features = self.feature_data.loc[(symbol, date)].values
+                        else:
+                            # 如果不是MultiIndex，尝试按日期索引
+                            stock_date_features = self.feature_data.loc[date].values
+                        stock_features.append(stock_date_features)
+                    except KeyError:
+                        # 如果找不到数据，使用零填充
+                        stock_features.append(np.zeros(self.n_features_per_stock))
+                
+                # 确保有正确的时间步数
+                while len(stock_features) < self.config.lookback_window:
+                    stock_features.insert(0, stock_features[0] if stock_features else np.zeros(self.n_features_per_stock))
+                
+                stock_features_list.append(np.array(stock_features))
+            
+            # 堆叠为 (lookback_window, n_stocks, n_features_per_stock)
+            features = np.stack(stock_features_list, axis=1)
         else:
             # 如果没有特征数据，抛出异常
             raise ValueError("没有可用的特征数据，无法生成观察")
@@ -1061,7 +1140,14 @@ class PortfolioEnvironment(gym.Env):
     
     def _is_done(self) -> bool:
         """判断回合是否结束"""
-        # 数据用尽检查（优先级最高）
+        # 日期索引边界检查（优先级最高）
+        if (hasattr(self, 'dates') and self.dates is not None and 
+            self.start_idx + self.current_step >= len(self.dates)):
+            logger.debug(f"日期索引用尽，结束episode: step={self.current_step}, "
+                        f"start_idx={self.start_idx}, dates_len={len(self.dates)}")
+            return True
+        
+        # 数据用尽检查
         if (self.feature_data is not None and 
             self.start_idx + self.current_step >= len(self.feature_data)):
             logger.debug(f"数据用尽，结束episode: step={self.current_step}, data_len={len(self.feature_data)}")
