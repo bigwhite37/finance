@@ -6,23 +6,19 @@ system:
   version: "1.0.0"
   environment: "development"  # development, testing, production
   log_level: "INFO"
-  
+
 # 数据配置
 data:
   # 数据源配置
   primary_source: "qlib"  # qlib, akshare
   backup_source: "akshare"
-  
+
   # 股票池配置
   stock_pool:
-    - "600519.SH"  # 贵州茅台
+    - "601288.SH"  # 农业银行
     - "600036.SH"  # 招商银行
-    - "601318.SH"  # 中国平安
-    - "002594.SZ"  # 比亚迪
-    - "600276.SH"  # 恒瑞医药
-    - "000333.SZ"  # 美的集团
-    - "002475.SZ"  # 立讯精密
-  
+    - "600919.SH"  # 中国平安
+
   # 数据参数
   lookback_window: 60
   update_frequency: "1D"  # 1D, 1H, 5min
@@ -33,11 +29,11 @@ data:
     - "close"
     - "volume"
     - "amount"
-  
+
   # 数据质量控制
   max_missing_ratio: 0.1
   outlier_threshold: 3.0
-  
+
 # 模型配置
 model:
   # Transformer配置
@@ -50,7 +46,7 @@ model:
     max_seq_len: 252
     n_features: 50
     activation: "gelu"
-  
+
   # SAC配置
   sac:
     hidden_dim: 512
@@ -63,28 +59,28 @@ model:
     target_entropy: -5  # -action_dim
     buffer_size: 1000000
     batch_size: 256
-    
+
   # 模型路径
   model_path: "./checkpoints/best_model.pth"
   checkpoint_interval: 1000
-  
+
 # 交易配置
 trading:
   # 资金配置
   initial_cash: 1000000.0
   max_position_size: 0.2  # 单只股票最大持仓比例
   min_position_size: 0.01  # 单只股票最小持仓比例
-  
+
   # 交易成本
   commission_rate: 0.001  # 手续费率
   stamp_tax_rate: 0.001   # 印花税率
   slippage_rate: 0.0005   # 滑点率
-  
+
   # 交易规则
   enable_t_plus_1: true   # 启用T+1交易规则
   enable_price_limit: true  # 启用涨跌停限制
   max_turnover_rate: 2.0  # 最大换手率
-  
+
   # 风险控制
   max_drawdown_limit: 0.15  # 最大回撤限制
   stop_loss_threshold: 0.05  # 止损阈值
@@ -96,30 +92,30 @@ training:
   train_ratio: 0.7
   valid_ratio: 0.15
   test_ratio: 0.15
-  
+
   # 训练参数
   max_episodes: 10000
   max_steps_per_episode: 252
   early_stopping_patience: 100
   learning_rate_decay: 0.95
-  
+
   # 环境配置
   reward_scaling: 1.0
   risk_aversion: 0.1
   transaction_cost_penalty: 1.0
-  
+
 # 回测配置
 backtest:
   start_date: "2020-01-01"
   end_date: "2023-12-31"
   benchmark: "000300.SH"  # 沪深300指数
   frequency: "1D"
-  
+
   # 回测参数
   initial_cash: 1000000.0
   commission: 0.001
   slippage: 0.0005
-  
+
 # 评估配置
 evaluation:
   # 绩效指标
@@ -134,23 +130,23 @@ evaluation:
     - "var_95"
     - "cvar_95"
     - "turnover_rate"
-  
+
   # 基准比较
   benchmark_symbols:
     - "000300.SH"  # 沪深300
     - "000905.SH"  # 中证500
     - "000001.SH"  # 上证指数
-  
+
 # 监控配置
 monitoring:
   enable: true
-  
+
   # Prometheus配置
   prometheus:
     host: "localhost"
     port: 8000
     metrics_path: "/metrics"
-    
+
   # 指标配置
   metrics:
     portfolio_value:
@@ -168,31 +164,31 @@ monitoring:
     trade_count:
       type: "counter"
       description: "交易次数"
-    
+
   # 数据保留期
   retention_days: 90
 
 # 告警配置
 alerting:
   enable: true
-  
+
   # 告警规则
   rules:
     max_drawdown:
       threshold: 0.10
       level: "HIGH"
       message: "最大回撤超过10%"
-    
+
     portfolio_loss:
       threshold: -0.05
       level: "MEDIUM"
       message: "组合亏损超过5%"
-    
+
     low_sharpe_ratio:
       threshold: 0.5
       level: "LOW"
       message: "夏普比率过低"
-  
+
   # 通知渠道
   channels:
     email:
@@ -203,7 +199,7 @@ alerting:
       password: "your_password"
       recipients:
         - "admin@company.com"
-    
+
     webhook:
       enable: false
       url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
@@ -211,7 +207,7 @@ alerting:
 # 审计配置
 audit:
   enable: true
-  
+
   # 数据库配置
   database:
     type: "influxdb"  # influxdb, postgresql
@@ -220,37 +216,37 @@ audit:
     database: "trading_audit"
     username: "admin"
     password: "password"
-  
+
   # 审计内容
   log_decisions: true
   log_trades: true
   log_performance: true
   log_system_events: true
-  
+
   # 数据保留
   retention_policy: "5y"  # 5年保留期
 
 # 风险控制配置
 risk_control:
   enable: true
-  
+
   # 持仓限制
   position_limits:
     single_stock_max: 0.2  # 单只股票最大持仓
     sector_max: 0.4        # 单个行业最大持仓
     total_long_max: 1.0    # 总多头持仓
-  
+
   # 风险指标限制
   risk_limits:
     var_95_daily: 0.03     # 日VaR限制
     tracking_error: 0.05   # 跟踪误差限制
     beta_range: [0.8, 1.2] # Beta范围限制
-  
+
   # 交易限制
   trading_limits:
     daily_turnover_max: 0.5  # 日最大换手率
     order_size_max: 0.1      # 单笔订单最大规模
-    
+
 # 部署配置
 deployment:
   # 模型版本管理
@@ -258,20 +254,20 @@ deployment:
     enable: true
     storage_path: "./models"
     max_versions: 10
-  
+
   # 金丝雀部署
   canary:
     enable: true
     initial_traffic: 0.1    # 初始流量比例
     success_threshold: 0.85 # 成功阈值
     evaluation_period: 7    # 评估期（天）
-  
+
   # 容器化配置
   docker:
     image: "rl-trading-system"
     tag: "latest"
     registry: "localhost:5000"
-  
+
   # Kubernetes配置
   kubernetes:
     namespace: "trading"
@@ -290,13 +286,13 @@ dashboard:
   host: "0.0.0.0"
   port: 5000
   debug: false
-  
+
   # 认证配置
   auth:
     enable: false
     username: "admin"
     password: "password"
-  
+
   # 数据刷新间隔
   refresh_interval: 30  # 秒
 
@@ -304,14 +300,14 @@ dashboard:
 logging:
   level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  
+
   # 文件日志
   file:
     enable: true
     path: "./logs/trading_system.log"
     max_size: "100MB"
     backup_count: 5
-  
+
   # 控制台日志
   console:
     enable: true

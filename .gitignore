@@ -236,6 +236,7 @@ htmlcov/
 
 node_modules/
 tasks.md
-*.txt
 
 final_backtest_results/
+attribution_analysis_output/
+drawdown_analysis.png

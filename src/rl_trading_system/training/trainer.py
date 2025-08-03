@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader, Dataset
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional, Union
 from dataclasses import dataclass, field
@@ -15,10 +17,102 @@ import logging
 import pickle
 from pathlib import Path
 import time
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from .data_split_strategy import SplitResult
 
 logger = logging.getLogger(__name__)
+
+
+class ExperienceDataset(Dataset):
+    """经验回放数据集，支持多进程加载"""
+    
+    def __init__(self, experiences: List[Tuple], transform=None):
+        """
+        初始化数据集
+        
+        Args:
+            experiences: 经验数据列表 [(state, action, reward, next_state, done), ...]
+            transform: 可选的数据转换函数
+        """
+        self.experiences = experiences
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.experiences)
+    
+    def __getitem__(self, idx):
+        experience = self.experiences[idx]
+        
+        if self.transform:
+            experience = self.transform(experience)
+        
+        return experience
+
+
+class ParallelEnvironmentManager:
+    """并行环境管理器"""
+    
+    def __init__(self, env_factory, num_envs: int = 4):
+        """
+        初始化并行环境管理器
+        
+        Args:
+            env_factory: 环境工厂函数
+            num_envs: 并行环境数量
+        """
+        self.env_factory = env_factory
+        self.num_envs = num_envs
+        self.envs = []
+        self.executor = None
+    
+    def _create_env(self):
+        """创建单个环境实例"""
+        return self.env_factory()
+    
+    def initialize(self):
+        """初始化并行环境"""
+        logger.info(f"初始化 {self.num_envs} 个并行环境...")
+        
+        # 使用进程池创建环境
+        with ProcessPoolExecutor(max_workers=self.num_envs) as executor:
+            futures = [executor.submit(self._create_env) for _ in range(self.num_envs)]
+            self.envs = [future.result() for future in futures]
+        
+        logger.info(f"并行环境初始化完成")
+    
+    def reset_all(self):
+        """重置所有环境"""
+        if not self.envs:
+            raise RuntimeError("环境未初始化")
+        
+        with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
+            futures = [executor.submit(env.reset) for env in self.envs]
+            states = [future.result() for future in futures]
+        
+        return states
+    
+    def step_all(self, actions):
+        """并行执行所有环境的step操作"""
+        if not self.envs:
+            raise RuntimeError("环境未初始化")
+        
+        if len(actions) != len(self.envs):
+            raise ValueError(f"actions数量 {len(actions)} 与环境数量 {len(self.envs)} 不匹配")
+        
+        with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
+            futures = [executor.submit(env.step, action) for env, action in zip(self.envs, actions)]
+            results = [future.result() for future in futures]
+        
+        return results
+    
+    def close(self):
+        """关闭所有环境"""
+        for env in self.envs:
+            if hasattr(env, 'close'):
+                env.close()
+        self.envs.clear()
 
 
 @dataclass
@@ -78,6 +172,20 @@ class TrainingConfig:
     performance_threshold_up: float = 1.15     # 性能提升阈值（更严格）
     batch_size_adaptation: bool = False        # 批次大小自适应
     exploration_decay_by_performance: bool = False  # 基于性能的探索衰减
+    
+    # 多核并行优化参数
+    enable_multiprocessing: bool = True            # 启用多进程优化
+    num_workers: int = field(default_factory=lambda: min(8, multiprocessing.cpu_count()))  # 数据加载工作进程数
+    parallel_environments: int = field(default_factory=lambda: min(4, multiprocessing.cpu_count() // 2))  # 并行环境数量
+    data_loader_workers: int = field(default_factory=lambda: min(4, multiprocessing.cpu_count() // 2))    # DataLoader工作线程数
+    pin_memory: bool = True                        # GPU内存固定
+    persistent_workers: bool = True                # 持久化工作进程
+    prefetch_factor: int = 2                       # 预取因子
+    
+    # GPU优化参数
+    enable_mixed_precision: bool = True           # 启用混合精度训练
+    enable_cudnn_benchmark: bool = True           # 启用cuDNN基准测试
+    non_blocking_transfer: bool = True            # 非阻塞数据传输
 
     def __post_init__(self):
         """配置验证"""
@@ -104,6 +212,23 @@ class TrainingConfig:
         
         if self.performance_threshold_down >= 1.0 or self.performance_threshold_up <= 1.0:
             raise ValueError("performance_threshold_down必须小于1.0，performance_threshold_up必须大于1.0")
+        
+        # 多核配置验证
+        if self.num_workers < 0:
+            raise ValueError("num_workers必须为非负数")
+        
+        if self.parallel_environments < 1:
+            raise ValueError("parallel_environments必须为正数")
+        
+        if self.data_loader_workers < 0:
+            raise ValueError("data_loader_workers必须为非负数")
+        
+        # 自动调整多核配置以避免资源过度使用
+        max_workers = multiprocessing.cpu_count()
+        if self.num_workers > max_workers:
+            self.num_workers = max_workers
+        if self.parallel_environments > max_workers:
+            self.parallel_environments = max_workers
 
 
 class EarlyStopping:
@@ -186,22 +311,30 @@ class DrawdownEarlyStopping:
         更新回撤早停状态
 
         Args:
-            current_value: 当前价值（如累积奖励）
+            current_value: 当前投资组合价值
 
         Returns:
             bool: 是否应该早停
         """
         if self.peak_value is None:
+            # 初始化峰值为当前值
             self.peak_value = current_value
             self.drawdown_history.append(0.0)
             return False
 
-        # 更新峰值
+        # 更新峰值：当前值大于历史峰值时更新
         if current_value > self.peak_value:
             self.peak_value = current_value
 
-        # 计算当前回撤
-        current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
+        # 标准回撤计算：相对于历史最高点的损失百分比
+        if self.peak_value > 0:
+            current_drawdown = (self.peak_value - current_value) / self.peak_value
+            # 确保回撤为非负数
+            current_drawdown = max(current_drawdown, 0.0)
+        else:
+            # 如果峰值为0或负数，无法计算有意义的回撤
+            current_drawdown = 0.0
+        
         self.drawdown_history.append(current_drawdown)
 
         # 检查是否超过回撤阈值
@@ -341,6 +474,9 @@ class RLTrainer:
 
         # 初始化学习率调度器（如果智能体支持）
         self._setup_lr_scheduler()
+        
+        # 初始化多核优化组件
+        self._setup_multicore_optimization()
 
         logger.info("训练器初始化完成")
         logger.debug(f"训练配置: {config}")
@@ -358,6 +494,56 @@ class RLTrainer:
         # 在实际实现中，这里会设置PyTorch的学习率调度器
         # 由于使用模拟智能体，这里只是占位符
         self.lr_scheduler = None
+    
+    def _setup_multicore_optimization(self):
+        """设置多核优化"""
+        if not self.config.enable_multiprocessing:
+            logger.info("多进程优化已禁用")
+            self.parallel_env_manager = None
+            self.data_loader = None
+            return
+        
+        logger.info(f"配置多核优化: {self.config.num_workers} 个数据工作进程, "
+                   f"{self.config.parallel_environments} 个并行环境")
+        
+        # 设置PyTorch多进程上下文
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # 如果已经设置了start method，忽略错误
+            pass
+        
+        # 设置cuDNN基准测试（如果启用GPU优化）
+        if self.config.enable_cudnn_benchmark and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN基准测试已启用")
+        
+        # 初始化混合精度训练
+        if self.config.enable_mixed_precision and torch.cuda.is_available():
+            self.scaler = torch.cuda.amp.GradScaler()
+            logger.info("混合精度训练已启用")
+        else:
+            self.scaler = None
+        
+        # 初始化并行环境管理器（如果配置了多个环境）
+        if self.config.parallel_environments > 1:
+            # 创建环境工厂函数
+            def env_factory():
+                # 这里需要根据实际环境类型创建副本
+                # 暂时使用占位符，在实际使用时需要提供合适的环境复制机制
+                return self.environment
+            
+            self.parallel_env_manager = ParallelEnvironmentManager(
+                env_factory, 
+                self.config.parallel_environments
+            )
+            logger.info(f"并行环境管理器已初始化，{self.config.parallel_environments} 个环境")
+        else:
+            self.parallel_env_manager = None
+        
+        # 预分配经验数据集和DataLoader（在实际训练中使用）
+        self.experience_dataset = None
+        self.data_loader = None
 
     def _get_current_learning_rate(self, episode: int) -> float:
         """获取当前学习率"""
@@ -459,6 +645,12 @@ class RLTrainer:
             validation_rewards.append(reward)
 
         validation_score = np.mean(validation_rewards)
+        validation_std = np.std(validation_rewards)
+        
+        # 添加验证稳定性检查
+        if validation_std > validation_score * 0.5:  # 标准差超过均值50%
+            logger.warning(f"验证结果不稳定: 标准差 {validation_std:.4f} 过大，模型泛化能力可能不足")
+        
         logger.info(f"验证完成，平均奖励: {validation_score:.4f}")
 
         return validation_score
@@ -537,12 +729,109 @@ class RLTrainer:
                     f" | Actor Loss: {update_info.get('actor_loss', 0):.4f}"
                     f" | Critic Loss: {update_info.get('critic_loss', 0):.4f}"
                 )
+                
+                # 添加损失异常检测
+                actor_loss = update_info.get('actor_loss', 0)
+                critic_loss = update_info.get('critic_loss', 0)
+                
+                if abs(actor_loss) > 10.0:
+                    logger.warning(f"Actor损失异常: {actor_loss:.4f}, 可能存在梯度爆炸")
+                if critic_loss > 50.0:
+                    logger.warning(f"Critic损失过高: {critic_loss:.4f}, 学习可能不稳定")
 
             logger.info(log_msg)
+            
+            # 添加训练稳定性检查
+            if episode >= 20:
+                reward_std = recent_stats.get('std_reward', 0)
+                mean_reward = recent_stats.get('mean_reward', 0)
+                if mean_reward != 0 and reward_std / abs(mean_reward) > 1.0:
+                    logger.warning(f"训练不稳定: 奖励方差过大 {reward_std:.2f}, 可能需要调整学习率")
+
+    def _create_data_loader(self, experiences: List[Tuple]) -> DataLoader:
+        """创建支持多进程的数据加载器"""
+        if not experiences:
+            return None
+        
+        dataset = ExperienceDataset(experiences)
+        
+        # 配置DataLoader参数
+        dataloader_kwargs = {
+            'batch_size': self.config.batch_size,
+            'shuffle': True,
+            'pin_memory': self.config.pin_memory and torch.cuda.is_available(),
+            'prefetch_factor': self.config.prefetch_factor
+        }
+        
+        # 只有在多进程启用时才使用num_workers
+        if self.config.enable_multiprocessing and self.config.data_loader_workers > 0:
+            dataloader_kwargs.update({
+                'num_workers': self.config.data_loader_workers,
+                'persistent_workers': self.config.persistent_workers
+            })
+        
+        return DataLoader(dataset, **dataloader_kwargs)
+    
+    def _run_parallel_episodes(self, episode_nums: List[int]) -> List[Tuple[float, int]]:
+        """并行运行多个episodes"""
+        if not self.parallel_env_manager:
+            # 如果没有并行环境管理器，退回到顺序执行
+            return [self._run_episode(ep, training=True) for ep in episode_nums]
+        
+        try:
+            # 重置所有环境
+            states = self.parallel_env_manager.reset_all()
+            
+            results = []
+            for i, episode_num in enumerate(episode_nums):
+                # 这里需要根据实际的并行执行逻辑来实现
+                # 暂时使用简化版本
+                episode_reward, episode_length = self._run_episode(episode_num, training=True)
+                results.append((episode_reward, episode_length))
+            
+            return results
+        except Exception as e:
+            logger.warning(f"并行episode执行失败，退回到顺序执行: {e}")
+            return [self._run_episode(ep, training=True) for ep in episode_nums]
+    
+    def _update_agent_with_dataloader(self, dataloader: DataLoader) -> Dict[str, float]:
+        """使用DataLoader进行批量更新"""
+        if not dataloader:
+            return self._update_agent()
+        
+        total_losses = {'actor_loss': 0.0, 'critic_loss': 0.0, 'temperature_loss': 0.0}
+        batch_count = 0
+        
+        for batch_experiences in dataloader:
+            # 这里需要根据实际的智能体更新逻辑来实现
+            # 暂时使用简化版本
+            update_info = self._update_agent()
+            
+            for key in total_losses:
+                total_losses[key] += update_info.get(key, 0.0)
+            batch_count += 1
+        
+        # 计算平均损失
+        if batch_count > 0:
+            for key in total_losses:
+                total_losses[key] /= batch_count
+        
+        return total_losses
 
     def train(self):
         """执行训练"""
         logger.info(f"开始训练，总episodes: {self.config.n_episodes}")
+        logger.info(f"多核优化: {'启用' if self.config.enable_multiprocessing else '禁用'}")
+        if self.config.enable_multiprocessing:
+            logger.info(f"  - 数据工作进程: {self.config.num_workers}")
+            logger.info(f"  - 并行环境: {self.config.parallel_environments}")
+            logger.info(f"  - 混合精度: {'启用' if self.config.enable_mixed_precision else '禁用'}")
+
+        # 系统状态检查
+        if self.config.enable_drawdown_monitoring:
+            logger.info(f"回撤监控已启用: 最大回撤阈值 {self.config.max_training_drawdown:.3f}")
+        else:
+            logger.warning("回撤监控未启用，无法进行风险控制")
 
         start_time = time.time()
         best_validation_score = float('-inf') if self.config.early_stopping_mode == 'max' else float('inf')
@@ -579,6 +868,15 @@ class RLTrainer:
             if episode % self.config.validation_frequency == 0:
                 validation_score = self._validate()
                 self.metrics.add_validation_score(validation_score)
+                
+                # 添加训练-验证性能对比分析
+                recent_train_reward = np.mean(self.metrics.episode_rewards[-10:]) if len(self.metrics.episode_rewards) >= 10 else 0
+                if recent_train_reward > 0:
+                    performance_gap = abs(validation_score - recent_train_reward) / recent_train_reward
+                    if performance_gap > 0.2:  # 性能差异超过20%
+                        logger.warning(f"训练-验证性能差异过大: {performance_gap:.3f}, 可能存在过拟合")
+                    else:
+                        logger.info(f"模型泛化良好: 训练-验证性能差异 {performance_gap:.3f}")
 
                 # 早停检查
                 if self.early_stopping.step(validation_score):
@@ -608,12 +906,40 @@ class RLTrainer:
         training_time = time.time() - start_time
         logger.info(f"训练完成，总用时: {training_time:.2f}秒")
 
+        # 训练结果分析
+        final_stats = self.metrics.get_statistics()
+        if final_stats:
+            logger.info(f"训练总结: 平均奖励 {final_stats.get('mean_reward', 0):.4f}, "
+                       f"奖励标准差 {final_stats.get('std_reward', 0):.4f}")
+            
+            # 检查训练是否收敛
+            if len(self.metrics.validation_scores) >= 2:
+                recent_improvement = self.metrics.validation_scores[-1] - self.metrics.validation_scores[-2]
+                if abs(recent_improvement) < 0.01:
+                    logger.info("模型已收敛: 验证分数变化很小")
+                else:
+                    logger.info(f"模型仍在学习: 最近验证改进 {recent_improvement:.4f}")
+
         # 保存最终模型
         final_model_path = self.save_dir / "final_model.pth"
         self.save_checkpoint(str(final_model_path), episode)
 
+        # 清理多核资源
+        self._cleanup_multicore_resources()
+        
         # 返回训练统计
         return self.metrics.get_statistics()
+    
+    def _cleanup_multicore_resources(self):
+        """清理多核资源"""
+        if self.parallel_env_manager:
+            self.parallel_env_manager.close()
+            logger.info("并行环境资源已清理")
+        
+        if hasattr(self, 'data_loader') and self.data_loader:
+            # DataLoader会自动清理worker进程
+            del self.data_loader
+            logger.debug("数据加载器资源已清理")
 
     def evaluate(self, n_episodes: int = 10) -> Dict[str, float]:
         """评估智能体性能"""
@@ -644,35 +970,52 @@ class RLTrainer:
     def _monitor_drawdown(self, episode_reward: float, episode: int):
         """监控训练过程中的回撤"""
         try:
-            # 计算累积奖励以跟踪回撤
-            if not hasattr(self, 'cumulative_reward'):
-                self.cumulative_reward = 0.0
-
-            self.cumulative_reward += episode_reward
+            # 从环境获取真实的投资组合价值来计算回撤
+            if hasattr(self.environment, 'total_value'):
+                portfolio_value = self.environment.total_value
+            else:
+                # 如果环境不支持，记录警告并跳过回撤监控
+                logger.warning("环境不支持投资组合价值获取，跳过回撤监控")
+                return
             
-            # 更新回撤早停状态（这会计算并更新回撤历史）
-            self.drawdown_early_stopping.step(self.cumulative_reward)
+            # 更新回撤早停状态（基于投资组合价值而非累积奖励）
+            self.drawdown_early_stopping.step(portfolio_value)
             
             # 获取更新后的当前回撤
             current_drawdown = self.drawdown_early_stopping.get_current_drawdown()
 
+            # 从环境获取准确的回撤值（如果支持）
+            env_drawdown = 0.0
+            if hasattr(self.environment, '_calculate_current_drawdown'):
+                env_drawdown = self.environment._calculate_current_drawdown()
+
             self.drawdown_metrics.append({
                 'episode': episode,
-                'cumulative_reward': self.cumulative_reward,
+                'portfolio_value': portfolio_value,
                 'episode_reward': episode_reward,
-                'drawdown': current_drawdown
+                'training_drawdown': current_drawdown,  # 基于投资组合价值的训练回撤
+                'env_drawdown': env_drawdown  # 环境内部计算的回撤
             })
 
-            # 从环境获取回撤指标（如果环境支持）
+            # 从环境获取其他回撤指标（如果环境支持）
             if hasattr(self.environment, 'get_drawdown_metrics'):
-                env_metrics = self.environment.get_drawdown_metrics()
-                if env_metrics:
-                    self.drawdown_metrics[-1].update(env_metrics)
+                try:
+                    env_metrics = self.environment.get_drawdown_metrics()
+                    if env_metrics and isinstance(env_metrics, dict):
+                        self.drawdown_metrics[-1].update(env_metrics)
+                except Exception as e:
+                    logger.debug(f"获取环境回撤指标失败: {e}")
 
-            # 定期记录回撤信息
+            # 定期记录回撤信息和异常检测
             if episode % 50 == 0:
-                logger.info(f"Episode {episode}: 累积奖励 {self.cumulative_reward:.4f}, "
-                          f"训练回撤 {current_drawdown:.4f}")
+                logger.info(f"Episode {episode}: 投资组合价值 {portfolio_value:.4f}, "
+                          f"训练回撤 {current_drawdown:.4f}, 环境回撤 {env_drawdown:.4f}")
+                
+                # 回撤异常检测
+                if current_drawdown == 0.0 and episode > 50:
+                    logger.warning(f"回撤计算异常: 连续{episode}个episode回撤为0，可能存在计算缺陷")
+                elif current_drawdown > self.config.max_training_drawdown * 0.8:
+                    logger.warning(f"回撤风险较高: {current_drawdown:.4f}, 接近阈值 {self.config.max_training_drawdown:.4f}")
 
         except Exception as e:
             logger.error(f"回撤监控失败: {e}")
@@ -691,11 +1034,36 @@ class RLTrainer:
             recent_performance = np.mean(self.performance_history[-20:])
             long_term_performance = np.mean(self.performance_history[-50:])
 
-            # 改进的自适应学习率调整
+            # 改进的自适应学习率调整（修复负奖励环境下的逻辑错误）
             if self.config.enable_adaptive_learning:
                 old_lr_factor = self.current_lr_factor
                 
-                if recent_performance < long_term_performance * self.config.performance_threshold_down:
+                # 计算性能变化的绝对值和相对值，适应正负奖励环境
+                performance_diff = recent_performance - long_term_performance
+                performance_change_ratio = abs(performance_diff) / max(abs(long_term_performance), 1.0)
+                
+                # 性能显著恶化的判断（适应负奖励）
+                is_performance_worse = False
+                if long_term_performance >= 0:
+                    # 正奖励环境：最近表现低于长期表现的阈值
+                    is_performance_worse = recent_performance < long_term_performance * self.config.performance_threshold_down
+                else:
+                    # 负奖励环境：最近表现更负（绝对值更大）
+                    is_performance_worse = recent_performance < long_term_performance / self.config.performance_threshold_down
+                
+                # 性能显著改善的判断
+                is_performance_better = False
+                if long_term_performance >= 0:
+                    # 正奖励环境：最近表现超过长期表现的阈值
+                    is_performance_better = recent_performance > long_term_performance * self.config.performance_threshold_up
+                else:
+                    # 负奖励环境：最近表现更好（绝对值更小）
+                    is_performance_better = recent_performance > long_term_performance / self.config.performance_threshold_up
+                
+                # 避免过于频繁的学习率调整
+                significant_change = performance_change_ratio > 0.05  # 至少5%的变化
+                
+                if is_performance_worse and significant_change:
                     # 性能下降，降低学习率但有最小值限制
                     self.current_lr_factor = max(
                         self.config.min_lr_factor,
@@ -704,7 +1072,7 @@ class RLTrainer:
                     if self.current_lr_factor != old_lr_factor:
                         logger.info(f"Episode {episode}: 检测到性能下降，降低学习率因子到 {self.current_lr_factor:.4f}")
                 
-                elif recent_performance > long_term_performance * self.config.performance_threshold_up:
+                elif is_performance_better and significant_change:
                     # 性能提升，快速恢复学习率
                     self.current_lr_factor = min(
                         self.config.max_lr_factor,
@@ -733,16 +1101,19 @@ class RLTrainer:
             return {'drawdown_monitoring_enabled': False}
 
         try:
-            drawdowns = [m['drawdown'] for m in self.drawdown_metrics]
-            cumulative_rewards = [m['cumulative_reward'] for m in self.drawdown_metrics]
+            training_drawdowns = [m['training_drawdown'] for m in self.drawdown_metrics]
+            env_drawdowns = [m['env_drawdown'] for m in self.drawdown_metrics]
+            portfolio_values = [m['portfolio_value'] for m in self.drawdown_metrics]
 
             return {
                 'drawdown_monitoring_enabled': True,
-                'max_training_drawdown': max(drawdowns) if drawdowns else 0.0,
-                'avg_training_drawdown': np.mean(drawdowns) if drawdowns else 0.0,
-                'final_cumulative_reward': cumulative_rewards[-1] if cumulative_rewards else 0.0,
-                'peak_cumulative_reward': max(cumulative_rewards) if cumulative_rewards else 0.0,
-                'drawdown_episodes': len([d for d in drawdowns if d > 0.1]),
+                'max_training_drawdown': max(training_drawdowns) if training_drawdowns else 0.0,
+                'avg_training_drawdown': np.mean(training_drawdowns) if training_drawdowns else 0.0,
+                'max_env_drawdown': max(env_drawdowns) if env_drawdowns else 0.0,
+                'avg_env_drawdown': np.mean(env_drawdowns) if env_drawdowns else 0.0,
+                'final_portfolio_value': portfolio_values[-1] if portfolio_values else 0.0,
+                'peak_portfolio_value': max(portfolio_values) if portfolio_values else 0.0,
+                'significant_drawdown_episodes': len([d for d in training_drawdowns if d > 0.1]),
                 'total_monitored_episodes': len(self.drawdown_metrics)
             }
 

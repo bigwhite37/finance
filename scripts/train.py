@@ -20,6 +20,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from rl_trading_system.config import ConfigManager
 from rl_trading_system.training import RLTrainer, TrainingConfig, create_split_strategy, SplitConfig
+from rl_trading_system.training.enhanced_trainer import EnhancedRLTrainer, EnhancedTrainingConfig
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer, DataProcessor
 from rl_trading_system.models import TimeSeriesTransformer, SACAgent, TransformerConfig, SACConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
@@ -212,14 +213,23 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         end_date=end_date
     )
 
-    # 创建训练配置
-    training_config = TrainingConfig(
+    # 创建增强训练配置
+    training_config = EnhancedTrainingConfig(
         n_episodes=model_config["training"]["n_episodes"],
         save_frequency=model_config["training"].get("eval_freq", 100),
         validation_frequency=model_config["training"].get("eval_freq", 100),
         early_stopping_patience=model_config["training"].get("patience", 50),
         early_stopping_min_delta=model_config["training"].get("min_delta", 0.001),
         save_dir=output_dir,
+        
+        # 增强指标配置
+        enable_portfolio_metrics=trading_config.get("enhanced_metrics", {}).get("enable_portfolio_metrics", True),
+        enable_agent_behavior_metrics=trading_config.get("enhanced_metrics", {}).get("enable_agent_behavior_metrics", True),
+        enable_risk_control_metrics=trading_config.get("enhanced_metrics", {}).get("enable_risk_control_metrics", True),
+        metrics_calculation_frequency=trading_config.get("enhanced_metrics", {}).get("metrics_calculation_frequency", 20),
+        detailed_metrics_logging=trading_config.get("enhanced_metrics", {}).get("detailed_metrics_logging", True),
+        risk_free_rate=trading_config.get("enhanced_metrics", {}).get("risk_free_rate", 0.03),
+        
         # 回撤控制训练参数
         enable_drawdown_monitoring=enable_drawdown_control,
         drawdown_early_stopping=enable_drawdown_control,
@@ -232,7 +242,21 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         max_lr_factor=trading_config.get("drawdown_control", {}).get("max_lr_factor", 1.0),
         lr_recovery_factor=trading_config.get("drawdown_control", {}).get("lr_recovery_factor", 1.25),
         performance_threshold_down=trading_config.get("drawdown_control", {}).get("performance_threshold_down", 0.85),
-        performance_threshold_up=trading_config.get("drawdown_control", {}).get("performance_threshold_up", 1.15)
+        performance_threshold_up=trading_config.get("drawdown_control", {}).get("performance_threshold_up", 1.15),
+        
+        # 多核优化参数
+        enable_multiprocessing=trading_config.get("model", {}).get("training", {}).get("enable_multiprocessing", True),
+        num_workers=trading_config.get("model", {}).get("training", {}).get("num_workers", 4),
+        parallel_environments=trading_config.get("model", {}).get("training", {}).get("parallel_environments", 2),
+        data_loader_workers=trading_config.get("model", {}).get("training", {}).get("data_loader_workers", 2),
+        pin_memory=trading_config.get("model", {}).get("training", {}).get("pin_memory", True),
+        persistent_workers=trading_config.get("model", {}).get("training", {}).get("persistent_workers", True),
+        prefetch_factor=trading_config.get("model", {}).get("training", {}).get("prefetch_factor", 2),
+        
+        # GPU优化参数
+        enable_mixed_precision=trading_config.get("model", {}).get("training", {}).get("enable_mixed_precision", True),
+        enable_cudnn_benchmark=trading_config.get("model", {}).get("training", {}).get("enable_cudnn_benchmark", True),
+        non_blocking_transfer=trading_config.get("model", {}).get("training", {}).get("non_blocking_transfer", True)
     )
 
     return portfolio_env, sac_agent, data_split, training_config
@@ -331,9 +355,9 @@ def main():
         # 设置设备
         training_config.device = device
 
-        # 创建训练器
-        logger_instance.info("初始化训练器...")
-        trainer = RLTrainer(training_config, environment, agent, data_split)
+        # 创建增强训练器
+        logger_instance.info("初始化增强训练器...")
+        trainer = EnhancedRLTrainer(training_config, environment, agent, data_split)
 
         # 从检查点恢复（如果指定）
         start_episode = 0

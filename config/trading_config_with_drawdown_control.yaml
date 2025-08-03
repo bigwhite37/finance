@@ -4,7 +4,10 @@
 # 交易环境配置
 trading:
   environment:
-    stock_pool: ["000001.SZ", "000002.SZ", "000858.SZ", "002415.SZ", "600519.SH"]
+    stock_pool:
+      - "601288.SH"  # 农业银行
+      - "600036.SH"  # 招商银行
+      - "600919.SH"  # 中国平安
     initial_cash: 1000000.0
     commission_rate: 0.001
     stamp_tax_rate: 0.001

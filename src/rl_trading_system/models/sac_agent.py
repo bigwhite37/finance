@@ -571,7 +571,7 @@ class SACAgent(nn.Module):
         
         self.actor_optimizer.step()
         
-        # 计算策略熵
+        # 计算策略熵（正值表示高熵，负值表示低熵）
         policy_entropy = -torch.mean(log_probs).item()
         
         return actor_loss.item(), policy_entropy

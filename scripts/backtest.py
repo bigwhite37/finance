@@ -40,6 +40,7 @@ from rl_trading_system.models import SACAgent, SACConfig, TransformerConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
 from rl_trading_system.risk_control.risk_controller import RiskController, RiskControlConfig
 from rl_trading_system.backtest.drawdown_control_config import DrawdownControlConfig
+from rl_trading_system.metrics.portfolio_metrics import PortfolioMetricsCalculator
 from rl_trading_system.utils.terminal_colors import (
     ColorFormatter, print_banner, print_section
 )
@@ -358,6 +359,54 @@ def compare_with_benchmarks(portfolio_returns: pd.Series,
             benchmark_returns[symbol] = pd.Series(0, index=portfolio_returns.index)
 
     return benchmark_returns
+
+
+def calculate_enhanced_performance_metrics(portfolio_values: pd.Series,
+                                         benchmark_values: pd.Series,
+                                         config: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    计算增强的性能指标，包括传统指标和新增的详细分析
+    
+    Args:
+        portfolio_values: 投资组合价值序列
+        benchmark_values: 基准价值序列
+        config: 配置字典
+        
+    Returns:
+        增强的性能指标字典
+    """
+    if config is None:
+        config = {}
+    
+    # 使用增强指标计算器
+    calculator = PortfolioMetricsCalculator()
+    
+    # 计算投资组合指标
+    dates = portfolio_values.index.tolist()
+    risk_free_rate = config.get('enhanced_metrics', {}).get('risk_free_rate', 0.03)
+    
+    portfolio_metrics = calculator.calculate_portfolio_metrics(
+        portfolio_values=portfolio_values.tolist(),
+        benchmark_values=benchmark_values.tolist(),
+        dates=dates,
+        risk_free_rate=risk_free_rate
+    )
+    
+    # 转换为字典格式并添加传统指标
+    enhanced_metrics = portfolio_metrics.to_dict()
+    
+    # 添加传统的性能指标以保持兼容性
+    portfolio_returns = portfolio_values.pct_change().dropna()
+    benchmark_returns = benchmark_values.pct_change().dropna()
+    
+    traditional_metrics = calculate_performance_metrics(portfolio_returns, benchmark_returns, config)
+    
+    # 合并指标，但确保增强指标优先（避免max_drawdown符号不一致）
+    for key, value in traditional_metrics.items():
+        if key not in enhanced_metrics:  # 只添加增强指标中没有的传统指标
+            enhanced_metrics[key] = value
+    
+    return enhanced_metrics
 
 
 def calculate_performance_metrics(portfolio_returns: pd.Series,
@@ -682,10 +731,14 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     benchmark_symbols = get_config_value(config, 'benchmark_symbols', BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS)
     benchmark_returns = compare_with_benchmarks(portfolio_returns, benchmark_symbols)
 
-    # 计算性能指标
+    # 计算增强性能指标
     metrics = {}
     for symbol, bench_returns in benchmark_returns.items():
-        symbol_metrics = calculate_performance_metrics(portfolio_returns, bench_returns)
+        # 重建基准价值序列
+        bench_values = (1 + bench_returns).cumprod() * portfolio_values.iloc[0]
+        
+        # 使用增强指标计算
+        symbol_metrics = calculate_enhanced_performance_metrics(portfolio_values, bench_values, config)
         metrics[symbol] = symbol_metrics
 
     # 计算汇总风险指标
@@ -819,38 +872,59 @@ def main():
         fig = create_performance_visualization(results)
         fig.write_html(str(output_dir / BACKTEST_CONFIG.CHART_HTML_FILENAME))
 
-        # 输出性能摘要
-        print_section("📊 回测结果摘要", formatter)
+        # 输出增强性能摘要
+        print_section("📊 增强回测结果摘要", formatter)
         main_benchmark = BACKTEST_CONFIG.DEFAULT_BENCHMARK_SYMBOLS[0]
 
         if main_benchmark in results['metrics']:
             metrics = results['metrics'][main_benchmark]
 
+            # 投资组合与市场表现对比指标
+            print(f"  {formatter.highlight('📈 投资组合与市场表现对比指标:')}")
+            
             # 核心性能指标
-            annual_return = metrics['annual_return'] * 100
+            annual_return = metrics['annualized_return'] * 100
             benchmark_return = metrics['benchmark_annual_return'] * 100
             excess_return = annual_return - benchmark_return
 
-            print(f"  {formatter.info('投资组合年化收益率')}: {formatter.success(f'{annual_return:+7.2f}%') if annual_return > 0 else formatter.error(f'{annual_return:+7.2f}%')}")
+            print(f"  {formatter.info('年化收益率')}: {formatter.success(f'{annual_return:+7.2f}%') if annual_return > 0 else formatter.error(f'{annual_return:+7.2f}%')}")
             print(f"  {formatter.info('基准年化收益率')}: {formatter.number(f'{benchmark_return:+7.2f}%')}")
             print(f"  {formatter.info('超额收益')}: {formatter.success(f'{excess_return:+7.2f}%') if excess_return > 0 else formatter.error(f'{excess_return:+7.2f}%')}")
             print()
 
-            # 风险指标
+            # 风险调整后收益指标
             sharpe = metrics['sharpe_ratio']
             max_dd = metrics['max_drawdown'] * 100
-            info_ratio = metrics['information_ratio']
+            alpha = metrics['alpha'] * 100
+            beta = metrics['beta']
 
             print(f"  {formatter.info('夏普比率')}: {formatter.success(f'{sharpe:7.3f}') if sharpe > 1 else formatter.warning(f'{sharpe:7.3f}')}")
             print(f"  {formatter.info('最大回撤')}: {formatter.error(f'{max_dd:7.2f}%') if max_dd > 10 else formatter.warning(f'{max_dd:7.2f}%')}")
-            print(f"  {formatter.info('信息比率')}: {formatter.success(f'{info_ratio:7.3f}') if info_ratio > 0.5 else formatter.number(f'{info_ratio:7.3f}')}")
+            print(f"  {formatter.info('Alpha (超额收益)')}: {formatter.success(f'{alpha:+7.2f}%') if alpha > 0 else formatter.number(f'{alpha:+7.2f}%')}")
+            print(f"  {formatter.info('Beta (系统性风险)')}: {formatter.number(f'{beta:7.3f}')}")
             print()
 
-            # 额外指标
-            alpha = metrics['alpha'] * 100
-            beta = metrics['beta']
-            print(f"  {formatter.info('Alpha')}: {formatter.success(f'{alpha:+7.2f}%') if alpha > 0 else formatter.number(f'{alpha:+7.2f}%')}")
-            print(f"  {formatter.info('Beta')}: {formatter.number(f'{beta:7.3f}')}")
+            # 传统指标（保持兼容性）
+            if 'information_ratio' in metrics:
+                info_ratio = metrics['information_ratio']
+                print(f"  {formatter.info('信息比率')}: {formatter.success(f'{info_ratio:7.3f}') if info_ratio > 0.5 else formatter.number(f'{info_ratio:7.3f}')}")
+
+            # 指标解读
+            print(f"  {formatter.highlight('📋 指标解读:')}")
+            if sharpe > 1.0:
+                print(f"  {formatter.success('✅ 夏普比率 > 1.0，风险调整后收益良好')}")
+            else:
+                print(f"  {formatter.warning('⚠️ 夏普比率 < 1.0，风险调整后收益一般')}")
+            
+            if alpha > 0:
+                print(f"  {formatter.success(f'✅ Alpha > 0，相对基准有 {alpha:.2f}% 的超额收益')}")
+            else:
+                print(f"  {formatter.error(f'❌ Alpha < 0，相对基准有 {abs(alpha):.2f}% 的负超额收益')}")
+            
+            if max_dd < 15:
+                print(f"  {formatter.success('✅ 最大回撤 < 15%，风险控制良好')}")
+            else:
+                print(f"  {formatter.warning('⚠️ 最大回撤 > 15%，需要加强风险控制')}")
 
         # 风险分析摘要
         if 'risk_metrics' in results and results['risk_metrics']['summary']:

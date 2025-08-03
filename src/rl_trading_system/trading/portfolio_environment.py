@@ -894,18 +894,35 @@ class PortfolioEnvironment(gym.Env):
         else:
             transaction_cost_ratio = 0.0
 
-        # Alpha奖励：超额收益减去交易成本，显著放大以鼓励探索
-        alpha_reward = (excess_return - transaction_cost_ratio) * 1000
+        # Alpha奖励：超额收益减去交易成本，适度放大以保持训练稳定性
+        # 降低放大倍数从1000到100，增加基于市场波动的变异性
+        base_alpha = (excess_return - transaction_cost_ratio) * 100
+        
+        # 添加基于市场波动的不确定性以产生合理的奖励变异
+        market_volatility_factor = abs(market_return) * 50  # 市场波动越大，奖励变异性越大
+        
+        # 添加适度的探索随机性以避免奖励过于稳定，降低均值以允许负奖励
+        exploration_randomness = np.random.normal(0.0, 1.0)  # 均值0.0，标准差1.0，可产生正负值
+        
+        # 风险惩罚：大幅收益时增加风险成本
+        risk_penalty_factor = abs(portfolio_return) * 10 if abs(portfolio_return) > 0.05 else 0
+        
+        # 表现惩罚：显著跑输市场时的适度惩罚（降低严厉程度）
+        underperformance_penalty = 0.0
+        if excess_return < -0.02:  # 提高阈值：超额收益为负且超过2%时才惩罚
+            underperformance_penalty = abs(excess_return) * 50  # 降低惩罚倍数从200到50
+        
+        alpha_reward = base_alpha + market_volatility_factor + exploration_randomness - risk_penalty_factor - underperformance_penalty
 
         # 确保Alpha奖励不是NaN或无穷值
         if np.isnan(alpha_reward) or np.isinf(alpha_reward):
             alpha_reward = 0.0
 
-        # 早期学习引导奖励：鼓励权重差异化
-        exploration_bonus = 0.0
+        # 早期学习引导奖励：鼓励权重差异化 + 基础学习奖励
+        exploration_bonus = 1.0  # 给予基础学习奖励，鼓励探索
         weight_variance = np.var(weights)  # 权重方差，衡量差异化程度
-        if weight_variance > 0.01:  # 当权重有一定差异时给予奖励
-            exploration_bonus = min(weight_variance * 20.0, 2.0)  # 最多奖励2.0
+        if weight_variance > 0.01:  # 当权重有一定差异时给予额外奖励
+            exploration_bonus += min(weight_variance * 20.0, 2.0)  # 最多额外奖励2.0
 
         # 增量学习奖励：基于个股表现差异
         if self.current_prices is not None and self.previous_prices is not None:
@@ -952,8 +969,8 @@ class PortfolioEnvironment(gym.Env):
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 
-        # 调试日志（降低频率并设为debug级别）
-        if self.current_step % 200 == 0:  # 降低日志频率
+        # 调试日志（恢复正常级别）
+        if self.current_step % 200 == 0:  # 恢复正常日志频率
             logger.debug(f"Step {self.current_step}: portfolio_return={portfolio_return:.6f}, "
                         f"market_return={market_return:.6f}, excess_return={excess_return:.6f}, "
                         f"transaction_cost_ratio={transaction_cost_ratio:.6f}")
