@@ -233,14 +233,40 @@ class PortfolioEnvironment(gym.Env):
         if not self.start_date or not self.end_date:
             raise ValueError("必须指定开始日期和结束日期才能加载市场数据")
 
-        # 从数据接口加载真实数据
-        raw_price_data = self.data_interface.get_price_data(
-            symbols=self.config.stock_pool,
-            start_date=self.start_date,
-            end_date=self.end_date
-        )
+        # 尝试从数据接口加载指定时间范围的数据
+        try:
+            raw_price_data = self.data_interface.get_price_data(
+                symbols=self.config.stock_pool,
+                start_date=self.start_date,
+                end_date=self.end_date
+            )
+        except RuntimeError as e:
+            # 如果指定时间范围没有数据，尝试获取可用的数据范围
+            logger.warning(f"无法获取指定时间范围的数据: {e}")
+            logger.info("尝试获取可用的数据范围...")
+            
+            try:
+                available_start, available_end = self.data_interface.get_available_date_range(
+                    self.config.stock_pool
+                )
+                logger.info(f"找到可用数据范围: {available_start} 到 {available_end}")
+                
+                # 使用可用的数据范围重新加载数据
+                raw_price_data = self.data_interface.get_price_data(
+                    symbols=self.config.stock_pool,
+                    start_date=available_start,
+                    end_date=available_end
+                )
+                
+                # 更新环境的日期范围为实际可用范围
+                self.start_date = available_start
+                self.end_date = available_end
+                logger.info(f"已调整为可用数据范围: {self.start_date} 到 {self.end_date}")
+                
+            except Exception as fallback_error:
+                raise RuntimeError(f"无法获取任何可用的股票数据: 原始错误={e}, fallback错误={fallback_error}") from e
 
-        # 如果没有获取到数据，抛出异常
+        # 如果仍然没有获取到数据，抛出异常
         if raw_price_data.empty:
             raise ValueError(f"无法获取股票数据: symbols={self.config.stock_pool}, "
                            f"start_date={self.start_date}, end_date={self.end_date}")
@@ -257,11 +283,29 @@ class PortfolioEnvironment(gym.Env):
         benchmark_symbol = "000300.SH"  # 沪深300指数
         logger.debug(f"加载基准指数数据: {benchmark_symbol}")
 
-        self.benchmark_data = self.data_interface.get_price_data(
-            symbols=[benchmark_symbol],
-            start_date=self.start_date,
-            end_date=self.end_date
-        )
+        try:
+            self.benchmark_data = self.data_interface.get_price_data(
+                symbols=[benchmark_symbol],
+                start_date=self.start_date,
+                end_date=self.end_date
+            )
+        except RuntimeError as e:
+            # 基准数据无法获取时，使用股票数据的时间范围再次尝试
+            logger.warning(f"无法获取基准数据在指定时间范围: {e}")
+            try:
+                # 使用已经调整的股票数据时间范围获取基准数据
+                self.benchmark_data = self.data_interface.get_price_data(
+                    symbols=[benchmark_symbol],
+                    start_date=self.start_date,
+                    end_date=self.end_date
+                )
+            except RuntimeError:
+                # 如果基准数据仍然无法获取，记录警告但继续执行
+                logger.warning(f"无法获取基准指数数据 {benchmark_symbol}，将使用默认基准")
+                # 创建一个基于日期的空DataFrame，后续会用平均收益率替代
+                dates_df = pd.DataFrame(index=self.dates)
+                dates_df['close'] = 1.0  # 假设基准价格恒定为1
+                self.benchmark_data = dates_df
 
         if not self.benchmark_data.empty:
             logger.debug(f"原始基准数据结构: index={self.benchmark_data.index.names}, columns={list(self.benchmark_data.columns)}")

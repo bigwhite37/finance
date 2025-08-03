@@ -42,12 +42,20 @@ drawdown_control:
   # 训练相关参数
   max_training_drawdown: 0.12          # 训练过程最大允许回撤
   enable_adaptive_learning: true      # 启用自适应学习
+  
+  # 自适应学习率参数
+  lr_adaptation_factor: 0.9            # 学习率衰减因子（更温和）
+  min_lr_factor: 0.01                  # 最小学习率因子
+  max_lr_factor: 1.0                   # 最大学习率因子
+  lr_recovery_factor: 1.25             # 学习率恢复因子
+  performance_threshold_down: 0.85     # 性能下降阈值（更严格）
+  performance_threshold_up: 1.15       # 性能提升阈值（更严格）
 
 backtest:
   freq: "1d"                    # 回测频率 1d 或 1min，可通过 BACKTEST_FREQ 覆盖
   rebalance_freq: "1d"          # 再平衡频率，可通过 BACKTEST_REBALANCE_FREQ 覆盖
-  start_date: "2024-06-31"      # 回测开始日期，可通过 BACKTEST_START_DATE 覆盖
-  end_date: "2025-06-31"        # 回测结束日期，可通过 BACKTEST_END_DATE 覆盖
+  start_date: "2024-01-01"      # 回测开始日期，可通过 BACKTEST_START_DATE 覆盖
+  end_date: "2025-01-01"        # 回测结束日期，可通过 BACKTEST_END_DATE 覆盖
   benchmark: "000300.SH"        # 基准指数（沪深300），可通过 BACKTEST_BENCHMARK 覆盖
 
 # 风险管理配置

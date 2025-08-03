@@ -2,7 +2,7 @@
 Qlib数据接口实现
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import pandas as pd
 import logging
 from .interfaces import DataInterface
@@ -192,9 +192,10 @@ class QlibDataInterface(DataInterface):
                             end_time=end_date)
             
             if data.empty:
-                logger.warning(f"未获取到数据: symbols={symbols}, "
-                             f"start_date={start_date}, end_date={end_date}")
-                return pd.DataFrame()
+                logger.error(f"无法获取股票数据: symbols={symbols}, "
+                           f"start_date={start_date}, end_date={end_date}")
+                raise RuntimeError(f"无法获取必要的股票数据: symbols={symbols}, "
+                                 f"start_date={start_date}, end_date={end_date}")
             
             # 重命名列以符合标准格式
             column_mapping = {
@@ -352,3 +353,84 @@ class QlibDataInterface(DataInterface):
         except Exception as e:
             logger.error(f"获取交易日历失败: {e}")
             raise
+    
+    def get_available_date_range(self, symbols: List[str]) -> Tuple[str, str]:
+        """
+        获取指定股票的可用数据范围
+        
+        Args:
+            symbols: 股票代码列表
+            
+        Returns:
+            Tuple[str, str]: (开始日期, 结束日期)
+        """
+        try:
+            self._initialize_qlib()
+            
+            import qlib
+            from qlib.data import D
+            
+            # 参数验证
+            if not self.validate_symbols(symbols):
+                raise ValueError("股票代码列表无效")
+            
+            # 转换为Qlib内部格式
+            formatted_symbols = self._convert_to_qlib_format(symbols)
+            
+            if not formatted_symbols:
+                raise RuntimeError("没有有效的股票代码")
+            
+            # 获取可用的交易日历
+            calendar = D.calendar(freq='day')
+            if len(calendar) == 0:
+                raise RuntimeError("无法获取交易日历")
+            
+            # 从交易日历获取大致范围
+            earliest_possible = calendar[0].strftime('%Y-%m-%d')
+            latest_possible = calendar[-1].strftime('%Y-%m-%d')
+            
+            # 使用第一个股票来探测实际可用范围
+            test_symbol = formatted_symbols[0]
+            fields = ['$close']
+            
+            # 尝试获取最近一年的数据来验证数据可用性
+            from datetime import datetime, timedelta
+            end_dt = datetime.strptime(latest_possible, '%Y-%m-%d')
+            start_dt = end_dt - timedelta(days=365)
+            start_test = start_dt.strftime('%Y-%m-%d')
+            
+            try:
+                test_data = D.features([test_symbol], fields, 
+                                     start_time=start_test, 
+                                     end_time=latest_possible)
+                if not test_data.empty:
+                    # 有最近数据，使用保守的范围估计
+                    # 通常A股数据从2005年左右开始比较完整
+                    conservative_start = "2005-01-01"
+                    return conservative_start, latest_possible
+            except Exception:
+                pass
+            
+            # 如果最近一年没有数据，尝试历史数据
+            # 测试过去几年是否有数据
+            for year_offset in range(1, 10):
+                test_year = int(latest_possible[:4]) - year_offset
+                test_start = f"{test_year}-01-01"
+                test_end = f"{test_year}-12-31"
+                
+                try:
+                    test_data = D.features([test_symbol], fields,
+                                         start_time=test_start,
+                                         end_time=test_end)
+                    if not test_data.empty:
+                        # 找到有数据的年份
+                        return test_start, test_end
+                except Exception:
+                    continue
+            
+            # 如果都没有找到数据，抛出异常
+            raise RuntimeError(f"无法找到股票 {symbols} 的任何可用数据范围")
+            
+        except Exception as e:
+            logger.error(f"获取可用数据范围失败: {e}")
+            raise RuntimeError(f"无法获取股票可用数据范围: {e}") from e

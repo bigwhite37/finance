@@ -71,6 +71,11 @@ class TrainingConfig:
     # 自适应训练参数
     enable_adaptive_learning: bool = False     # 启用自适应学习参数调整
     lr_adaptation_factor: float = 0.8          # 学习率自适应因子
+    min_lr_factor: float = 0.01                # 最小学习率因子
+    max_lr_factor: float = 1.0                 # 最大学习率因子
+    lr_recovery_factor: float = 1.25           # 学习率恢复因子
+    performance_threshold_down: float = 0.85   # 性能下降阈值（更严格）
+    performance_threshold_up: float = 1.15     # 性能提升阈值（更严格）
     batch_size_adaptation: bool = False        # 批次大小自适应
     exploration_decay_by_performance: bool = False  # 基于性能的探索衰减
 
@@ -90,6 +95,15 @@ class TrainingConfig:
 
         if self.early_stopping_mode not in ['max', 'min']:
             raise ValueError("early_stopping_mode必须是'max'或'min'")
+        
+        if self.min_lr_factor <= 0 or self.min_lr_factor >= self.max_lr_factor:
+            raise ValueError("min_lr_factor必须大于0且小于max_lr_factor")
+        
+        if self.lr_recovery_factor <= 1.0:
+            raise ValueError("lr_recovery_factor必须大于1.0")
+        
+        if self.performance_threshold_down >= 1.0 or self.performance_threshold_up <= 1.0:
+            raise ValueError("performance_threshold_down必须小于1.0，performance_threshold_up必须大于1.0")
 
 
 class EarlyStopping:
@@ -677,14 +691,27 @@ class RLTrainer:
             recent_performance = np.mean(self.performance_history[-20:])
             long_term_performance = np.mean(self.performance_history[-50:])
 
-            # 自适应学习率调整
+            # 改进的自适应学习率调整
             if self.config.enable_adaptive_learning:
-                if recent_performance < long_term_performance * 0.9:  # 性能下降
-                    self.current_lr_factor *= self.config.lr_adaptation_factor
-                    logger.info(f"Episode {episode}: 检测到性能下降，降低学习率因子到 {self.current_lr_factor:.4f}")
-                elif recent_performance > long_term_performance * 1.1:  # 性能提升
-                    self.current_lr_factor = min(1.0, self.current_lr_factor * 1.1)
-                    logger.info(f"Episode {episode}: 检测到性能提升，调整学习率因子到 {self.current_lr_factor:.4f}")
+                old_lr_factor = self.current_lr_factor
+                
+                if recent_performance < long_term_performance * self.config.performance_threshold_down:
+                    # 性能下降，降低学习率但有最小值限制
+                    self.current_lr_factor = max(
+                        self.config.min_lr_factor,
+                        self.current_lr_factor * self.config.lr_adaptation_factor
+                    )
+                    if self.current_lr_factor != old_lr_factor:
+                        logger.info(f"Episode {episode}: 检测到性能下降，降低学习率因子到 {self.current_lr_factor:.4f}")
+                
+                elif recent_performance > long_term_performance * self.config.performance_threshold_up:
+                    # 性能提升，快速恢复学习率
+                    self.current_lr_factor = min(
+                        self.config.max_lr_factor,
+                        self.current_lr_factor * self.config.lr_recovery_factor
+                    )
+                    if self.current_lr_factor != old_lr_factor:
+                        logger.info(f"Episode {episode}: 检测到性能提升，调整学习率因子到 {self.current_lr_factor:.4f}")
 
             # 基于回撤的探索调整
             if (self.config.exploration_decay_by_performance and

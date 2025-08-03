@@ -73,11 +73,35 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     start_date = backtest_config.get("start_date", "2020-01-01")
     end_date = backtest_config.get("end_date", "2023-12-31")
 
-    market_data = data_interface.get_price_data(
-        symbols=stock_pool,
-        start_date=start_date,
-        end_date=end_date
-    )
+    # 尝试获取数据，如果失败则使用可用数据范围
+    try:
+        market_data = data_interface.get_price_data(
+            symbols=stock_pool,
+            start_date=start_date,
+            end_date=end_date
+        )
+    except RuntimeError as e:
+        logger.warning(f"无法获取指定时间范围的数据: {e}")
+        logger.info("尝试获取可用的数据范围...")
+        
+        try:
+            available_start, available_end = data_interface.get_available_date_range(stock_pool)
+            logger.info(f"找到可用数据范围: {available_start} 到 {available_end}")
+            
+            # 使用可用的数据范围重新加载数据
+            market_data = data_interface.get_price_data(
+                symbols=stock_pool,
+                start_date=available_start,
+                end_date=available_end
+            )
+            
+            # 更新日期范围
+            start_date = available_start
+            end_date = available_end
+            logger.info(f"已调整为可用数据范围: {start_date} 到 {end_date}")
+            
+        except Exception as fallback_error:
+            raise RuntimeError(f"无法获取任何可用的股票数据: 原始错误={e}, fallback错误={fallback_error}") from e
 
     # 特征工程
     logger.info("执行特征工程...")
@@ -200,7 +224,15 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         enable_drawdown_monitoring=enable_drawdown_control,
         drawdown_early_stopping=enable_drawdown_control,
         max_training_drawdown=trading_config.get("drawdown_control", {}).get("max_training_drawdown", 0.3),
-        enable_adaptive_learning=trading_config.get("drawdown_control", {}).get("enable_adaptive_learning", False)
+        enable_adaptive_learning=trading_config.get("drawdown_control", {}).get("enable_adaptive_learning", False),
+        
+        # 自适应学习率参数
+        lr_adaptation_factor=trading_config.get("drawdown_control", {}).get("lr_adaptation_factor", 0.9),
+        min_lr_factor=trading_config.get("drawdown_control", {}).get("min_lr_factor", 0.01),
+        max_lr_factor=trading_config.get("drawdown_control", {}).get("max_lr_factor", 1.0),
+        lr_recovery_factor=trading_config.get("drawdown_control", {}).get("lr_recovery_factor", 1.25),
+        performance_threshold_down=trading_config.get("drawdown_control", {}).get("performance_threshold_down", 0.85),
+        performance_threshold_up=trading_config.get("drawdown_control", {}).get("performance_threshold_up", 1.15)
     )
 
     return portfolio_env, sac_agent, data_split, training_config
