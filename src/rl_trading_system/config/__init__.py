@@ -16,6 +16,9 @@ from .schemas import (
     MONITORING_CONFIG_SCHEMA,
     CONFIG_SCHEMAS
 )
+from .drawdown_control_config_manager import DrawdownControlConfigManager
+from .config_validator import ConfigValidator
+from .hot_reload import ConfigHotReloader
 
 __all__ = [
     "ConfigManager", 
@@ -29,5 +32,8 @@ __all__ = [
     "TRADING_CONFIG_SCHEMA",
     "COMPLIANCE_CONFIG_SCHEMA",
     "MONITORING_CONFIG_SCHEMA",
-    "CONFIG_SCHEMAS"
+    "CONFIG_SCHEMAS",
+    "DrawdownControlConfigManager",
+    "ConfigValidator",
+    "ConfigHotReloader"
 ]

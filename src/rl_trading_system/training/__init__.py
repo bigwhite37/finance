@@ -15,6 +15,7 @@ from .trainer import (
     RLTrainer,
     TrainingConfig,
     EarlyStopping,
+    DrawdownEarlyStopping,
     TrainingMetrics
 )
 
@@ -30,5 +31,6 @@ __all__ = [
     "RLTrainer",
     "TrainingConfig",
     "EarlyStopping",
+    "DrawdownEarlyStopping",
     "TrainingMetrics"
 ]

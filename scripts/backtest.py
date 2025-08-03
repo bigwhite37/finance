@@ -39,6 +39,7 @@ from rl_trading_system.data import QlibDataInterface, FeatureEngineer
 from rl_trading_system.models import SACAgent, SACConfig, TransformerConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
 from rl_trading_system.risk_control.risk_controller import RiskController, RiskControlConfig
+from rl_trading_system.backtest.drawdown_control_config import DrawdownControlConfig
 from rl_trading_system.utils.terminal_colors import (
     ColorFormatter, print_banner, print_section
 )
@@ -580,13 +581,31 @@ def run_backtest(model_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     data_interface = QlibDataInterface()
     feature_engineer = FeatureEngineer()
 
+    # 检查是否启用回撤控制
+    enable_drawdown_control = config.get("drawdown_control", {}).get("enable", False)
+    drawdown_control_config = None
+    
+    if enable_drawdown_control:
+        logger.info("回测启用回撤控制功能")
+        # 从配置中创建回撤控制配置
+        drawdown_config_dict = config.get("drawdown_control", {})
+        drawdown_control_config = DrawdownControlConfig(
+            max_drawdown_threshold=drawdown_config_dict.get("max_drawdown_threshold", 0.15),
+            drawdown_warning_threshold=drawdown_config_dict.get("drawdown_warning_threshold", 0.08),
+            enable_market_regime_detection=drawdown_config_dict.get("enable_market_regime_detection", True),
+            drawdown_penalty_factor=drawdown_config_dict.get("drawdown_penalty_factor", 2.0),
+            risk_aversion_coefficient=drawdown_config_dict.get("risk_aversion_coefficient", 0.5)
+        )
+
     # 创建投资组合环境配置
     portfolio_config = PortfolioConfig(
         stock_pool=stock_pool,
         initial_cash=initial_cash,
         commission_rate=trading_env.get('commission_rate', BACKTEST_CONFIG.DEFAULT_COMMISSION_RATE),
         stamp_tax_rate=trading_env.get('stamp_tax_rate', BACKTEST_CONFIG.DEFAULT_STAMP_TAX_RATE),
-        max_position_size=trading_env.get('max_position_size', BACKTEST_CONFIG.DEFAULT_MAX_POSITION_SIZE)
+        max_position_size=trading_env.get('max_position_size', BACKTEST_CONFIG.DEFAULT_MAX_POSITION_SIZE),
+        enable_drawdown_control=enable_drawdown_control,
+        drawdown_control_config=drawdown_control_config
     )
 
     # 创建环境
@@ -840,6 +859,19 @@ def main():
             print(f"  {formatter.info('风险违规次数')}: {formatter.warning(str(risk_summary.get('total_violations', 0)))}")
             avg_concentration = risk_summary.get('avg_concentration', 0)
             print(f"  {formatter.info('平均集中度')}: {formatter.number(f'{avg_concentration:.3f}')}")
+            
+        enable_drawdown_control = config.get("drawdown_control", {}).get("enable", False)
+        # 回撤控制摘要
+        if enable_drawdown_control:
+            print()
+            print(f"  {formatter.success('🛡️  回撤控制已启用')}")
+            # drawdown_control_config = config.get("drawdown_control", {})
+            # if drawdown_control_config:
+            #     print(f"  {formatter.info('回撤控制阈值')}: {formatter.number(f'{drawdown_control_config.max_drawdown_threshold:.1%}')}")
+            #     print(f"  {formatter.info('回撤警告阈值')}: {formatter.number(f'{drawdown_control_config.drawdown_warning_threshold:.1%}')}")
+        else:
+            print()
+            print(f"  {formatter.warning('⚠️  回撤控制未启用')}")
 
         print()
         print(formatter.success(f"🎉 回测完成！结果已保存到: {formatter.path(str(output_dir))}"))

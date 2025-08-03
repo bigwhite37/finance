@@ -1,635 +1,862 @@
 """
-Web仪表板
+实时回撤监控Web仪表板
 
-提供Web界面来监控和管理交易系统
+提供实时回撤监控的Web界面，包括图表组件、告警通知和交互功能。
 """
 
+import os
 import json
-import threading
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
-from flask import Flask, render_template_string, jsonify, request, redirect, url_for
-import plotly.graph_objs as go
-import plotly.utils
+from flask import Flask, render_template, jsonify, request, send_from_directory
+import pandas as pd
+import numpy as np
 
-from .system_integration import system_manager, SystemConfig, SystemState
+# Optional dependencies
+try:
+    import plotly.graph_objs as go
+    import plotly.utils
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    go = None
+
+from .monitoring.drawdown_monitoring_service import DrawdownMonitoringService
 
 
-class WebDashboard:
-    """Web仪表板"""
+class DrawdownDashboard:
+    """回撤监控仪表板"""
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 5000):
-        self.host = host
-        self.port = port
-        self.app = Flask(__name__)
-        self.app.secret_key = "trading_system_dashboard"
+    def __init__(self, monitoring_service: DrawdownMonitoringService, 
+                 template_folder: str = None, static_folder: str = None):
+        self.monitoring_service = monitoring_service
+        self.logger = logging.getLogger(__name__)
+        
+        # 设置模板和静态文件路径
+        if template_folder is None:
+            template_folder = os.path.join(os.path.dirname(__file__), 'templates')
+        if static_folder is None:
+            static_folder = os.path.join(os.path.dirname(__file__), 'static')
+        
+        # 创建Flask应用
+        self.app = Flask(__name__, 
+                        template_folder=template_folder,
+                        static_folder=static_folder)
         
         # 设置路由
         self._setup_routes()
         
-        # 历史数据存储
-        self.history_data: Dict[str, List[Dict]] = {}
-        self.max_history_points = 1000
-        
-        # 启动数据收集线程
-        self.data_collection_thread = threading.Thread(target=self._collect_data, daemon=True)
-        self.data_collection_thread.start()
+        self.logger.info("回撤监控仪表板初始化完成")
     
     def _setup_routes(self):
         """设置路由"""
         
         @self.app.route('/')
-        def index():
-            """主页"""
-            systems = system_manager.list_systems()
-            system_statuses = {}
-            
-            for name in systems:
-                status = system_manager.get_system_status(name)
-                if status:
-                    system_statuses[name] = status
-            
-            return render_template_string(INDEX_TEMPLATE, 
-                                        systems=system_statuses,
-                                        current_time=datetime.now())
+        def dashboard():
+            """主仪表板页面"""
+            return render_template('dashboard.html')
         
-        @self.app.route('/system/<name>')
-        def system_detail(name):
-            """系统详情页"""
-            status = system_manager.get_system_status(name)
-            if not status:
-                return "系统不存在", 404
-            
-            # 获取历史数据
-            history = self.history_data.get(name, [])
-            
-            # 生成图表
-            charts = self._generate_charts(name, history)
-            
-            return render_template_string(SYSTEM_DETAIL_TEMPLATE,
-                                        name=name,
-                                        status=status,
-                                        charts=charts,
-                                        current_time=datetime.now())
-        
-        @self.app.route('/api/systems')
-        def api_systems():
-            """API: 获取所有系统状态"""
-            systems = system_manager.list_systems()
-            result = {}
-            
-            for name in systems:
-                status = system_manager.get_system_status(name)
-                if status:
-                    result[name] = status
-            
-            return jsonify(result)
-        
-        @self.app.route('/api/system/<name>')
-        def api_system_status(name):
-            """API: 获取特定系统状态"""
-            status = system_manager.get_system_status(name)
-            if not status:
-                return jsonify({'error': '系统不存在'}), 404
-            
-            return jsonify(status)
-        
-        @self.app.route('/api/system/<name>/start', methods=['POST'])
-        def api_start_system(name):
-            """API: 启动系统"""
-            success = system_manager.start_system(name)
-            return jsonify({'success': success})
-        
-        @self.app.route('/api/system/<name>/stop', methods=['POST'])
-        def api_stop_system(name):
-            """API: 停止系统"""
-            success = system_manager.stop_system(name)
-            return jsonify({'success': success})
-        
-        @self.app.route('/api/system/<name>/history')
-        def api_system_history(name):
-            """API: 获取系统历史数据"""
-            history = self.history_data.get(name, [])
-            return jsonify(history)
-        
-        @self.app.route('/create_system', methods=['GET', 'POST'])
-        def create_system():
-            """创建系统页面"""
-            if request.method == 'POST':
-                try:
-                    # 获取表单数据
-                    name = request.form['name']
-                    stock_pool = request.form['stock_pool'].split(',')
-                    initial_cash = float(request.form['initial_cash'])
-                    
-                    # 创建配置
-                    config = SystemConfig(
-                        stock_pool=[s.strip() for s in stock_pool],
-                        initial_cash=initial_cash,
-                        update_frequency=request.form.get('update_frequency', '1D'),
-                        enable_monitoring=True,
-                        enable_audit=True,
-                        enable_risk_control=True
-                    )
-                    
-                    # 创建系统
-                    success = system_manager.create_system(name, config)
-                    
-                    if success:
-                        return redirect(url_for('index'))
-                    else:
-                        return render_template_string(CREATE_SYSTEM_TEMPLATE, 
-                                                    error="系统创建失败")
-                
-                except Exception as e:
-                    return render_template_string(CREATE_SYSTEM_TEMPLATE, 
-                                                error=f"创建失败: {str(e)}")
-            
-            return render_template_string(CREATE_SYSTEM_TEMPLATE)
-    
-    def _collect_data(self):
-        """收集历史数据"""
-        while True:
+        @self.app.route('/api/dashboard/overview')
+        def get_dashboard_overview():
+            """获取仪表板概览数据"""
             try:
-                systems = system_manager.list_systems()
-                current_time = datetime.now()
+                current_metrics = self.monitoring_service.last_metrics
+                if not current_metrics:
+                    return jsonify({'error': '暂无数据'}), 404
                 
-                for name in systems:
-                    status = system_manager.get_system_status(name)
-                    if status and status['state'] == SystemState.RUNNING.value:
-                        # 记录历史数据点
-                        data_point = {
-                            'timestamp': current_time.isoformat(),
-                            'portfolio_value': status['portfolio_value'],
-                            'total_return': status['stats']['total_return'],
-                            'positions': status['current_positions']
-                        }
-                        
-                        if name not in self.history_data:
-                            self.history_data[name] = []
-                        
-                        self.history_data[name].append(data_point)
-                        
-                        # 限制历史数据点数量
-                        if len(self.history_data[name]) > self.max_history_points:
-                            self.history_data[name] = self.history_data[name][-self.max_history_points:]
+                # 获取历史数据用于趋势分析
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=24)
+                historical_data = self.monitoring_service.historical_data_manager.get_historical_metrics(
+                    start_time, end_time
+                )
                 
-                # 每30秒收集一次数据
-                threading.Event().wait(30)
+                # 计算趋势
+                drawdown_trend = self._calculate_trend([d['current_drawdown'] for d in historical_data[-10:]])
+                volatility_trend = self._calculate_trend([d['volatility'] for d in historical_data[-10:]])
+                
+                overview = {
+                    'current_metrics': current_metrics.to_dict(),
+                    'trends': {
+                        'drawdown_trend': drawdown_trend,
+                        'volatility_trend': volatility_trend
+                    },
+                    'summary_stats': self._calculate_summary_stats(historical_data),
+                    'last_updated': current_metrics.timestamp.isoformat()
+                }
+                
+                return jsonify(overview)
                 
             except Exception as e:
-                print(f"数据收集异常: {e}")
-                threading.Event().wait(60)  # 出错时等待更长时间
+                self.logger.error(f"获取仪表板概览失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/charts/drawdown_curve')
+        def get_drawdown_curve_chart():
+            """获取回撤曲线图表"""
+            try:
+                hours = request.args.get('hours', 24, type=int)
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
+                
+                historical_data = self.monitoring_service.historical_data_manager.get_historical_metrics(
+                    start_time, end_time
+                )
+                
+                if not historical_data:
+                    return jsonify({'error': '暂无历史数据'}), 404
+                
+                # 创建回撤曲线图
+                chart_data = self._create_drawdown_curve_chart(historical_data)
+                return jsonify(chart_data)
+                
+            except Exception as e:
+                self.logger.error(f"获取回撤曲线图失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/charts/portfolio_value')
+        def get_portfolio_value_chart():
+            """获取投资组合价值图表"""
+            try:
+                hours = request.args.get('hours', 24, type=int)
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
+                
+                historical_data = self.monitoring_service.historical_data_manager.get_historical_metrics(
+                    start_time, end_time
+                )
+                
+                if not historical_data:
+                    return jsonify({'error': '暂无历史数据'}), 404
+                
+                # 创建投资组合价值图
+                chart_data = self._create_portfolio_value_chart(historical_data)
+                return jsonify(chart_data)
+                
+            except Exception as e:
+                self.logger.error(f"获取投资组合价值图失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/charts/risk_metrics')
+        def get_risk_metrics_chart():
+            """获取风险指标图表"""
+            try:
+                hours = request.args.get('hours', 24, type=int)
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
+                
+                historical_data = self.monitoring_service.historical_data_manager.get_historical_metrics(
+                    start_time, end_time
+                )
+                
+                if not historical_data:
+                    return jsonify({'error': '暂无历史数据'}), 404
+                
+                # 创建风险指标图
+                chart_data = self._create_risk_metrics_chart(historical_data)
+                return jsonify(chart_data)
+                
+            except Exception as e:
+                self.logger.error(f"获取风险指标图失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/alerts')
+        def get_alerts():
+            """获取告警信息"""
+            try:
+                active_alerts = self.monitoring_service.historical_data_manager.get_active_alerts()
+                
+                # 按严重程度排序
+                severity_order = {'CRITICAL': 0, 'WARNING': 1, 'INFO': 2}
+                active_alerts.sort(key=lambda x: severity_order.get(x['severity'], 3))
+                
+                return jsonify({
+                    'active_alerts': active_alerts,
+                    'alert_count': len(active_alerts),
+                    'critical_count': len([a for a in active_alerts if a['severity'] == 'CRITICAL']),
+                    'warning_count': len([a for a in active_alerts if a['severity'] == 'WARNING'])
+                })
+                
+            except Exception as e:
+                self.logger.error(f"获取告警信息失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/dashboard/performance_stats')
+        def get_performance_stats():
+            """获取性能统计"""
+            try:
+                hours = request.args.get('hours', 24, type=int)
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
+                
+                historical_data = self.monitoring_service.historical_data_manager.get_historical_metrics(
+                    start_time, end_time
+                )
+                
+                if not historical_data:
+                    return jsonify({'error': '暂无历史数据'}), 404
+                
+                stats = self._calculate_performance_stats(historical_data)
+                return jsonify(stats)
+                
+            except Exception as e:
+                self.logger.error(f"获取性能统计失败: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/static/<path:filename>')
+        def static_files(filename):
+            """静态文件服务"""
+            return send_from_directory(self.app.static_folder, filename)
     
-    def _generate_charts(self, system_name: str, history: List[Dict]) -> Dict[str, str]:
-        """生成图表"""
-        charts = {}
+    def _calculate_trend(self, values: List[float]) -> str:
+        """计算趋势方向"""
+        if len(values) < 2:
+            return 'stable'
         
-        if not history:
-            return charts
+        recent_avg = np.mean(values[-3:]) if len(values) >= 3 else values[-1]
+        earlier_avg = np.mean(values[:3]) if len(values) >= 3 else values[0]
         
-        # 提取时间序列数据
-        timestamps = [datetime.fromisoformat(point['timestamp']) for point in history]
-        portfolio_values = [point['portfolio_value'] for point in history]
-        total_returns = [point['total_return'] for point in history]
+        change_pct = (recent_avg - earlier_avg) / abs(earlier_avg) if earlier_avg != 0 else 0
         
-        # 1. 组合价值图表
-        portfolio_fig = go.Figure()
-        portfolio_fig.add_trace(go.Scatter(
+        if change_pct > 0.05:
+            return 'up'
+        elif change_pct < -0.05:
+            return 'down'
+        else:
+            return 'stable'
+    
+    def _calculate_summary_stats(self, historical_data: List[Dict]) -> Dict[str, Any]:
+        """计算汇总统计"""
+        if not historical_data:
+            return {}
+        
+        drawdowns = [d['current_drawdown'] for d in historical_data]
+        volatilities = [d['volatility'] for d in historical_data]
+        portfolio_values = [d['portfolio_value'] for d in historical_data]
+        
+        return {
+            'avg_drawdown': np.mean(drawdowns),
+            'max_drawdown': min(drawdowns),  # 最大回撤是最小值
+            'avg_volatility': np.mean(volatilities),
+            'portfolio_return': (portfolio_values[-1] - portfolio_values[0]) / portfolio_values[0] if len(portfolio_values) > 1 else 0,
+            'data_points': len(historical_data)
+        }
+    
+    def _create_drawdown_curve_chart(self, historical_data: List[Dict]) -> Dict[str, Any]:
+        """创建回撤曲线图表"""
+        if not PLOTLY_AVAILABLE:
+            # 返回简化的数据格式
+            timestamps = [d['timestamp'] for d in historical_data]
+            drawdowns = [d['current_drawdown'] * 100 for d in historical_data]
+            return {
+                'data': [{'x': timestamps, 'y': drawdowns, 'type': 'scatter', 'name': '当前回撤'}],
+                'layout': {'title': '回撤曲线', 'xaxis': {'title': '时间'}, 'yaxis': {'title': '回撤 (%)'}}
+            }
+        
+        timestamps = [datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')) for d in historical_data]
+        drawdowns = [d['current_drawdown'] * 100 for d in historical_data]  # 转换为百分比
+        
+        # 创建Plotly图表
+        fig = go.Figure()
+        
+        # 添加回撤曲线
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=drawdowns,
+            mode='lines',
+            name='当前回撤',
+            line=dict(color='red', width=2),
+            fill='tonexty',
+            fillcolor='rgba(255, 0, 0, 0.1)'
+        ))
+        
+        # 添加零线
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="零线")
+        
+        # 添加警告线
+        fig.add_hline(y=-8, line_dash="dot", line_color="orange", annotation_text="警告线(-8%)")
+        fig.add_hline(y=-15, line_dash="dot", line_color="red", annotation_text="危险线(-15%)")
+        
+        fig.update_layout(
+            title='回撤曲线',
+            xaxis_title='时间',
+            yaxis_title='回撤 (%)',
+            hovermode='x unified',
+            showlegend=True
+        )
+        
+        return json.loads(plotly.utils.PlotlyJSONEncoder().encode(fig))
+    
+    def _create_portfolio_value_chart(self, historical_data: List[Dict]) -> Dict[str, Any]:
+        """创建投资组合价值图表"""
+        if not PLOTLY_AVAILABLE:
+            # 返回简化的数据格式
+            timestamps = [d['timestamp'] for d in historical_data]
+            portfolio_values = [d['portfolio_value'] for d in historical_data]
+            return {
+                'data': [
+                    {'x': timestamps, 'y': portfolio_values, 'type': 'scatter', 'name': '投资组合价值'},
+                ],
+                'layout': {'title': '投资组合价值变化', 'xaxis': {'title': '时间'}, 'yaxis': {'title': '价值'}}
+            }
+        
+        timestamps = [datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')) for d in historical_data]
+        portfolio_values = [d['portfolio_value'] for d in historical_data]
+        
+        # 计算峰值线
+        running_max = []
+        current_max = portfolio_values[0] if portfolio_values else 0
+        for value in portfolio_values:
+            current_max = max(current_max, value)
+            running_max.append(current_max)
+        
+        fig = go.Figure()
+        
+        # 添加投资组合价值
+        fig.add_trace(go.Scatter(
             x=timestamps,
             y=portfolio_values,
             mode='lines',
-            name='组合价值',
+            name='投资组合价值',
             line=dict(color='blue', width=2)
         ))
-        portfolio_fig.update_layout(
-            title='组合价值变化',
-            xaxis_title='时间',
-            yaxis_title='价值 (元)',
-            height=400
-        )
-        charts['portfolio_value'] = json.dumps(portfolio_fig, cls=plotly.utils.PlotlyJSONEncoder)
         
-        # 2. 收益率图表
-        return_fig = go.Figure()
-        return_fig.add_trace(go.Scatter(
+        # 添加峰值线
+        fig.add_trace(go.Scatter(
             x=timestamps,
-            y=[r * 100 for r in total_returns],  # 转换为百分比
+            y=running_max,
             mode='lines',
-            name='总收益率',
-            line=dict(color='green', width=2)
+            name='历史峰值',
+            line=dict(color='green', width=1, dash='dash')
         ))
-        return_fig.update_layout(
-            title='收益率变化',
+        
+        fig.update_layout(
+            title='投资组合价值变化',
             xaxis_title='时间',
-            yaxis_title='收益率 (%)',
-            height=400
+            yaxis_title='价值',
+            hovermode='x unified',
+            showlegend=True
         )
-        charts['total_return'] = json.dumps(return_fig, cls=plotly.utils.PlotlyJSONEncoder)
         
-        # 3. 持仓分布图表（使用最新数据）
-        if history:
-            latest_positions = history[-1]['positions']
-            # 假设我们知道股票名称
-            stock_names = [f'股票{i+1}' for i in range(len(latest_positions))]
-            
-            position_fig = go.Figure(data=[go.Pie(
-                labels=stock_names,
-                values=latest_positions,
-                hole=0.3
-            )])
-            position_fig.update_layout(
-                title='当前持仓分布',
-                height=400
-            )
-            charts['positions'] = json.dumps(position_fig, cls=plotly.utils.PlotlyJSONEncoder)
-        
-        return charts
+        return json.loads(plotly.utils.PlotlyJSONEncoder().encode(fig))
     
-    def run(self, debug: bool = False):
-        """运行Web服务器"""
-        print(f"启动Web仪表板: http://{self.host}:{self.port}")
-        self.app.run(host=self.host, port=self.port, debug=debug, threaded=True)
+    def _create_risk_metrics_chart(self, historical_data: List[Dict]) -> Dict[str, Any]:
+        """创建风险指标图表"""
+        timestamps = [datetime.fromisoformat(d['timestamp'].replace('Z', '+00:00')) for d in historical_data]
+        volatilities = [d['volatility'] * 100 for d in historical_data]  # 转换为百分比
+        risk_budget_usage = [d['risk_budget_usage'] * 100 for d in historical_data]  # 转换为百分比
+        concentration_scores = [d['concentration_score'] * 100 for d in historical_data]  # 转换为百分比
+        
+        fig = go.Figure()
+        
+        # 添加波动率
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=volatilities,
+            mode='lines',
+            name='波动率 (%)',
+            line=dict(color='orange', width=2),
+            yaxis='y'
+        ))
+        
+        # 添加风险预算使用率
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=risk_budget_usage,
+            mode='lines',
+            name='风险预算使用率 (%)',
+            line=dict(color='purple', width=2),
+            yaxis='y2'
+        ))
+        
+        # 添加集中度分数
+        fig.add_trace(go.Scatter(
+            x=timestamps,
+            y=concentration_scores,
+            mode='lines',
+            name='集中度分数 (%)',
+            line=dict(color='brown', width=2),
+            yaxis='y2'
+        ))
+        
+        fig.update_layout(
+            title='风险指标变化',
+            xaxis_title='时间',
+            yaxis=dict(title='波动率 (%)', side='left'),
+            yaxis2=dict(title='使用率/集中度 (%)', side='right', overlaying='y'),
+            hovermode='x unified',
+            showlegend=True
+        )
+        
+        return json.loads(plotly.utils.PlotlyJSONEncoder().encode(fig))
+    
+    def _calculate_performance_stats(self, historical_data: List[Dict]) -> Dict[str, Any]:
+        """计算性能统计"""
+        if not historical_data:
+            return {}
+        
+        # 提取数据
+        portfolio_values = [d['portfolio_value'] for d in historical_data]
+        drawdowns = [d['current_drawdown'] for d in historical_data]
+        volatilities = [d['volatility'] for d in historical_data]
+        sharpe_ratios = [d['sharpe_ratio'] for d in historical_data if d['sharpe_ratio'] is not None]
+        
+        # 计算收益率
+        if len(portfolio_values) > 1:
+            returns = [(portfolio_values[i] - portfolio_values[i-1]) / portfolio_values[i-1] 
+                      for i in range(1, len(portfolio_values))]
+            total_return = (portfolio_values[-1] - portfolio_values[0]) / portfolio_values[0]
+        else:
+            returns = []
+            total_return = 0
+        
+        # 计算统计指标
+        stats = {
+            'total_return': total_return * 100,  # 转换为百分比
+            'annualized_return': total_return * 252 * 100 if returns else 0,  # 年化收益率
+            'max_drawdown': min(drawdowns) * 100 if drawdowns else 0,
+            'current_drawdown': drawdowns[-1] * 100 if drawdowns else 0,
+            'avg_volatility': np.mean(volatilities) * 100 if volatilities else 0,
+            'current_volatility': volatilities[-1] * 100 if volatilities else 0,
+            'avg_sharpe_ratio': np.mean(sharpe_ratios) if sharpe_ratios else 0,
+            'current_sharpe_ratio': sharpe_ratios[-1] if sharpe_ratios else 0,
+            'win_rate': len([r for r in returns if r > 0]) / len(returns) * 100 if returns else 0,
+            'avg_win': np.mean([r for r in returns if r > 0]) * 100 if returns else 0,
+            'avg_loss': np.mean([r for r in returns if r < 0]) * 100 if returns else 0,
+            'profit_factor': abs(sum([r for r in returns if r > 0]) / sum([r for r in returns if r < 0])) if returns and any(r < 0 for r in returns) else 0
+        }
+        
+        return stats
+    
+    def run(self, host: str = '0.0.0.0', port: int = 8080, debug: bool = False):
+        """运行仪表板服务器"""
+        self.logger.info(f"启动回撤监控仪表板: http://{host}:{port}")
+        self.app.run(host=host, port=port, debug=debug, threaded=True)
 
 
-# HTML模板
-INDEX_TEMPLATE = """
+def create_dashboard_templates():
+    """创建仪表板模板文件"""
+    template_dir = os.path.join(os.path.dirname(__file__), 'templates')
+    static_dir = os.path.join(os.path.dirname(__file__), 'static')
+    
+    # 创建目录
+    os.makedirs(template_dir, exist_ok=True)
+    os.makedirs(static_dir, exist_ok=True)
+    
+    # 创建主模板
+    dashboard_html = """
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
-    <title>交易系统仪表板</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>回撤监控仪表板</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        .system-card { margin-bottom: 20px; }
-        .status-running { color: #28a745; }
-        .status-stopped { color: #dc3545; }
-        .status-paused { color: #ffc107; }
-        .status-error { color: #dc3545; }
+        .metric-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .metric-value {
+            font-size: 2rem;
+            font-weight: bold;
+        }
+        .metric-label {
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+        .trend-up { color: #28a745; }
+        .trend-down { color: #dc3545; }
+        .trend-stable { color: #6c757d; }
+        .alert-critical { border-left: 4px solid #dc3545; }
+        .alert-warning { border-left: 4px solid #ffc107; }
+        .alert-info { border-left: 4px solid #17a2b8; }
+        .chart-container {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .status-normal { background-color: #28a745; }
+        .status-warning { background-color: #ffc107; }
+        .status-critical { background-color: #dc3545; }
     </style>
 </head>
-<body>
+<body class="bg-light">
     <nav class="navbar navbar-dark bg-dark">
         <div class="container-fluid">
-            <span class="navbar-brand mb-0 h1">交易系统仪表板</span>
-            <span class="navbar-text">{{ current_time.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+            <span class="navbar-brand mb-0 h1">
+                <i class="fas fa-chart-line"></i> 回撤监控仪表板
+            </span>
+            <span class="navbar-text" id="last-updated">
+                最后更新: --
+            </span>
         </div>
     </nav>
-    
-    <div class="container mt-4">
-        <div class="row">
-            <div class="col-md-12">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h2>系统概览</h2>
-                    <a href="/create_system" class="btn btn-primary">创建新系统</a>
-                </div>
-                
-                {% if not systems %}
-                <div class="alert alert-info">
-                    <h4>没有运行的系统</h4>
-                    <p>点击"创建新系统"开始使用交易系统。</p>
-                </div>
-                {% else %}
-                <div class="row">
-                    {% for name, status in systems.items() %}
-                    <div class="col-md-6 col-lg-4">
-                        <div class="card system-card">
-                            <div class="card-header">
-                                <h5 class="card-title">{{ name }}</h5>
-                                <span class="badge bg-{% if status.state == 'running' %}success{% elif status.state == 'stopped' %}secondary{% elif status.state == 'paused' %}warning{% else %}danger{% endif %}">
-                                    {{ status.state }}
-                                </span>
-                            </div>
-                            <div class="card-body">
-                                <p><strong>组合价值:</strong> ¥{{ "%.2f"|format(status.portfolio_value) }}</p>
-                                <p><strong>总收益:</strong> {{ "%.2f%%"|format(status.stats.total_return * 100) }}</p>
-                                <p><strong>交易次数:</strong> {{ status.stats.total_trades }}</p>
-                                <div class="btn-group" role="group">
-                                    <a href="/system/{{ name }}" class="btn btn-info btn-sm">详情</a>
-                                    {% if status.state == 'stopped' %}
-                                    <button class="btn btn-success btn-sm" onclick="startSystem('{{ name }}')">启动</button>
-                                    {% elif status.state == 'running' %}
-                                    <button class="btn btn-danger btn-sm" onclick="stopSystem('{{ name }}')">停止</button>
-                                    {% endif %}
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    {% endfor %}
-                </div>
-                {% endif %}
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        function startSystem(name) {
-            fetch(`/api/system/${name}/start`, {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        location.reload();
-                    } else {
-                        alert('启动失败');
-                    }
-                });
-        }
-        
-        function stopSystem(name) {
-            if (confirm('确定要停止系统吗？')) {
-                fetch(`/api/system/${name}/stop`, {method: 'POST'})
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            location.reload();
-                        } else {
-                            alert('停止失败');
-                        }
-                    });
-            }
-        }
-        
-        // 自动刷新页面
-        setTimeout(() => location.reload(), 30000);
-    </script>
-</body>
-</html>
-"""
 
-SYSTEM_DETAIL_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>{{ name }} - 系统详情</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-</head>
-<body>
-    <nav class="navbar navbar-dark bg-dark">
-        <div class="container-fluid">
-            <a class="navbar-brand" href="/">交易系统仪表板</a>
-            <span class="navbar-text">{{ current_time.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+    <div class="container-fluid mt-4">
+        <!-- 概览指标 -->
+        <div class="row" id="overview-metrics">
+            <!-- 动态生成的指标卡片 -->
         </div>
-    </nav>
-    
-    <div class="container mt-4">
-        <div class="row">
-            <div class="col-md-12">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h2>{{ name }}</h2>
-                    <div class="btn-group">
-                        {% if status.state == 'stopped' %}
-                        <button class="btn btn-success" onclick="startSystem()">启动</button>
-                        {% elif status.state == 'running' %}
-                        <button class="btn btn-danger" onclick="stopSystem()">停止</button>
-                        {% endif %}
-                        <a href="/" class="btn btn-secondary">返回</a>
-                    </div>
-                </div>
-                
-                <!-- 系统状态 -->
-                <div class="row mb-4">
-                    <div class="col-md-3">
-                        <div class="card">
-                            <div class="card-body text-center">
-                                <h5>系统状态</h5>
-                                <span class="badge bg-{% if status.state == 'running' %}success{% elif status.state == 'stopped' %}secondary{% elif status.state == 'paused' %}warning{% else %}danger{% endif %} fs-6">
-                                    {{ status.state }}
-                                </span>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="card">
-                            <div class="card-body text-center">
-                                <h5>组合价值</h5>
-                                <h4>¥{{ "%.2f"|format(status.portfolio_value) }}</h4>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="card">
-                            <div class="card-body text-center">
-                                <h5>总收益</h5>
-                                <h4 class="{% if status.stats.total_return >= 0 %}text-success{% else %}text-danger{% endif %}">
-                                    {{ "%.2f%%"|format(status.stats.total_return * 100) }}
-                                </h4>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <div class="card">
-                            <div class="card-body text-center">
-                                <h5>交易次数</h5>
-                                <h4>{{ status.stats.total_trades }}</h4>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- 图表 -->
-                {% if charts %}
-                <div class="row">
-                    {% if 'portfolio_value' in charts %}
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-body">
-                                <div id="portfolio-chart"></div>
-                            </div>
-                        </div>
-                    </div>
-                    {% endif %}
-                    
-                    {% if 'total_return' in charts %}
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-body">
-                                <div id="return-chart"></div>
-                            </div>
-                        </div>
-                    </div>
-                    {% endif %}
-                    
-                    {% if 'positions' in charts %}
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-body">
-                                <div id="position-chart"></div>
-                            </div>
-                        </div>
-                    </div>
-                    {% endif %}
-                </div>
-                {% endif %}
-                
-                <!-- 详细信息 -->
-                <div class="row mt-4">
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-header">
-                                <h5>当前持仓</h5>
-                            </div>
-                            <div class="card-body">
-                                {% for i, position in enumerate(status.current_positions) %}
-                                <div class="d-flex justify-content-between">
-                                    <span>股票{{ i+1 }}:</span>
-                                    <span>{{ "%.2f%%"|format(position * 100) }}</span>
-                                </div>
-                                {% endfor %}
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="col-md-6">
-                        <div class="card">
-                            <div class="card-header">
-                                <h5>统计信息</h5>
-                            </div>
-                            <div class="card-body">
-                                {% for key, value in status.stats.items() %}
-                                <div class="d-flex justify-content-between">
-                                    <span>{{ key }}:</span>
-                                    <span>{{ value }}</span>
-                                </div>
-                                {% endfor %}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        // 渲染图表
-        {% if charts %}
-        {% if 'portfolio_value' in charts %}
-        Plotly.newPlot('portfolio-chart', {{ charts.portfolio_value|safe }});
-        {% endif %}
-        
-        {% if 'total_return' in charts %}
-        Plotly.newPlot('return-chart', {{ charts.total_return|safe }});
-        {% endif %}
-        
-        {% if 'positions' in charts %}
-        Plotly.newPlot('position-chart', {{ charts.positions|safe }});
-        {% endif %}
-        {% endif %}
-        
-        function startSystem() {
-            fetch(`/api/system/{{ name }}/start`, {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        location.reload();
-                    } else {
-                        alert('启动失败');
-                    }
-                });
-        }
-        
-        function stopSystem() {
-            if (confirm('确定要停止系统吗？')) {
-                fetch(`/api/system/{{ name }}/stop`, {method: 'POST'})
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            location.reload();
-                        } else {
-                            alert('停止失败');
-                        }
-                    });
-            }
-        }
-        
-        // 自动刷新页面
-        setTimeout(() => location.reload(), 60000);
-    </script>
-</body>
-</html>
-"""
 
-CREATE_SYSTEM_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>创建交易系统</title>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body>
-    <nav class="navbar navbar-dark bg-dark">
-        <div class="container-fluid">
-            <a class="navbar-brand" href="/">交易系统仪表板</a>
-        </div>
-    </nav>
-    
-    <div class="container mt-4">
-        <div class="row justify-content-center">
-            <div class="col-md-6">
+        <!-- 告警信息 -->
+        <div class="row">
+            <div class="col-12">
                 <div class="card">
                     <div class="card-header">
-                        <h4>创建新的交易系统</h4>
+                        <h5><i class="fas fa-exclamation-triangle"></i> 告警信息</h5>
                     </div>
-                    <div class="card-body">
-                        {% if error %}
-                        <div class="alert alert-danger">{{ error }}</div>
-                        {% endif %}
-                        
-                        <form method="POST">
-                            <div class="mb-3">
-                                <label for="name" class="form-label">系统名称</label>
-                                <input type="text" class="form-control" id="name" name="name" required>
-                            </div>
-                            
-                            <div class="mb-3">
-                                <label for="stock_pool" class="form-label">股票池</label>
-                                <input type="text" class="form-control" id="stock_pool" name="stock_pool" 
-                                       value="000001.SZ,000002.SZ,600000.SH" required>
-                                <div class="form-text">用逗号分隔股票代码</div>
-                            </div>
-                            
-                            <div class="mb-3">
-                                <label for="initial_cash" class="form-label">初始资金</label>
-                                <input type="number" class="form-control" id="initial_cash" name="initial_cash" 
-                                       value="1000000" step="1000" required>
-                            </div>
-                            
-                            <div class="mb-3">
-                                <label for="update_frequency" class="form-label">更新频率</label>
-                                <select class="form-select" id="update_frequency" name="update_frequency">
-                                    <option value="1D" selected>每日</option>
-                                    <option value="1H">每小时</option>
-                                    <option value="5min">每5分钟</option>
-                                </select>
-                            </div>
-                            
-                            <div class="d-grid gap-2">
-                                <button type="submit" class="btn btn-primary">创建系统</button>
-                                <a href="/" class="btn btn-secondary">取消</a>
-                            </div>
-                        </form>
+                    <div class="card-body" id="alerts-container">
+                        <!-- 动态生成的告警信息 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 图表区域 -->
+        <div class="row mt-4">
+            <div class="col-lg-6">
+                <div class="chart-container">
+                    <h5>回撤曲线</h5>
+                    <div id="drawdown-chart"></div>
+                </div>
+            </div>
+            <div class="col-lg-6">
+                <div class="chart-container">
+                    <h5>投资组合价值</h5>
+                    <div id="portfolio-chart"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col-lg-8">
+                <div class="chart-container">
+                    <h5>风险指标</h5>
+                    <div id="risk-chart"></div>
+                </div>
+            </div>
+            <div class="col-lg-4">
+                <div class="chart-container">
+                    <h5>性能统计</h5>
+                    <div id="performance-stats">
+                        <!-- 动态生成的性能统计 -->
                     </div>
                 </div>
             </div>
         </div>
     </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // 全局变量
+        let refreshInterval;
+        const REFRESH_RATE = 5000; // 5秒刷新一次
+
+        // 初始化仪表板
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDashboard();
+            startAutoRefresh();
+        });
+
+        // 加载仪表板数据
+        async function loadDashboard() {
+            try {
+                await Promise.all([
+                    loadOverview(),
+                    loadAlerts(),
+                    loadCharts(),
+                    loadPerformanceStats()
+                ]);
+            } catch (error) {
+                console.error('加载仪表板失败:', error);
+                showError('加载数据失败，请检查服务器连接');
+            }
+        }
+
+        // 加载概览数据
+        async function loadOverview() {
+            const response = await fetch('/api/dashboard/overview');
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
+            updateOverviewMetrics(data);
+            updateLastUpdated(data.last_updated);
+        }
+
+        // 更新概览指标
+        function updateOverviewMetrics(data) {
+            const metrics = data.current_metrics;
+            const trends = data.trends;
+            
+            const metricsHtml = `
+                <div class="col-md-3">
+                    <div class="metric-card">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="metric-value">${(metrics.current_drawdown * 100).toFixed(2)}%</div>
+                                <div class="metric-label">当前回撤</div>
+                            </div>
+                            <div>
+                                <i class="fas fa-arrow-${getTrendIcon(trends.drawdown_trend)} trend-${trends.drawdown_trend}"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="metric-value">${(metrics.max_drawdown * 100).toFixed(2)}%</div>
+                                <div class="metric-label">最大回撤</div>
+                            </div>
+                            <div>
+                                <i class="fas fa-chart-line"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="metric-value">${(metrics.volatility * 100).toFixed(2)}%</div>
+                                <div class="metric-label">当前波动率</div>
+                            </div>
+                            <div>
+                                <i class="fas fa-arrow-${getTrendIcon(trends.volatility_trend)} trend-${trends.volatility_trend}"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="metric-value">
+                                    <span class="status-indicator status-${getAlertStatus(metrics.alert_level)}"></span>
+                                    ${metrics.alert_level}
+                                </div>
+                                <div class="metric-label">系统状态</div>
+                            </div>
+                            <div>
+                                <i class="fas fa-shield-alt"></i>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            document.getElementById('overview-metrics').innerHTML = metricsHtml;
+        }
+
+        // 加载告警信息
+        async function loadAlerts() {
+            const response = await fetch('/api/dashboard/alerts');
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
+            updateAlerts(data);
+        }
+
+        // 更新告警信息
+        function updateAlerts(data) {
+            const alertsContainer = document.getElementById('alerts-container');
+            
+            if (data.active_alerts.length === 0) {
+                alertsContainer.innerHTML = '<div class="text-muted">暂无活跃告警</div>';
+                return;
+            }
+
+            const alertsHtml = data.active_alerts.map(alert => `
+                <div class="alert alert-${getSeverityClass(alert.severity)} alert-${alert.severity.toLowerCase()}" role="alert">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <strong>${alert.alert_type}</strong>: ${alert.message}
+                        </div>
+                        <small class="text-muted">${formatDateTime(alert.timestamp)}</small>
+                    </div>
+                </div>
+            `).join('');
+            
+            alertsContainer.innerHTML = alertsHtml;
+        }
+
+        // 加载图表
+        async function loadCharts() {
+            const [drawdownChart, portfolioChart, riskChart] = await Promise.all([
+                fetch('/api/dashboard/charts/drawdown_curve').then(r => r.json()),
+                fetch('/api/dashboard/charts/portfolio_value').then(r => r.json()),
+                fetch('/api/dashboard/charts/risk_metrics').then(r => r.json())
+            ]);
+
+            Plotly.newPlot('drawdown-chart', drawdownChart.data, drawdownChart.layout, {responsive: true});
+            Plotly.newPlot('portfolio-chart', portfolioChart.data, portfolioChart.layout, {responsive: true});
+            Plotly.newPlot('risk-chart', riskChart.data, riskChart.layout, {responsive: true});
+        }
+
+        // 加载性能统计
+        async function loadPerformanceStats() {
+            const response = await fetch('/api/dashboard/performance_stats');
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(data.error);
+            }
+
+            updatePerformanceStats(data);
+        }
+
+        // 更新性能统计
+        function updatePerformanceStats(stats) {
+            const statsHtml = `
+                <div class="row">
+                    <div class="col-6">
+                        <div class="text-center">
+                            <div class="h4 text-primary">${stats.total_return.toFixed(2)}%</div>
+                            <div class="small text-muted">总收益率</div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="text-center">
+                            <div class="h4 text-info">${stats.current_sharpe_ratio.toFixed(2)}</div>
+                            <div class="small text-muted">夏普比率</div>
+                        </div>
+                    </div>
+                </div>
+                <hr>
+                <div class="row">
+                    <div class="col-6">
+                        <div class="text-center">
+                            <div class="h5 text-success">${stats.win_rate.toFixed(1)}%</div>
+                            <div class="small text-muted">胜率</div>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="text-center">
+                            <div class="h5 text-warning">${stats.profit_factor.toFixed(2)}</div>
+                            <div class="small text-muted">盈亏比</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            document.getElementById('performance-stats').innerHTML = statsHtml;
+        }
+
+        // 工具函数
+        function getTrendIcon(trend) {
+            switch(trend) {
+                case 'up': return 'up';
+                case 'down': return 'down';
+                default: return 'right';
+            }
+        }
+
+        function getAlertStatus(level) {
+            switch(level) {
+                case 'CRITICAL': return 'critical';
+                case 'WARNING': return 'warning';
+                default: return 'normal';
+            }
+        }
+
+        function getSeverityClass(severity) {
+            switch(severity) {
+                case 'CRITICAL': return 'danger';
+                case 'WARNING': return 'warning';
+                default: return 'info';
+            }
+        }
+
+        function formatDateTime(timestamp) {
+            return new Date(timestamp).toLocaleString('zh-CN');
+        }
+
+        function updateLastUpdated(timestamp) {
+            document.getElementById('last-updated').textContent = 
+                `最后更新: ${formatDateTime(timestamp)}`;
+        }
+
+        function showError(message) {
+            const alertHtml = `
+                <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                    <strong>错误:</strong> ${message}
+                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('afterbegin', alertHtml);
+        }
+
+        // 自动刷新
+        function startAutoRefresh() {
+            refreshInterval = setInterval(loadDashboard, REFRESH_RATE);
+        }
+
+        function stopAutoRefresh() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        }
+
+        // 页面可见性变化时控制刷新
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                stopAutoRefresh();
+            } else {
+                startAutoRefresh();
+            }
+        });
+    </script>
 </body>
 </html>
-"""
-
-
-def create_dashboard(host: str = "127.0.0.1", port: int = 5000) -> WebDashboard:
-    """创建Web仪表板实例"""
-    return WebDashboard(host, port)
+    """
+    
+    with open(os.path.join(template_dir, 'dashboard.html'), 'w', encoding='utf-8') as f:
+        f.write(dashboard_html)
+    
+    print(f"仪表板模板已创建: {template_dir}")
 
 
 if __name__ == "__main__":
-    dashboard = create_dashboard()
-    dashboard.run(debug=True)
+    # 创建模板文件
+    create_dashboard_templates()
+    
+    # 示例用法
+    from .monitoring.drawdown_monitoring_service import DrawdownMonitoringService
+    
+    # 创建监控服务
+    monitoring_service = DrawdownMonitoringService()
+    monitoring_service.start_monitoring()
+    
+    # 创建仪表板
+    dashboard = DrawdownDashboard(monitoring_service)
+    
+    try:
+        # 运行仪表板
+        dashboard.run(port=8080, debug=True)
+    except KeyboardInterrupt:
+        monitoring_service.stop_monitoring()
+        print("仪表板已停止")

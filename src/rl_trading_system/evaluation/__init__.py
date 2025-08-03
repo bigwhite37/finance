@@ -5,6 +5,9 @@ from .performance_metrics import (
     TradingMetrics, PortfolioMetrics
 )
 from .report_generator import ReportGenerator
+from .statistical_tests import SignificanceTest, StatisticalTestResult
+from .performance_comparator import PerformanceComparator, ComparisonResult
+from .metrics_calculator import MultiDimensionalMetrics, MetricsCalculator
 
 __all__ = [
     "ReturnMetrics",
@@ -12,5 +15,11 @@ __all__ = [
     "RiskAdjustedMetrics",
     "TradingMetrics",
     "PortfolioMetrics",
-    "ReportGenerator"
+    "ReportGenerator",
+    "SignificanceTest",
+    "StatisticalTestResult",
+    "PerformanceComparator",
+    "ComparisonResult",
+    "MultiDimensionalMetrics",
+    "MetricsCalculator"
 ]

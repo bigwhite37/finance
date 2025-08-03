@@ -7,11 +7,20 @@ from .multi_frequency_backtest import (
     ExecutionMode,
     PriceMode
 )
+from .enhanced_backtest_engine import EnhancedBacktestEngine, EnhancedBacktestResult
+from .parameter_optimizer import ParameterGridSearch, OptimizationResult
+from .drawdown_control_config import DrawdownControlConfig, BacktestComparisonConfig
 
 __all__ = [
     "MultiFrequencyBacktest",
     "BacktestConfig",
     "BacktestResult", 
     "ExecutionMode",
-    "PriceMode"
+    "PriceMode",
+    "EnhancedBacktestEngine",
+    "EnhancedBacktestResult",
+    "ParameterGridSearch",
+    "OptimizationResult",
+    "DrawdownControlConfig",
+    "BacktestComparisonConfig"
 ]

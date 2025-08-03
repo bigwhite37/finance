@@ -62,6 +62,18 @@ class TrainingConfig:
     # 设备
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # 回撤控制和奖励优化参数
+    enable_drawdown_monitoring: bool = False    # 启用训练过程中的回撤监控
+    drawdown_early_stopping: bool = False      # 基于回撤的早停
+    max_training_drawdown: float = 0.3         # 训练过程最大允许回撤
+    reward_enhancement_progress: float = 0.5   # 奖励增强进度（0-1）
+
+    # 自适应训练参数
+    enable_adaptive_learning: bool = False     # 启用自适应学习参数调整
+    lr_adaptation_factor: float = 0.8          # 学习率自适应因子
+    batch_size_adaptation: bool = False        # 批次大小自适应
+    exploration_decay_by_performance: bool = False  # 基于性能的探索衰减
+
     def __post_init__(self):
         """配置验证"""
         if self.n_episodes <= 0:
@@ -135,6 +147,72 @@ class EarlyStopping:
         self.best_score = None
         self.counter = 0
         self.early_stop = False
+
+
+class DrawdownEarlyStopping:
+    """基于回撤的早停机制"""
+
+    def __init__(self, max_drawdown: float = 0.3, patience: int = 10):
+        """
+        初始化基于回撤的早停机制
+
+        Args:
+            max_drawdown: 最大允许回撤阈值
+            patience: 超过阈值后的耐心值
+        """
+        self.max_drawdown = max_drawdown
+        self.patience = patience
+        self.peak_value = None
+        self.counter = 0
+        self.early_stop = False
+        self.drawdown_history = []
+
+    def step(self, current_value: float) -> bool:
+        """
+        更新回撤早停状态
+
+        Args:
+            current_value: 当前价值（如累积奖励）
+
+        Returns:
+            bool: 是否应该早停
+        """
+        if self.peak_value is None:
+            self.peak_value = current_value
+            self.drawdown_history.append(0.0)
+            return False
+
+        # 更新峰值
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+
+        # 计算当前回撤
+        current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
+        self.drawdown_history.append(current_drawdown)
+
+        # 检查是否超过回撤阈值
+        if current_drawdown > self.max_drawdown:
+            self.counter += 1
+        else:
+            self.counter = 0
+
+        # 判断是否需要早停
+        if self.counter >= self.patience:
+            self.early_stop = True
+            return True
+
+        return False
+
+    def get_current_drawdown(self) -> float:
+        """获取当前回撤"""
+        return self.drawdown_history[-1] if self.drawdown_history else 0.0
+
+    def reset(self):
+        """重置早停状态"""
+        self.peak_value = None
+        self.counter = 0
+        self.early_stop = False
+        self.drawdown_history = []
 
 
 class TrainingMetrics:
@@ -222,6 +300,23 @@ class RLTrainer:
             mode=config.early_stopping_mode
         )
 
+        # 初始化回撤控制相关组件
+        if config.enable_drawdown_monitoring:
+            self.drawdown_early_stopping = DrawdownEarlyStopping(
+                max_drawdown=config.max_training_drawdown,
+                patience=config.early_stopping_patience // 2  # 回撤早停耐心值更小
+            )
+            self.drawdown_metrics = []
+            logger.info("回撤监控已启用")
+        else:
+            self.drawdown_early_stopping = None
+            self.drawdown_metrics = []
+
+        # 自适应训练参数
+        self.adaptive_learning_enabled = config.enable_adaptive_learning
+        self.current_lr_factor = 1.0
+        self.performance_history = []
+
         # 设置随机种子
         if config.random_seed is not None:
             self._set_random_seed(config.random_seed)
@@ -282,7 +377,7 @@ class RLTrainer:
         for step in range(self.config.max_steps_per_episode):
             # 选择动作
             action_tensor = self.agent.get_action(obs, deterministic=not training)
-            
+
             # 将PyTorch张量转换为numpy数组传递给环境
             if isinstance(action_tensor, torch.Tensor):
                 action = action_tensor.detach().cpu().numpy()
@@ -412,7 +507,7 @@ class RLTrainer:
         else:
             # 大量episode时每20个记录一次
             log_frequency = 20
-            
+
         if episode % log_frequency == 0:
             recent_stats = self.metrics.get_recent_statistics(window=min(10, episode))
 
@@ -456,6 +551,13 @@ class RLTrainer:
                 temperature_loss=update_info.get('temperature_loss', 0.0)
             )
 
+            # 回撤监控和自适应参数调整
+            if self.config.enable_drawdown_monitoring:
+                self._monitor_drawdown(episode_reward, episode)
+
+            if self.adaptive_learning_enabled:
+                self._adapt_training_parameters(episode_reward, episode)
+
             # 记录日志
             self._log_episode_stats(episode, episode_reward, episode_length, update_info)
 
@@ -466,7 +568,14 @@ class RLTrainer:
 
                 # 早停检查
                 if self.early_stopping.step(validation_score):
-                    logger.info(f"触发早停，episode: {episode}")
+                    logger.info(f"触发性能早停，episode: {episode}")
+                    break
+
+                # 回撤早停检查（检查是否已经触发早停，不重复调用step）
+                if (self.drawdown_early_stopping and
+                    self.drawdown_early_stopping.early_stop):
+                    logger.info(f"触发回撤早停，episode: {episode}, "
+                              f"当前回撤: {self.drawdown_early_stopping.get_current_drawdown():.4f}")
                     break
 
                 # 更新最佳验证分数
@@ -517,3 +626,99 @@ class RLTrainer:
         logger.info(f"评估完成，平均奖励: {evaluation_stats['mean_reward']:.4f}")
         logger.debug(f"详细评估结果: {evaluation_stats}")
         return evaluation_stats
+
+    def _monitor_drawdown(self, episode_reward: float, episode: int):
+        """监控训练过程中的回撤"""
+        try:
+            # 计算累积奖励以跟踪回撤
+            if not hasattr(self, 'cumulative_reward'):
+                self.cumulative_reward = 0.0
+
+            self.cumulative_reward += episode_reward
+            
+            # 更新回撤早停状态（这会计算并更新回撤历史）
+            self.drawdown_early_stopping.step(self.cumulative_reward)
+            
+            # 获取更新后的当前回撤
+            current_drawdown = self.drawdown_early_stopping.get_current_drawdown()
+
+            self.drawdown_metrics.append({
+                'episode': episode,
+                'cumulative_reward': self.cumulative_reward,
+                'episode_reward': episode_reward,
+                'drawdown': current_drawdown
+            })
+
+            # 从环境获取回撤指标（如果环境支持）
+            if hasattr(self.environment, 'get_drawdown_metrics'):
+                env_metrics = self.environment.get_drawdown_metrics()
+                if env_metrics:
+                    self.drawdown_metrics[-1].update(env_metrics)
+
+            # 定期记录回撤信息
+            if episode % 50 == 0:
+                logger.info(f"Episode {episode}: 累积奖励 {self.cumulative_reward:.4f}, "
+                          f"训练回撤 {current_drawdown:.4f}")
+
+        except Exception as e:
+            logger.error(f"回撤监控失败: {e}")
+            raise RuntimeError(f"训练回撤监控出现错误: {e}") from e
+
+    def _adapt_training_parameters(self, episode_reward: float, episode: int):
+        """基于性能自适应调整训练参数"""
+        try:
+            self.performance_history.append(episode_reward)
+
+            # 只在有足够历史数据时进行调整
+            if len(self.performance_history) < 50:
+                return
+
+            # 计算最近性能
+            recent_performance = np.mean(self.performance_history[-20:])
+            long_term_performance = np.mean(self.performance_history[-50:])
+
+            # 自适应学习率调整
+            if self.config.enable_adaptive_learning:
+                if recent_performance < long_term_performance * 0.9:  # 性能下降
+                    self.current_lr_factor *= self.config.lr_adaptation_factor
+                    logger.info(f"Episode {episode}: 检测到性能下降，降低学习率因子到 {self.current_lr_factor:.4f}")
+                elif recent_performance > long_term_performance * 1.1:  # 性能提升
+                    self.current_lr_factor = min(1.0, self.current_lr_factor * 1.1)
+                    logger.info(f"Episode {episode}: 检测到性能提升，调整学习率因子到 {self.current_lr_factor:.4f}")
+
+            # 基于回撤的探索调整
+            if (self.config.exploration_decay_by_performance and
+                hasattr(self.agent, 'exploration_rate')):
+                if self.drawdown_early_stopping:
+                    current_drawdown = self.drawdown_early_stopping.get_current_drawdown()
+                    if current_drawdown > 0.2:  # 回撤较大时减少探索
+                        exploration_decay = 0.95
+                        self.agent.exploration_rate *= exploration_decay
+                        logger.info(f"Episode {episode}: 大回撤，减少探索率到 {self.agent.exploration_rate:.4f}")
+
+        except Exception as e:
+            logger.error(f"自适应参数调整失败: {e}")
+            raise RuntimeError(f"训练参数自适应调整出现错误: {e}") from e
+
+    def collect_drawdown_metrics(self) -> Dict[str, Any]:
+        """收集回撤指标"""
+        if not self.drawdown_metrics:
+            return {'drawdown_monitoring_enabled': False}
+
+        try:
+            drawdowns = [m['drawdown'] for m in self.drawdown_metrics]
+            cumulative_rewards = [m['cumulative_reward'] for m in self.drawdown_metrics]
+
+            return {
+                'drawdown_monitoring_enabled': True,
+                'max_training_drawdown': max(drawdowns) if drawdowns else 0.0,
+                'avg_training_drawdown': np.mean(drawdowns) if drawdowns else 0.0,
+                'final_cumulative_reward': cumulative_rewards[-1] if cumulative_rewards else 0.0,
+                'peak_cumulative_reward': max(cumulative_rewards) if cumulative_rewards else 0.0,
+                'drawdown_episodes': len([d for d in drawdowns if d > 0.1]),
+                'total_monitored_episodes': len(self.drawdown_metrics)
+            }
+
+        except Exception as e:
+            logger.error(f"收集回撤指标失败: {e}")
+            raise RuntimeError(f"回撤指标收集出现错误: {e}") from e

@@ -23,6 +23,7 @@ from rl_trading_system.training import RLTrainer, TrainingConfig, create_split_s
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer, DataProcessor
 from rl_trading_system.models import TimeSeriesTransformer, SACAgent, TransformerConfig, SACConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
+from rl_trading_system.backtest.drawdown_control_config import DrawdownControlConfig
 from rl_trading_system.utils.terminal_colors import (
     ColorFormatter, print_banner, print_section, print_model_recommendation,
     print_training_stats, print_evaluation_results
@@ -149,12 +150,31 @@ def create_training_components(model_config: dict, trading_config: dict, output_
 
     # 创建交易环境
     logger.debug("创建交易环境...")
+    
+    # 检查是否启用回撤控制
+    enable_drawdown_control = trading_config.get("drawdown_control", {}).get("enable", False)
+    drawdown_control_config = None
+    
+    if enable_drawdown_control:
+        logger.info("启用回撤控制功能")
+        # 从配置中创建回撤控制配置
+        drawdown_config_dict = trading_config.get("drawdown_control", {})
+        drawdown_control_config = DrawdownControlConfig(
+            max_drawdown_threshold=drawdown_config_dict.get("max_drawdown_threshold", 0.15),
+            drawdown_warning_threshold=drawdown_config_dict.get("drawdown_warning_threshold", 0.08),
+            enable_market_regime_detection=drawdown_config_dict.get("enable_market_regime_detection", True),
+            drawdown_penalty_factor=drawdown_config_dict.get("drawdown_penalty_factor", 2.0),
+            risk_aversion_coefficient=drawdown_config_dict.get("risk_aversion_coefficient", 0.5)
+        )
+    
     portfolio_config = PortfolioConfig(
         stock_pool=stock_pool,
         initial_cash=trading_env.get("initial_cash", 1000000.0),
         commission_rate=trading_env.get("commission_rate", 0.001),
         stamp_tax_rate=trading_env.get("stamp_tax_rate", 0.001),
-        max_position_size=trading_env.get("max_position_size", 0.1)
+        max_position_size=trading_env.get("max_position_size", 0.1),
+        enable_drawdown_control=enable_drawdown_control,
+        drawdown_control_config=drawdown_control_config
     )
 
     # Extract training data using indices
@@ -175,7 +195,12 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         validation_frequency=model_config["training"].get("eval_freq", 100),
         early_stopping_patience=model_config["training"].get("patience", 50),
         early_stopping_min_delta=model_config["training"].get("min_delta", 0.001),
-        save_dir=output_dir
+        save_dir=output_dir,
+        # 回撤控制训练参数
+        enable_drawdown_monitoring=enable_drawdown_control,
+        drawdown_early_stopping=enable_drawdown_control,
+        max_training_drawdown=trading_config.get("drawdown_control", {}).get("max_training_drawdown", 0.3),
+        enable_adaptive_learning=trading_config.get("drawdown_control", {}).get("enable_adaptive_learning", False)
     )
 
     return portfolio_env, sac_agent, data_split, training_config

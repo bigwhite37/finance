@@ -1,0 +1,49 @@
+# 交易配置文件（包含回撤控制）
+# 示例配置，展示如何启用回撤控制功能
+
+# 交易环境配置
+trading:
+  environment:
+    stock_pool: ["000001.SZ", "000002.SZ", "000858.SZ", "002415.SZ", "600519.SH"]
+    initial_cash: 1000000.0
+    commission_rate: 0.001
+    stamp_tax_rate: 0.001
+    max_position_size: 0.1
+
+# 回撤控制配置
+drawdown_control:
+  enable: true  # 启用回撤控制
+
+  # 基础回撤参数
+  max_drawdown_threshold: 0.15        # 最大回撤阈值 15%
+  drawdown_warning_threshold: 0.08    # 回撤警告阈值 8%
+
+  # 风险控制参数
+  drawdown_penalty_factor: 2.0        # 回撤惩罚因子
+  risk_aversion_coefficient: 0.5      # 风险厌恶系数
+
+  # 市场状态感知
+  enable_market_regime_detection: true  # 启用市场状态检测
+
+  # 训练相关参数
+  max_training_drawdown: 0.3          # 训练过程最大允许回撤
+  enable_adaptive_learning: true      # 启用自适应学习
+
+# 回测配置
+backtest:
+  start_date: "2022-01-01"
+  end_date: "2023-12-31"
+  initial_cash: 1000000
+  benchmark_symbols: ["000300.SH", "000905.SH"]
+
+# 数据配置
+data:
+  source: "qlib"
+  update_interval: 86400  # 1天更新一次
+
+# 风险管理配置
+risk:
+  enable_risk_control: true
+  max_portfolio_concentration: 0.4
+  max_single_position: 0.15
+  min_cash_ratio: 0.05
