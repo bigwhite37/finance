@@ -153,27 +153,22 @@ def create_training_components(model_config: dict, trading_config: dict, output_
 
     # 创建SAC配置，集成Transformer
     sac_config = SACConfig(
-        state_dim=transformer_config.d_model,  # 使用Transformer输出维度作为SAC状态维度
-        action_dim=model_config["model"]["sac"]["action_dim"],
-        hidden_dim=model_config["model"]["sac"]["hidden_dim"],
-        lr_actor=model_config["model"]["sac"]["lr_actor"],
-        lr_critic=model_config["model"]["sac"]["lr_critic"],
-        lr_alpha=model_config["model"]["sac"]["lr_alpha"],
+        learning_rate=model_config["model"]["sac"]["lr_actor"],  # 使用 actor 学习率作为通用学习率
         gamma=model_config["model"]["sac"]["gamma"],
         tau=model_config["model"]["sac"]["tau"],
-        alpha=model_config["model"]["sac"]["alpha"],
-        target_entropy=model_config["model"]["sac"]["target_entropy"],
-        buffer_capacity=model_config["model"]["sac"]["buffer_size"],
+        ent_coef='auto',  # 自动调整熵系数
+        target_entropy='auto',  # 自动设置目标熵
         batch_size=model_config["model"]["sac"]["batch_size"],
+        buffer_size=model_config["model"]["sac"]["buffer_size"],
+        learning_starts=1000,  # 开始学习的最小步数
+        net_arch=[model_config["model"]["sac"]["hidden_dim"]] * 2,  # 使用两层隐藏层
         use_transformer=True,  # 启用Transformer集成
-        transformer_config=transformer_config  # 传入Transformer配置
+        transformer_config=transformer_config,  # 传入Transformer配置
+        total_timesteps=model_config["training"]["n_episodes"] * 252,  # 估算总时间步数（n_episodes * 平均交易日）
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
 
-    # 创建模型（SAC智能体内部集成了Transformer）
-    logger.debug("初始化SAC智能体（集成Transformer）...")
-    sac_agent = SACAgent(sac_config)
-
-    # 创建交易环境
+    # 先创建交易环境
     logger.debug("创建交易环境...")
     
     # 检查是否启用回撤控制
@@ -212,6 +207,11 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         start_date=start_date,
         end_date=end_date
     )
+
+    # 创建SAC智能体（现在环境已经创建了）
+    logger.debug("初始化SAC智能体（集成Transformer）...")
+    sac_agent = SACAgent(sac_config, env=portfolio_env)
+    sac_agent.set_env(portfolio_env)
 
     # 创建增强训练配置
     training_config = EnhancedTrainingConfig(

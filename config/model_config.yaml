@@ -9,7 +9,7 @@ model:
     dropout: 0.1                # Dropout率，可通过 MODEL_TRANSFORMER_DROPOUT 覆盖
     max_seq_len: 252            # 最大序列长度（一年交易日），可通过 MODEL_TRANSFORMER_MAX_SEQ_LEN 覆盖
     n_features: 37              # 特征数量（每只股票37个特征），可通过 MODEL_TRANSFORMER_N_FEATURES 覆盖
-  
+
   sac:
     state_dim: 256              # 状态维度（Transformer输出维度），可通过 MODEL_SAC_STATE_DIM 覆盖
     action_dim: 3               # 动作维度（股票数量），可通过 MODEL_SAC_ACTION_DIM 覆盖
@@ -29,7 +29,7 @@ model:
     target_update_interval: 1
     automatic_entropy_tuning: true
     hidden_size: 256
-    
+
 training:
   n_episodes: 100  # 减少训练轮数用于测试
   eval_freq: 20

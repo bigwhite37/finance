@@ -33,7 +33,7 @@ from .replay_buffer import (
     ReplayBufferConfig,
     create_replay_buffer
 )
-from .sac_agent import SACAgent, SACConfig
+from .sac_agent import SACAgent, SACConfig, TransformerFeaturesExtractor
 
 __all__ = [
     # Transformer Components
@@ -55,5 +55,5 @@ __all__ = [
     "Actor", "ActorConfig",
     "Critic", "CriticConfig", "DoubleCritic", "CriticWithTargetNetwork",
     "Experience", "ReplayBuffer", "PrioritizedReplayBuffer", "ReplayBufferConfig", "create_replay_buffer",
-    "SACAgent", "SACConfig"
+    "SACAgent", "SACConfig", "TransformerFeaturesExtractor"
 ]

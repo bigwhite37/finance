@@ -85,42 +85,68 @@ model:
     max_seq_len: 60
     n_features: 37   # 每只股票的特征数（与已训练模型一致）
 
+  # SAC 配置 - 基于 stable_baselines3
   sac:
-    actor_lr: 0.0003
-    critic_lr: 0.0003
-    alpha_lr: 0.0003
-    lr_actor: 0.0003
-    lr_critic: 0.0003
-    lr_alpha: 0.0003
-    gamma: 0.99
-    tau: 0.005
-    alpha: 0.2
-    target_update_interval: 1
-    automatic_entropy_tuning: true
-    target_entropy: -3.0  # -action_dim
-    buffer_size: 100000
-    batch_size: 256
-    hidden_size: 256
-    hidden_dim: 256  # 隐藏层维度
-    state_dim: 128   # Transformer输出维度（与已训练模型一致）
-    action_dim: 3   # 3只股票
+    # 基础学习参数
+    lr_actor: 0.0003                # Actor 学习率（兼容性保留）
+    lr_critic: 0.0003               # Critic 学习率（兼容性保留）
+    lr_alpha: 0.0003                # Alpha 学习率（兼容性保留）
+    learning_rate: 0.0003           # SB3 统一学习率
+    
+    # SAC 算法参数
+    gamma: 0.99                     # 折扣因子
+    tau: 0.005                      # 软更新系数
+    ent_coef: "auto"                # 熵系数，"auto" 表示自动调整
+    target_entropy: "auto"          # 目标熵，"auto" 表示 -dim(action_space)
+    
+    # 训练参数
+    batch_size: 256                 # 批次大小
+    buffer_size: 100000             # 经验回放缓冲区大小
+    learning_starts: 1000           # 开始学习的最小步数
+    train_freq: 1                   # 训练频率
+    gradient_steps: 1               # 每次更新的梯度步数
+    target_update_interval: 1       # 目标网络更新间隔
+    
+    # 网络架构
+    hidden_dim: 256                 # 隐藏层维度
+    net_arch: [256, 256]           # 网络架构（两层 256 单元）
+    activation_fn: "relu"           # 激活函数
+    
+    # 兼容性参数（用于旧配置）
+    action_dim: 3                   # 动作维度（3只股票的权重）
+    state_dim: 128                  # 状态维度（Transformer输出维度）
+    
+    # SB3 特定参数
+    use_sde: false                  # 是否使用状态相关探索
+    sde_sample_freq: -1             # SDE 采样频率
+    use_sde_at_warmup: false        # 预热时是否使用 SDE
 
   training:
-    n_episodes: 100  # 减少训练轮数用于测试
-    eval_freq: 20
-    patience: 20
-    min_delta: 0.001
-
-    # 多核优化配置
-    enable_multiprocessing: true     # 启用多进程优化
-    num_workers: 10                   # 数据加载工作进程数
-    parallel_environments: 5        # 并行环境数量
-    data_loader_workers: 2           # DataLoader工作线程数
-    pin_memory: true                 # GPU内存固定
-    persistent_workers: true         # 持久化工作进程
-    prefetch_factor: 2               # 预取因子
-
+    # 训练轮数和评估
+    n_episodes: 100                 # 训练轮数（用于计算总时间步数）
+    total_timesteps: 25200          # 总训练时间步数 (100 episodes * 252 trading days)
+    eval_freq: 5000                 # 评估频率
+    n_eval_episodes: 10             # 评估时的回合数
+    save_freq: 10000                # 模型保存频率
+    
+    # 早停参数
+    patience: 20                    # 早停耐心
+    min_delta: 0.001                # 最小改进阈值
+    
+    # SB3 训练参数
+    verbose: 1                      # 详细程度
+    device: "auto"                  # 设备选择："auto", "cpu", "cuda"
+    
+    # 多核优化配置（部分在 SB3 中不直接适用，保留用于环境并行）
+    enable_multiprocessing: false   # SB3 内部处理并行，禁用外部多进程
+    num_workers: 4                  # 环境工作进程数
+    parallel_environments: 1       # 并行环境数量（SB3 使用 VecEnv）
+    data_loader_workers: 2          # DataLoader工作线程数
+    pin_memory: true                # GPU内存固定
+    persistent_workers: false       # 持久化工作进程
+    prefetch_factor: 2              # 预取因子
+    
     # GPU优化配置
-    enable_mixed_precision: true     # 启用混合精度训练
-    enable_cudnn_benchmark: true     # 启用cuDNN基准测试
-    non_blocking_transfer: true      # 非阻塞数据传输
+    enable_mixed_precision: false   # SB3 自动处理混合精度
+    enable_cudnn_benchmark: true    # 启用cuDNN基准测试
+    non_blocking_transfer: true     # 非阻塞数据传输
