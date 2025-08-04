@@ -14,87 +14,54 @@ import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecTransposeDict
 
 from .transformer import TimeSeriesTransformer, TransformerConfig
 
 
-class TrainingProgressCallback(BaseCallback):
-    """
-    自定义回调函数，用于显示训练过程中的统计信息
-    """
-    
-    def __init__(self, log_freq: int = 1000, verbose: int = 0):
-        super().__init__(verbose)
-        self.log_freq = log_freq
-        self.logger = logging.getLogger(__name__)
-        
-    def _on_step(self) -> bool:
-        """每步调用的回调"""
-        # 每隔log_freq步打印一次统计信息
-        if self.n_calls % self.log_freq == 0:
-            # 获取训练统计信息
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
-                # 从SB3的logger中获取统计信息
-                record = self.model.logger.name_to_value
-                
-                # 提取关键指标
-                stats = {}
-                if 'train/actor_loss' in record:
-                    stats['actor_loss'] = record['train/actor_loss']
-                if 'train/critic_loss' in record:
-                    stats['critic_loss'] = record['train/critic_loss']
-                if 'train/ent_coef' in record:
-                    stats['entropy_coef'] = record['train/ent_coef']
-                if 'train/ent_coef_loss' in record:
-                    stats['entropy_loss'] = record['train/ent_coef_loss']
-                if 'train/learning_rate' in record:
-                    stats['learning_rate'] = record['train/learning_rate']
-                
-                # 打印统计信息（不要太频繁）
-                if stats:
-                    stats_str = " | ".join([f"{k}: {v:.4f}" for k, v in stats.items()])
-                    self.logger.info(f"Step {self.n_calls}: {stats_str}")
-        
-        return True
-
 
 @dataclass
 class SACConfig:
-    """基于 Stable Baselines3 的 SAC 配置"""
-    # 学习率
-    learning_rate: float = 3e-4
+    """
+    基于 Stable Baselines3 的 SAC 配置
     
-    # SAC算法参数
-    gamma: float = 0.99          # 折扣因子
-    tau: float = 0.005           # 软更新系数
+    注意：核心参数（learning_rate, batch_size, buffer_size, gamma, tau）
+    现在由TrainingConfig统一管理，此配置类主要包含SAC特有参数
+    """
+    # === SAC特有算法参数 ===
     ent_coef: str = 'auto'       # 熵系数，'auto' 表示自动调整
     target_entropy: str = 'auto' # 目标熵，'auto' 表示 -dim(action_space)
     
-    # 训练参数
-    batch_size: int = 256
-    buffer_size: int = 1000000
+    # === SB3训练行为参数 ===
     learning_starts: int = 1000    # 开始学习的最小步数
     train_freq: int = 1           # 训练频率
     gradient_steps: int = 1       # 每次更新的梯度步数
     target_update_interval: int = 1 # 目标网络更新间隔
     
-    # 网络架构
+    # === 网络架构 ===
     net_arch: List[int] = field(default_factory=lambda: [256, 256])
     activation_fn: str = "relu"   # 激活函数类型
     
-    # 设备和其他
+    # === 设备和其他 ===
     device: str = 'auto'
     seed: Optional[int] = None
     verbose: int = 1
     
-    # 自定义特征提取器参数
+    # === 自定义特征提取器参数 ===
     use_transformer: bool = True
     transformer_config: Optional[TransformerConfig] = None
     
-    # 训练和评估相关
-    total_timesteps: int = 100000
-    eval_freq: int = 5000
-    n_eval_episodes: int = 10
+    # === 从TrainingConfig注入的参数（运行时设置，不设默认值） ===
+    # 这些参数将在创建时从TrainingConfig注入：
+    # - learning_rate
+    # - batch_size  
+    # - buffer_size
+    # - gamma
+    # - tau
+    # - total_timesteps
+    # - eval_freq
+    # - n_eval_episodes
     
     def get_activation_fn(self):
         """获取激活函数"""
@@ -113,12 +80,18 @@ class TransformerFeaturesExtractor(BaseFeaturesExtractor):
     基于 Transformer 的特征提取器，用于 Stable Baselines3
     """
     
-    def __init__(self, observation_space: gym.Space, transformer_config: TransformerConfig):
+    def __init__(self, observation_space: gym.Space, transformer_config: TransformerConfig, **kwargs):
         # 计算特征维度
         features_dim = transformer_config.d_model
         super().__init__(observation_space, features_dim)
         
         self.transformer = TimeSeriesTransformer(transformer_config)
+        
+        # 记录调试信息
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"初始化TransformerFeaturesExtractor: d_model={features_dim}, "
+                   f"观察空间={observation_space}")
         
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
@@ -163,18 +136,36 @@ class SACAgent:
     提供与原有接口兼容的 SAC 实现，内部使用 SB3 的 SAC 算法
     """
     
-    def __init__(self, config: SACConfig, env: gym.Env = None):
+    def __init__(self, config: SACConfig, env: Union[gym.Env, 'VecEnv'] = None, env_factory=None, n_envs: int = 1, 
+                 training_config=None):
+        """
+        初始化SAC智能体
+        
+        Args:
+            config: SACConfig配置
+            env: 环境实例
+            env_factory: 环境工厂函数
+            n_envs: 并行环境数量
+            training_config: TrainingConfig配置（用于注入统一参数）
+        """
         self.config = config
         self.env = env
+        self.env_factory = env_factory
+        self.n_envs = n_envs
         self.logger = logging.getLogger(__name__)
         
-        # 存储训练统计信息
+        # 从TrainingConfig注入参数（如果提供）
+        self.training_config = training_config
+        if training_config:
+            self._inject_training_params(training_config)
+        
+        # 存储训练统计信息（SB3兼容）
         self.training_step = 0
-        self.episode_count = 0
         self.total_env_steps = 0
         
         # SB3 模型（将在需要时创建）
         self._model = None
+        self._vec_env = None
         
         # 设置设备
         if config.device == 'auto':
@@ -182,7 +173,95 @@ class SACAgent:
         else:
             self.device = config.device
             
-    def _create_model(self, env: gym.Env) -> SAC:
+    def _inject_training_params(self, training_config):
+        """
+        从TrainingConfig注入统一管理的参数到SACConfig
+        
+        Args:
+            training_config: TrainingConfig实例
+        """
+        # 注入核心参数（以TrainingConfig为准）
+        self.learning_rate = training_config.learning_rate
+        self.batch_size = training_config.batch_size
+        self.buffer_size = training_config.buffer_size
+        self.gamma = training_config.gamma
+        self.tau = training_config.tau
+        self.total_timesteps = training_config.total_timesteps
+        self.eval_freq = training_config.eval_freq
+        self.n_eval_episodes = training_config.n_eval_episodes
+        
+        self.logger.info(f"已从TrainingConfig注入参数: lr={self.learning_rate}, "
+                        f"batch_size={self.batch_size}, buffer_size={self.buffer_size}")
+        self.logger.info(f"训练参数: total_timesteps={self.total_timesteps}, "
+                        f"eval_freq={self.eval_freq}, n_eval_episodes={self.n_eval_episodes}")
+            
+    def _create_vec_env(self):
+        """创建向量化环境"""
+        if self._vec_env is not None:
+            return self._vec_env
+            
+        if self.env is not None:
+            # 如果已有环境，检查是否为VecEnv
+            if hasattr(self.env, 'num_envs'):
+                # 已经是VecEnv
+                self._vec_env = self.env
+                self.n_envs = self.env.num_envs
+            else:
+                # 单环境，包装为DummyVecEnv
+                from stable_baselines3.common.vec_env import DummyVecEnv
+                self._vec_env = DummyVecEnv([lambda: self.env])
+                self.n_envs = 1
+        elif self.env_factory is not None:
+            # 首先检查env_factory是否返回VecEnv（带异常处理）
+            try:
+                test_env = self.env_factory()
+                if hasattr(test_env, 'num_envs'):
+                    # env_factory返回的已经是VecEnv，直接使用
+                    self.logger.info("env_factory返回VecEnv，直接使用而不重复包装")
+                    self._vec_env = test_env
+                    self.n_envs = test_env.num_envs
+                else:
+                    # env_factory返回普通环境，需要向量化包装
+                    if self.n_envs > 1:
+                        # 包装环境工厂以增强异常追踪
+                        def safe_env_factory():
+                            try:
+                                return self.env_factory()
+                            except Exception as e:
+                                import traceback
+                                self.logger.error(f"环境工厂创建环境失败: {e}")
+                                self.logger.error(f"完整traceback: {traceback.format_exc()}")
+                                raise RuntimeError(f"环境工厂创建环境失败: {e}") from e
+                        
+                        self._vec_env = make_vec_env(
+                            safe_env_factory,
+                            n_envs=self.n_envs,
+                            vec_env_cls=SubprocVecEnv,
+                            vec_env_kwargs={'start_method': 'spawn'}  # 兼容性设置
+                        )
+                    else:
+                        self._vec_env = make_vec_env(
+                            self.env_factory,
+                            n_envs=1,
+                            vec_env_cls=DummyVecEnv
+                        )
+            except Exception as e:
+                import traceback
+                self.logger.error(f"环境工厂测试失败: {e}")
+                self.logger.error(f"完整traceback: {traceback.format_exc()}")
+                raise RuntimeError(f"环境工厂测试失败，无法创建向量化环境: {e}") from e
+        else:
+            raise ValueError("需要提供env或env_factory参数")
+            
+        # 检查是否需要VecTransposeDict包装
+        if hasattr(self._vec_env.observation_space, 'spaces'):
+            self._vec_env = VecTransposeDict(self._vec_env)
+            self.logger.info("已应用VecTransposeDict包装器")
+            
+        self.logger.info(f"创建了{self.n_envs}个并行环境")
+        return self._vec_env
+        
+    def _create_model(self, vec_env) -> SAC:
         """创建 SB3 SAC 模型"""
         # 准备策略参数
         policy_kwargs = {
@@ -198,30 +277,36 @@ class SACAgent:
             }
         
         # 检查观察空间类型，选择合适的策略
-        if hasattr(env.observation_space, 'spaces'):
+        if hasattr(vec_env.observation_space, 'spaces'):
             # 字典观察空间
             policy_type = "MultiInputPolicy"
         else:
             # 普通观察空间
             policy_type = "MlpPolicy"
         
-        # 创建 SAC 模型
+        # 使用注入的参数或默认值创建 SAC 模型
+        learning_rate = getattr(self, 'learning_rate', 3e-4)
+        buffer_size = getattr(self, 'buffer_size', 1000000)
+        batch_size = getattr(self, 'batch_size', 256)
+        gamma = getattr(self, 'gamma', 0.99)
+        tau = getattr(self, 'tau', 0.005)
+        
         model = SAC(
             policy=policy_type,
-            env=env,
-            learning_rate=self.config.learning_rate,
-            buffer_size=self.config.buffer_size,
+            env=vec_env,
+            learning_rate=learning_rate,
+            buffer_size=buffer_size,
             learning_starts=self.config.learning_starts,
-            batch_size=self.config.batch_size,
-            tau=self.config.tau,
-            gamma=self.config.gamma,
+            batch_size=batch_size,
+            tau=tau,
+            gamma=gamma,
             train_freq=self.config.train_freq,
             gradient_steps=self.config.gradient_steps,
             target_update_interval=self.config.target_update_interval,
             ent_coef=self.config.ent_coef,
             target_entropy=self.config.target_entropy,
             policy_kwargs=policy_kwargs,
-            verbose=1,  # 启用详细输出
+            verbose=self.config.verbose,
             seed=self.config.seed,
             device=self.device
         )
@@ -232,19 +317,34 @@ class SACAgent:
     def model(self) -> SAC:
         """获取 SB3 模型实例"""
         if self._model is None:
-            if self.env is None:
-                raise RuntimeError("需要先设置环境或创建模型后才能访问")
-            self._model = self._create_model(self.env)
+            vec_env = self._create_vec_env()
+            self._model = self._create_model(vec_env)
         return self._model
         
-    def set_env(self, env: gym.Env):
+    @property
+    def vec_env(self):
+        """获取向量化环境"""
+        if self._vec_env is None:
+            self._create_vec_env()
+        return self._vec_env
+        
+    def set_env(self, env: Union[gym.Env, 'VecEnv'], env_factory=None, n_envs: int = None):
         """设置环境"""
         self.env = env
+        if env_factory is not None:
+            self.env_factory = env_factory
+        if n_envs is not None:
+            self.n_envs = n_envs
+            
+        # 重置向量化环境和模型
+        self._vec_env = None
         if self._model is not None:
-            self._model.set_env(env)
+            vec_env = self._create_vec_env()
+            self._model.set_env(vec_env)
         else:
             # 如果模型还没创建，现在创建它
-            self._model = self._create_model(env)
+            vec_env = self._create_vec_env()
+            self._model = self._create_model(vec_env)
             
     def get_action(self, state, deterministic: bool = False, return_log_prob: bool = False):
         """
@@ -293,20 +393,12 @@ class SACAgent:
             **kwargs: 其他参数
         """
         if total_timesteps is None:
-            total_timesteps = self.config.total_timesteps
+            # 使用注入的参数或默认值
+            total_timesteps = getattr(self, 'total_timesteps', 100000)
             
         self.logger.info(f"开始训练 SAC 模型，总步数: {total_timesteps}")
         
-        # 创建训练进度回调
-        # 设置合理的日志频率，避免打印太多
-        log_freq = max(1000, total_timesteps // 20)  # 最多打印20次，最少每1000步打印一次
-        callback = TrainingProgressCallback(log_freq=log_freq, verbose=1)
-        
-        # 如果用户没有提供回调，使用我们的回调
-        if 'callback' not in kwargs:
-            kwargs['callback'] = callback
-        
-        # 训练模型
+        # 训练模型（回调现在由trainer统一管理）
         self.model.learn(total_timesteps=total_timesteps, **kwargs)
         
         # 更新统计信息
@@ -380,10 +472,9 @@ class SACAgent:
     
     def update(self, **kwargs) -> Dict[str, float]:
         """
-        更新网络参数（兼容性包装）
+        更新网络参数（兼容性方法，推荐直接使用.learn()）
         
-        注意：SB3的训练是通过learn()方法进行的，这里我们执行少量训练步骤
-        并返回训练统计信息以保持与原有框架的兼容性
+        注意：SB3的训练应该通过learn()方法进行，这里保留以向后兼容
         """
         if self._model is None:
             return {}
@@ -392,61 +483,22 @@ class SACAgent:
         if not self.can_update():
             return {}
         
-        # 执行少量训练步骤（比如10步）来获取统计信息
-        try:
-            # 保存当前的训练步数
-            initial_timesteps = self.model.num_timesteps
-            
-            # 执行少量训练步骤
-            train_steps = min(10, self.config.gradient_steps)
-            self.model.learn(total_timesteps=train_steps, reset_num_timesteps=False)
-            
-            # 获取训练统计信息
-            stats = {}
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
-                record = self.model.logger.name_to_value
-                
-                # 提取关键指标
-                if 'train/actor_loss' in record:
-                    stats['actor_loss'] = float(record['train/actor_loss'])
-                if 'train/critic_loss' in record:
-                    stats['critic_loss'] = float(record['train/critic_loss'])
-                if 'train/ent_coef_loss' in record:
-                    stats['temperature_loss'] = float(record['train/ent_coef_loss'])
-                if 'train/ent_coef' in record:
-                    stats['entropy_coef'] = float(record['train/ent_coef'])
-                if 'train/learning_rate' in record:
-                    stats['learning_rate'] = float(record['train/learning_rate'])
-            
-            # 更新统计信息
-            self.total_env_steps = self.model.num_timesteps
-            self.training_step = self.model.num_timesteps
-            
-            # 如果有统计信息，偶尔打印一下（不要太频繁）
-            if stats and self.training_step % 500 == 0:
-                stats_str = " | ".join([f"{k}: {v:.4f}" for k, v in stats.items() if k in ['actor_loss', 'critic_loss', 'entropy_coef']])
-                if stats_str:
-                    self.logger.info(f"SAC训练步骤 {self.training_step}: {stats_str}")
-            
-            # 调试：打印所有可用的记录
-            if self.training_step % 100 == 0 and hasattr(self.model, 'logger') and self.model.logger is not None:
-                all_records = self.model.logger.name_to_value
-                if all_records:
-                    self.logger.info(f"SAC训练记录 (步骤 {self.training_step}): {list(all_records.keys())}")
-                    # 打印一些关键统计信息
-                    key_stats = {}
-                    for key in ['train/actor_loss', 'train/critic_loss', 'train/ent_coef', 'rollout/ep_rew_mean']:
-                        if key in all_records:
-                            key_stats[key] = all_records[key]
-                    if key_stats:
-                        stats_str = " | ".join([f"{k.split('/')[-1]}: {v:.4f}" for k, v in key_stats.items()])
-                        self.logger.info(f"SAC关键指标: {stats_str}")
-            
-            return stats
-            
-        except Exception as e:
-            self.logger.warning(f"SAC更新过程中出现错误: {e}")
-            return {}
+        # 简化版本：返回基本统计信息
+        self.total_env_steps = self.model.num_timesteps
+        self.training_step = self.model.num_timesteps
+        
+        # 从SB3 logger获取最新统计（如果可用）
+        stats = {}
+        if hasattr(self.model, 'logger') and self.model.logger is not None:
+            record = self.model.logger.name_to_value
+            if 'train/actor_loss' in record:
+                stats['actor_loss'] = float(record['train/actor_loss'])
+            if 'train/critic_loss' in record:
+                stats['critic_loss'] = float(record['train/critic_loss'])
+            if 'train/ent_coef' in record:
+                stats['entropy_coef'] = float(record['train/ent_coef'])
+        
+        return stats
     
     def get_training_stats(self) -> Dict[str, float]:
         """获取训练统计（兼容性方法）"""
@@ -486,7 +538,7 @@ class SACAgent:
     
     def encode_observation(self, obs, training: bool = False):
         """
-        编码观察（兼容性方法）
+        编码观察（兼容性方法，简化版本）
         
         Args:
             obs: 观察数据，可能是字典或张量
@@ -495,37 +547,9 @@ class SACAgent:
         Returns:
             torch.Tensor: 编码后的观察
         """
-        # 如果使用了Transformer特征提取器，这里应该通过它来编码
-        if self.config.use_transformer and self._model is not None:
-            # 获取特征提取器
-            if hasattr(self.model.policy, 'features_extractor'):
-                extractor = self.model.policy.features_extractor
-                if hasattr(extractor, 'transformer'):
-                    # 设置训练/评估模式
-                    if training:
-                        extractor.train()
-                    else:
-                        extractor.eval()
-                    
-                    # 处理观察数据
-                    if isinstance(obs, dict):
-                        features = obs['features']
-                    else:
-                        features = obs
-                    
-                    # 转换为torch张量
-                    if not isinstance(features, torch.Tensor):
-                        features = torch.from_numpy(features).float()
-                    
-                    # 通过特征提取器编码
-                    with torch.no_grad():
-                        encoded = extractor(features.unsqueeze(0) if features.dim() == 2 else features)
-                    
-                    return encoded.squeeze(0) if encoded.dim() > 1 else encoded
-        
-        # 默认处理：直接返回观察数据
+        # 简化处理：SB3会自动通过特征提取器处理观察
         if isinstance(obs, dict):
-            features = obs['features']
+            features = obs.get('features', obs)
         else:
             features = obs
             
@@ -538,18 +562,8 @@ class SACAgent:
         """
         添加经验到回放缓冲区（兼容性方法）
         
-        Args:
-            experience: Experience对象
-            
-        注意：SB3的SAC有自己的经验回放机制，这里主要是为了兼容性
+        注意：SB3会自动管理经验回放，这个方法主要用于向后兼容
         """
-        # SB3会自动管理经验回放，这里我们只需要确保模型存在
-        if self._model is None:
-            # 如果模型还没创建，先创建它
-            if self.env is None:
-                raise RuntimeError("需要先设置环境才能添加经验")
-            self._model = self._create_model(self.env)
-        
-        # SB3的经验添加是在learn()过程中自动进行的
-        # 这里我们可以记录一些统计信息
-        self.total_env_steps += 1
+        # SB3的经验回放是在.learn()过程中自动处理的
+        # 这里只是为了向后兼容，实际不需要手动添加经验
+        self.logger.debug("SB3会自动管理经验回放，无需手动添加")

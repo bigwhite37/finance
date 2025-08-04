@@ -150,20 +150,26 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         n_features=model_config["model"]["transformer"]["n_features"]
     )
 
-    # 创建SAC配置，集成Transformer
+    # 创建SAC配置，集成Transformer（使用SB3标准参数）
     sac_config = SACConfig(
-        learning_rate=model_config["model"]["sac"]["lr_actor"],  # 使用 actor 学习率作为通用学习率
+        learning_rate=model_config["model"]["sac"].get("learning_rate", 0.0003),
         gamma=model_config["model"]["sac"]["gamma"],
         tau=model_config["model"]["sac"]["tau"],
-        ent_coef='auto',  # 自动调整熵系数
-        target_entropy='auto',  # 自动设置目标熵
+        ent_coef=model_config["model"]["sac"].get("ent_coef", "auto"),
+        target_entropy=model_config["model"]["sac"].get("target_entropy", "auto"),
         batch_size=model_config["model"]["sac"]["batch_size"],
         buffer_size=model_config["model"]["sac"]["buffer_size"],
-        learning_starts=100,  # 开始学习的最小步数（降低以便更快开始学习）
-        net_arch=[model_config["model"]["sac"]["hidden_dim"]] * 2,  # 使用两层隐藏层
+        learning_starts=model_config["model"]["sac"].get("learning_starts", 1000),
+        train_freq=model_config["model"]["sac"].get("train_freq", 1),
+        gradient_steps=model_config["model"]["sac"].get("gradient_steps", 1),
+        target_update_interval=model_config["model"]["sac"].get("target_update_interval", 1),
+        net_arch=model_config["model"]["sac"].get("net_arch", [256, 256]),
+        activation_fn=model_config["model"]["sac"].get("activation_fn", "relu"),
         use_transformer=True,  # 启用Transformer集成
         transformer_config=transformer_config,  # 传入Transformer配置
-        total_timesteps=model_config["training"]["n_episodes"] * 252,  # 估算总时间步数（n_episodes * 平均交易日）
+        total_timesteps=model_config["model"]["training"].get("total_timesteps", model_config["training"]["n_episodes"] * 252),
+        eval_freq=model_config["model"]["training"].get("eval_freq", 5000),
+        n_eval_episodes=model_config["model"]["training"].get("n_eval_episodes", 10),
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
 
@@ -207,19 +213,39 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         end_date=end_date
     )
 
-    # 创建SAC智能体（现在环境已经创建了）
-    logger.debug("初始化SAC智能体（集成Transformer）...")
-    sac_agent = SACAgent(sac_config, env=portfolio_env)
-    sac_agent.set_env(portfolio_env)
-
-    # 创建训练配置
+    # 创建环境工厂函数（用于SB3 VecEnv）
+    def env_factory():
+        """环境工厂函数，用于创建环境实例"""
+        return PortfolioEnvironment(
+            config=portfolio_config,
+            data_interface=data_interface,
+            feature_engineer=feature_engineer,
+            start_date=start_date,
+            end_date=end_date
+        )
+    
+    # 获取并行环境数量
+    n_envs = model_config["model"]["training"].get("parallel_environments", 1)
+    
+    # 先创建训练配置（适配SB3参数）
     training_config = TrainingConfig(
+        # SB3核心参数
+        total_timesteps=model_config["model"]["training"].get("total_timesteps", model_config["training"]["n_episodes"] * 252),
+        n_envs=n_envs,
+        eval_freq=model_config["model"]["training"].get("eval_freq", 5000),
+        save_freq=model_config["model"]["training"].get("save_freq", 10000),
+        n_eval_episodes=model_config["model"]["training"].get("n_eval_episodes", 10),
+        
+        # 向后兼容参数
         n_episodes=model_config["training"]["n_episodes"],
         save_frequency=model_config["training"].get("eval_freq", 100),
         validation_frequency=model_config["training"].get("eval_freq", 100),
         early_stopping_patience=model_config["training"].get("patience", 50),
         early_stopping_min_delta=model_config["training"].get("min_delta", 0.001),
         save_dir=output_dir,
+        
+        # 奖励阈值（用于早停）
+        reward_threshold=model_config["model"]["training"].get("reward_threshold", None),
         
         # 增强指标配置
         enable_portfolio_metrics=trading_config.get("enhanced_metrics", {}).get("enable_portfolio_metrics", True),
@@ -258,7 +284,13 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         non_blocking_transfer=trading_config.get("model", {}).get("training", {}).get("non_blocking_transfer", True)
     )
 
-    return portfolio_env, sac_agent, data_split, training_config
+    # 创建SAC智能体（传入training_config以实现参数统一管理）
+    logger.debug(f"初始化SAC智能体（集成Transformer，{n_envs}个并行环境）...")
+    sac_agent = SACAgent(sac_config, env=portfolio_env, env_factory=env_factory, n_envs=n_envs, 
+                        training_config=training_config)
+
+    # 返回环境工厂函数以供训练器使用
+    return portfolio_env, sac_agent, data_split, training_config, env_factory
 
 
 def main():
@@ -347,23 +379,23 @@ def main():
         print()
 
         # 创建训练组件
-        environment, agent, data_split, training_config = create_training_components(
+        environment, agent, data_split, training_config, trainer_env_factory = create_training_components(
             model_config, trading_config, str(output_dir)
         )
 
         # 设置设备
         training_config.device = device
 
-        # 创建训练器
+        # 创建训练器（传递环境工厂函数）
         logger_instance.info("初始化训练器...")
-        trainer = RLTrainer(training_config, environment, agent, data_split)
+        trainer = RLTrainer(training_config, environment, agent, data_split, env_factory=trainer_env_factory)
 
         # 从检查点恢复（如果指定）
-        start_episode = 0
+        start_timesteps = 0
         if args.resume:
             if Path(args.resume).exists():
                 logger_instance.info(f"从检查点恢复训练: {args.resume}")
-                start_episode = trainer.load_checkpoint(args.resume)
+                start_timesteps = trainer.load_checkpoint(args.resume)
             else:
                 logger_instance.warning(f"检查点文件不存在: {args.resume}")
 
@@ -377,22 +409,22 @@ def main():
         # 输出训练统计
         print_training_stats(training_stats, formatter)
 
-        # 运行最终评估
+        # 运行最终评估（注意：SB3的评估主要通过EvalCallback自动进行）
         print_section("📊 最终评估", formatter)
-        print(f"  {formatter.info('正在运行模型评估...')}")
-        evaluation_stats = trainer.evaluate(n_episodes=20)
+        print(f"  {formatter.info('评估已通过SB3的EvalCallback自动完成')}")
+        evaluation_stats = trainer.evaluate()  # 简化调用，不再指定episodes
 
         # 输出评估结果
         print_evaluation_results(evaluation_stats, formatter)
 
-        # 显示模型保存信息和使用建议
+        # 显示模型保存信息和使用建议（SB3模型路径）
         model_paths = {
-            'final_model': str(output_dir / "final_model_agent.pth"),
+            'final_model': str(output_dir / "final_model"),  # SB3模型不用.pth后缀
         }
         
-        # 检查是否有最佳模型
-        best_model_path = output_dir / "best_model_agent.pth"
-        if best_model_path.exists():
+        # 检查是否有最佳模型（SB3 EvalCallback保存的最佳模型）
+        best_model_path = output_dir / "best_model"
+        if best_model_path.with_suffix('.zip').exists():  # SB3用.zip格式
             model_paths['best_model'] = str(best_model_path)
         
         print_model_recommendation(model_paths, formatter)

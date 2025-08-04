@@ -9,7 +9,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, Dataset
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional, Union
 from dataclasses import dataclass, field
@@ -18,11 +17,73 @@ import pickle
 from pathlib import Path
 import time
 import multiprocessing
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 from .data_split_strategy import SplitResult
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnRewardThreshold, BaseCallback
+import os
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 logger = logging.getLogger(__name__)
+
+
+class TrainingProgressCallback(BaseCallback):
+    """
+    改进的训练进度回调函数
+    
+    修复问题：
+    1. 使用model.num_timesteps替代n_calls（如sb3.md建议）
+    2. 添加多进程rank判断避免重复日志
+    3. 考虑多环境下的步数调整
+    """
+    
+    def __init__(self, log_freq: int = 1000, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.logger = logging.getLogger(__name__)
+        self.last_logged_timestep = 0
+        
+        # 获取当前进程rank（用于多进程环境）
+        self.rank = os.environ.get('RANK', '0')
+        self.is_main_process = self.rank == '0' or self.rank == 0
+        
+    def _on_step(self) -> bool:
+        """每步调用的回调"""
+        # 只在主进程中记录日志
+        if not self.is_main_process:
+            return True
+            
+        # 使用model.num_timesteps而不是n_calls（如sb3.md建议）
+        current_timesteps = self.model.num_timesteps
+        
+        # 每隔log_freq个timesteps打印一次统计信息  
+        if current_timesteps - self.last_logged_timestep >= self.log_freq:
+            self.last_logged_timestep = current_timesteps
+            
+            # 获取训练统计信息
+            if hasattr(self.model, 'logger') and self.model.logger is not None:
+                # 从SB3的logger中获取统计信息
+                record = self.model.logger.name_to_value
+                
+                # 提取关键指标
+                stats = {}
+                if 'train/actor_loss' in record:
+                    stats['actor_loss'] = record['train/actor_loss']
+                if 'train/critic_loss' in record:
+                    stats['critic_loss'] = record['train/critic_loss']
+                if 'train/ent_coef' in record:
+                    stats['entropy_coef'] = record['train/ent_coef']
+                if 'train/ent_coef_loss' in record:
+                    stats['entropy_loss'] = record['train/ent_coef_loss']
+                if 'train/learning_rate' in record:
+                    stats['learning_rate'] = record['train/learning_rate']
+                
+                # 打印统计信息
+                if stats:
+                    stats_str = " | ".join([f"{k}: {v:.4f}" for k, v in stats.items()])
+                    self.logger.info(f"Timestep {current_timesteps}: {stats_str}")
+        
+        return True
 
 # 尝试导入增强指标模块，如果不存在则跳过
 try:
@@ -38,127 +99,62 @@ except ImportError:
     ENHANCED_METRICS_AVAILABLE = False
 
 
-class ExperienceDataset(Dataset):
-    """经验回放数据集，支持多进程加载"""
-    
-    def __init__(self, experiences: List[Tuple], transform=None):
-        """
-        初始化数据集
-        
-        Args:
-            experiences: 经验数据列表 [(state, action, reward, next_state, done), ...]
-            transform: 可选的数据转换函数
-        """
-        self.experiences = experiences
-        self.transform = transform
-    
-    def __len__(self):
-        return len(self.experiences)
-    
-    def __getitem__(self, idx):
-        experience = self.experiences[idx]
-        
-        if self.transform:
-            experience = self.transform(experience)
-        
-        return experience
 
 
-class ParallelEnvironmentManager:
-    """并行环境管理器"""
-    
-    def __init__(self, env_factory, num_envs: int = 4):
-        """
-        初始化并行环境管理器
-        
-        Args:
-            env_factory: 环境工厂函数
-            num_envs: 并行环境数量
-        """
-        self.env_factory = env_factory
-        self.num_envs = num_envs
-        self.envs = []
-        self.executor = None
-    
-    def _create_env(self):
-        """创建单个环境实例"""
-        return self.env_factory()
-    
-    def initialize(self):
-        """初始化并行环境"""
-        logger.info(f"初始化 {self.num_envs} 个并行环境...")
-        
-        # 使用进程池创建环境
-        with ProcessPoolExecutor(max_workers=self.num_envs) as executor:
-            futures = [executor.submit(self._create_env) for _ in range(self.num_envs)]
-            self.envs = [future.result() for future in futures]
-        
-        logger.info(f"并行环境初始化完成")
-    
-    def reset_all(self):
-        """重置所有环境"""
-        if not self.envs:
-            raise RuntimeError("环境未初始化")
-        
-        with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
-            futures = [executor.submit(env.reset) for env in self.envs]
-            states = [future.result() for future in futures]
-        
-        return states
-    
-    def step_all(self, actions):
-        """并行执行所有环境的step操作"""
-        if not self.envs:
-            raise RuntimeError("环境未初始化")
-        
-        if len(actions) != len(self.envs):
-            raise ValueError(f"actions数量 {len(actions)} 与环境数量 {len(self.envs)} 不匹配")
-        
-        with ThreadPoolExecutor(max_workers=self.num_envs) as executor:
-            futures = [executor.submit(env.step, action) for env, action in zip(self.envs, actions)]
-            results = [future.result() for future in futures]
-        
-        return results
-    
-    def close(self):
-        """关闭所有环境"""
-        for env in self.envs:
-            if hasattr(env, 'close'):
-                env.close()
-        self.envs.clear()
 
 
 @dataclass
 class TrainingConfig:
-    """训练配置"""
+    """
+    训练配置 - 作为配置优先级的主配置类
+    
+    配置优先级：
+    1. TrainingConfig中的参数（最高优先级）
+    2. SACConfig中的参数（如果TrainingConfig中没有对应参数）
+    3. 默认值（最低优先级）
+    
+    注意：重复字段将从SACConfig中移除，由此类统一管理
+    """
+    # === SB3核心参数（高优先级统一管理） ===
+    total_timesteps: int = 1000000  # 总训练步数
+    n_envs: int = 1  # 并行环境数量
+    batch_size: int = 256           # 批次大小
+    learning_rate: float = 3e-4     # 学习率
+    buffer_size: int = 1000000      # 经验回放缓冲区大小
+    
+    # === SAC算法参数 ===
+    gamma: float = 0.99  # 折扣因子
+    tau: float = 0.005   # 软更新参数
+
+    # === SB3回调频率（timesteps单位） ===
+    eval_freq: int = 10000          # 评估频率（以timesteps计）
+    save_freq: int = 50000          # 保存频率（以timesteps计）
+    n_eval_episodes: int = 5        # 评估时运行的episode数
+
+    # === 向后兼容的episode参数（用于计算total_timesteps） ===
     n_episodes: int = 5000
     max_steps_per_episode: int = 180  # 降低以匹配实际数据长度
-    batch_size: int = 256
-    learning_rate: float = 3e-4
-    buffer_size: int = 1000000
-    gamma: float = 0.99  # 折扣因子
-    tau: float = 0.005  # 软更新参数
-
-    # 验证和保存频率
+    
+    # 向后兼容的episode频率（将被转换为timestep频率）
     validation_frequency: int = 50
     save_frequency: int = 100
 
-    # 早停参数
-    early_stopping_patience: int = 20
+    # === 早停参数（timesteps单位） ===
+    early_stopping_patience: int = 20000    # 早停耐心（从episode转为timesteps）
     early_stopping_min_delta: float = 0.001
     early_stopping_mode: str = 'max'  # 'max' or 'min'
 
-    # 学习率调度
+    # === 学习率调度 ===
     lr_scheduler_step_size: int = 1000
     lr_scheduler_gamma: float = 0.95
 
-    # 梯度裁剪
+    # === 梯度裁剪 ===
     gradient_clip_norm: Optional[float] = 1.0
 
-    # 训练稳定性
-    warmup_episodes: int = 1  # 降低以便测试时模型能立即开始学习
-    update_frequency: int = 1
-    target_update_frequency: int = 1
+    # === 已废弃字段（由SB3接管，保留仅为向后兼容） ===
+    warmup_episodes: int = 1  # DEPRECATED: SB3使用learning_starts
+    update_frequency: int = 1  # DEPRECATED: SB3使用train_freq
+    target_update_frequency: int = 1  # DEPRECATED: SB3使用target_update_interval
 
     # 保存路径
     save_dir: str = "./checkpoints"
@@ -185,36 +181,39 @@ class TrainingConfig:
     performance_threshold_up: float = 1.15     # 性能提升阈值（更严格）
     batch_size_adaptation: bool = False        # 批次大小自适应
     exploration_decay_by_performance: bool = False  # 基于性能的探索衰减
-    
-    # 多核并行优化参数
+
+    # 多核并行优化参数（保留以向后兼容）
     enable_multiprocessing: bool = True            # 启用多进程优化
     num_workers: int = field(default_factory=lambda: min(8, multiprocessing.cpu_count()))  # 数据加载工作进程数
-    parallel_environments: int = field(default_factory=lambda: min(4, multiprocessing.cpu_count() // 2))  # 并行环境数量
+    parallel_environments: int = field(default_factory=lambda: min(4, multiprocessing.cpu_count() // 2))  # 并行环境数量（已迁移到n_envs）
     data_loader_workers: int = field(default_factory=lambda: min(4, multiprocessing.cpu_count() // 2))    # DataLoader工作线程数
     pin_memory: bool = True                        # GPU内存固定
     persistent_workers: bool = True                # 持久化工作进程
     prefetch_factor: int = 2                       # 预取因子
-    
+
+    # 奖励阈值（用于早停）
+    reward_threshold: Optional[float] = None       # 奖励阈值，达到时停止训练
+
     # GPU优化参数
-    enable_mixed_precision: bool = True           # 启用混合精度训练
-    enable_cudnn_benchmark: bool = True           # 启用cuDNN基准测试
-    non_blocking_transfer: bool = True            # 非阻塞数据传输
+    enable_mixed_precision: bool = False         # DEPRECATED: SB3 >= 2.2会自动处理混合精度，手动启用可能冲突
+    enable_cudnn_benchmark: bool = True          # 启用cuDNN基准测试
+    non_blocking_transfer: bool = True           # 非阻塞数据传输
 
     # 增强指标配置
     enable_portfolio_metrics: bool = True          # 启用投资组合指标计算
     enable_agent_behavior_metrics: bool = True     # 启用智能体行为指标计算
     enable_risk_control_metrics: bool = True       # 启用风险控制指标计算
-    
-    # 指标计算频率
-    metrics_calculation_frequency: int = 20        # 每N个episode计算一次指标
-    
+
+    # 指标计算频率（timesteps单位）
+    metrics_calculation_frequency: int = 3600      # 每N个timesteps计算一次指标（从episode换算）
+
     # 基准数据配置
     benchmark_data_path: Optional[str] = None      # 基准数据路径
     risk_free_rate: float = 0.03                   # 无风险利率
-    
+
     # 环境配置（用于指标计算的默认值）
     initial_cash: float = 1000000.0                # 初始资金（用于指标计算默认值）
-    
+
     # 日志配置
     detailed_metrics_logging: bool = True          # 详细指标日志
     metrics_log_level: str = 'INFO'                # 指标日志级别
@@ -235,26 +234,51 @@ class TrainingConfig:
 
         if self.early_stopping_mode not in ['max', 'min']:
             raise ValueError("early_stopping_mode必须是'max'或'min'")
-        
+
+        # 自动计算total_timesteps（如果未设置或为0）
+        if self.total_timesteps == 1000000 or self.total_timesteps == 0:  # 使用默认值或占位符
+            self.total_timesteps = self.n_episodes * self.max_steps_per_episode * self.n_envs
+
+        # 自动计算SB3回调频率（从episode转换为timesteps）
+        if self.eval_freq == 10000:
+            self.eval_freq = self.validation_frequency * self.max_steps_per_episode * self.n_envs
+        if self.save_freq == 50000:
+            self.save_freq = self.save_frequency * self.max_steps_per_episode * self.n_envs
+            
+        # 转换早停耐心从episode到timesteps（如果使用默认值）
+        if self.early_stopping_patience == 20000:  # 新的默认值
+            # 基于原始episode的early_stopping_patience计算
+            episode_patience = 20  # 原始的episode耐心
+            self.early_stopping_patience = episode_patience * self.max_steps_per_episode * self.n_envs
+            
+        # 转换指标计算频率从episode到timesteps（如果使用默认值）  
+        if self.metrics_calculation_frequency == 3600:  # 新的默认值
+            # 基于原始episode的metrics_calculation_frequency计算
+            episode_freq = 20  # 原始的episode频率
+            self.metrics_calculation_frequency = episode_freq * self.max_steps_per_episode * self.n_envs
+            
+        # 检查废弃字段的使用并发出警告
+        self._check_deprecated_fields()
+
         if self.min_lr_factor <= 0 or self.min_lr_factor >= self.max_lr_factor:
             raise ValueError("min_lr_factor必须大于0且小于max_lr_factor")
-        
+
         if self.lr_recovery_factor <= 1.0:
             raise ValueError("lr_recovery_factor必须大于1.0")
-        
+
         if self.performance_threshold_down >= 1.0 or self.performance_threshold_up <= 1.0:
             raise ValueError("performance_threshold_down必须小于1.0，performance_threshold_up必须大于1.0")
-        
+
         # 多核配置验证
         if self.num_workers < 0:
             raise ValueError("num_workers必须为非负数")
-        
+
         if self.parallel_environments < 1:
             raise ValueError("parallel_environments必须为正数")
-        
+
         if self.data_loader_workers < 0:
             raise ValueError("data_loader_workers必须为非负数")
-        
+
         # 自动调整多核配置以避免资源过度使用
         max_workers = multiprocessing.cpu_count()
         if self.num_workers > max_workers:
@@ -262,15 +286,59 @@ class TrainingConfig:
         if self.parallel_environments > max_workers:
             self.parallel_environments = max_workers
 
+        # 同步n_envs与parallel_environments
+        if self.n_envs == 1 and self.parallel_environments > 1:
+            self.n_envs = self.parallel_environments
+
         # 增强指标配置验证
         if self.metrics_calculation_frequency <= 0:
             raise ValueError("metrics_calculation_frequency必须为正数")
-        
+
         if self.enable_portfolio_metrics and self.benchmark_data_path == "":
             raise ValueError("启用投资组合指标时，benchmark_data_path不能为空")
-        
+
         if self.risk_free_rate < 0:
             raise ValueError("risk_free_rate不能为负数")
+            
+    def _check_deprecated_fields(self):
+        """检查废弃字段的使用并发出警告"""
+        import warnings
+        
+        # 检查warmup_episodes（现在使用learning_starts）
+        if self.warmup_episodes != 1:  # 非默认值
+            warnings.warn(
+                f"warmup_episodes已废弃，请使用SACConfig.learning_starts。"
+                f"当前值：{self.warmup_episodes}",
+                DeprecationWarning,
+                stacklevel=3
+            )
+            
+        # 检查update_frequency（现在使用train_freq）
+        if self.update_frequency != 1:  # 非默认值
+            warnings.warn(
+                f"update_frequency已废弃，请使用SACConfig.train_freq。"
+                f"当前值：{self.update_frequency}",
+                DeprecationWarning,
+                stacklevel=3
+            )
+            
+        # 检查target_update_frequency（现在使用target_update_interval）
+        if self.target_update_frequency != 1:  # 非默认值
+            warnings.warn(
+                f"target_update_frequency已废弃，请使用SACConfig.target_update_interval。"
+                f"当前值：{self.target_update_frequency}",
+                DeprecationWarning,
+                stacklevel=3
+            )
+            
+        # 检查enable_mixed_precision（现在由SB3自动处理）
+        if self.enable_mixed_precision:
+            warnings.warn(
+                "enable_mixed_precision已废弃，SB3 >= 2.2会自动处理混合精度训练。"
+                "手动启用可能导致冲突，建议设置为False。",
+                DeprecationWarning,
+                stacklevel=3
+            )
 
 
 class EarlyStopping:
@@ -330,8 +398,57 @@ class EarlyStopping:
         self.early_stop = False
 
 
+class DrawdownEarlyStoppingCallback(BaseCallback):
+    """基于回撤的早停回调"""
+
+    def __init__(self, max_drawdown: float = 0.3, patience: int = 10, verbose: int = 0):
+        super().__init__(verbose)
+        self.max_drawdown = max_drawdown
+        self.patience = patience
+        self.peak_value = None
+        self.counter = 0
+        self.drawdown_history = []
+
+    def _on_step(self) -> bool:
+        """每步检查回撤"""
+        # 从环境获取投资组合价值
+        if hasattr(self.training_env, 'get_attr'):
+            try:
+                portfolio_values = self.training_env.get_attr('total_value')
+                if portfolio_values:
+                    current_value = portfolio_values[0]  # 第一个环境的值
+
+                    if self.peak_value is None:
+                        self.peak_value = current_value
+                        return True
+
+                    if current_value > self.peak_value:
+                        self.peak_value = current_value
+
+                    current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
+                    current_drawdown = max(current_drawdown, 0.0)
+
+                    self.drawdown_history.append(current_drawdown)
+
+                    if current_drawdown > self.max_drawdown:
+                        self.counter += 1
+                    else:
+                        self.counter = 0
+
+                    if self.counter >= self.patience:
+                        if self.verbose > 0:
+                            print(f"\n触发回撤早停: 当前回撤 {current_drawdown:.4f} > 阈值 {self.max_drawdown:.4f}")
+                        return False
+            except:
+                pass
+        return True
+
+    def get_current_drawdown(self) -> float:
+        return self.drawdown_history[-1] if self.drawdown_history else 0.0
+
+
 class DrawdownEarlyStopping:
-    """基于回撤的早停机制"""
+    """基于回撤的早停机制（兼容性类）"""
 
     def __init__(self, max_drawdown: float = 0.3, patience: int = 10):
         """
@@ -376,7 +493,7 @@ class DrawdownEarlyStopping:
         else:
             # 如果峰值为0或负数，无法计算有意义的回撤
             current_drawdown = 0.0
-        
+
         self.drawdown_history.append(current_drawdown)
 
         # 检查是否超过回撤阈值
@@ -404,69 +521,12 @@ class DrawdownEarlyStopping:
         self.drawdown_history = []
 
 
-class TrainingMetrics:
-    """训练指标收集器"""
-
-    def __init__(self):
-        self.episode_rewards: List[float] = []
-        self.episode_lengths: List[int] = []
-        self.actor_losses: List[float] = []
-        self.critic_losses: List[float] = []
-        self.temperature_losses: List[float] = []
-        self.validation_scores: List[float] = []
-        self.timestamps: List[datetime] = []
-
-    def add_episode_metrics(self, reward: float, length: int,
-                          actor_loss: float = 0.0, critic_loss: float = 0.0,
-                          temperature_loss: float = 0.0):
-        """添加episode指标"""
-        self.episode_rewards.append(reward)
-        self.episode_lengths.append(length)
-        self.actor_losses.append(actor_loss)
-        self.critic_losses.append(critic_loss)
-        self.temperature_losses.append(temperature_loss)
-        self.timestamps.append(datetime.now())
-
-    def add_validation_score(self, score: float):
-        """添加验证分数"""
-        self.validation_scores.append(score)
-
-    def get_statistics(self, window: Optional[int] = None) -> Dict[str, float]:
-        """获取统计信息"""
-        if len(self.episode_rewards) == 0:
-            return {}
-
-        if window is not None:
-            rewards = self.episode_rewards[-window:]
-            lengths = self.episode_lengths[-window:]
-            actor_losses = self.actor_losses[-window:]
-            critic_losses = self.critic_losses[-window:]
-        else:
-            rewards = self.episode_rewards
-            lengths = self.episode_lengths
-            actor_losses = self.actor_losses
-            critic_losses = self.critic_losses
-
-        return {
-            'mean_reward': np.mean(rewards),
-            'std_reward': np.std(rewards),
-            'min_reward': np.min(rewards),
-            'max_reward': np.max(rewards),
-            'mean_length': np.mean(lengths),
-            'mean_actor_loss': np.mean(actor_losses),
-            'mean_critic_loss': np.mean(critic_losses),
-            'total_episodes': len(self.episode_rewards)
-        }
-
-    def get_recent_statistics(self, window: int = 100) -> Dict[str, float]:
-        """获取最近window个episode的统计信息"""
-        return self.get_statistics(window=window)
 
 
 class RLTrainer:
     """强化学习训练器"""
 
-    def __init__(self, config: TrainingConfig, environment, agent, data_split: SplitResult):
+    def __init__(self, config: TrainingConfig, environment, agent, data_split: SplitResult, env_factory=None):
         """
         初始化训练器
 
@@ -475,28 +535,29 @@ class RLTrainer:
             environment: 交易环境
             agent: 强化学习智能体
             data_split: 数据划分结果
+            env_factory: 环境工厂函数（用于创建多个环境实例）
         """
         self.config = config
         self.environment = environment
         self.agent = agent
         self.data_split = data_split
+        self.env_factory = env_factory
 
-        # 初始化训练组件
-        self.metrics = TrainingMetrics()
+        # 初始化训练组件（SB3自带指标收集）
         self.early_stopping = EarlyStopping(
             patience=config.early_stopping_patience,
             min_delta=config.early_stopping_min_delta,
             mode=config.early_stopping_mode
         )
 
-        # 初始化回撤控制相关组件
+        # 初始化回撤控制相关组件（保留以向后兼容）
         if config.enable_drawdown_monitoring:
             self.drawdown_early_stopping = DrawdownEarlyStopping(
                 max_drawdown=config.max_training_drawdown,
                 patience=config.early_stopping_patience // 2  # 回撤早停耐心值更小
             )
             self.drawdown_metrics = []
-            logger.info("回撤监控已启用")
+            logger.info("回撤监控已启用（将通过SB3回调实现）")
         else:
             self.drawdown_early_stopping = None
             self.drawdown_metrics = []
@@ -509,22 +570,22 @@ class RLTrainer:
         # 初始化增强指标组件
         if ENHANCED_METRICS_AVAILABLE:
             self.metrics_calculator = PortfolioMetricsCalculator()
-            
+
             # 历史数据存储
             self.portfolio_values_history: List[float] = []
             self.benchmark_values_history: List[float] = []
             self.dates_history: List[datetime] = []
-            
+
             # 智能体行为数据
             self.entropy_history: List[float] = []
             self.position_weights_history: List[np.ndarray] = []
-            
+
             # 风险控制数据
             self.risk_budget_history: List[float] = []
             self.risk_usage_history: List[float] = []
             self.control_signals_history: List[Dict[str, Any]] = []
             self.market_regime_history: List[str] = []
-            
+
             logger.info(f"指标计算配置: 投资组合指标={config.enable_portfolio_metrics}, "
                        f"智能体行为指标={config.enable_agent_behavior_metrics}, "
                        f"风险控制指标={config.enable_risk_control_metrics}")
@@ -550,7 +611,7 @@ class RLTrainer:
 
         # 初始化学习率调度器（如果智能体支持）
         self._setup_lr_scheduler()
-        
+
         # 初始化多核优化组件
         self._setup_multicore_optimization()
 
@@ -570,7 +631,7 @@ class RLTrainer:
         # 在实际实现中，这里会设置PyTorch的学习率调度器
         # 由于使用模拟智能体，这里只是占位符
         self.lr_scheduler = None
-    
+
     def _setup_multicore_optimization(self):
         """设置多核优化"""
         if not self.config.enable_multiprocessing:
@@ -578,48 +639,28 @@ class RLTrainer:
             self.parallel_env_manager = None
             self.data_loader = None
             return
-        
+
         logger.info(f"配置多核优化: {self.config.num_workers} 个数据工作进程, "
                    f"{self.config.parallel_environments} 个并行环境")
-        
+
         # 设置PyTorch多进程上下文
         try:
             mp.set_start_method('spawn', force=True)
         except RuntimeError:
             # 如果已经设置了start method，忽略错误
             pass
-        
+
         # 设置cuDNN基准测试（如果启用GPU优化）
         if self.config.enable_cudnn_benchmark and torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN基准测试已启用")
-        
-        # 初始化混合精度训练
-        if self.config.enable_mixed_precision and torch.cuda.is_available():
-            self.scaler = torch.cuda.amp.GradScaler()
-            logger.info("混合精度训练已启用")
-        else:
-            self.scaler = None
-        
-        # 初始化并行环境管理器（如果配置了多个环境）
-        if self.config.parallel_environments > 1:
-            # 创建环境工厂函数
-            def env_factory():
-                # 这里需要根据实际环境类型创建副本
-                # 暂时使用占位符，在实际使用时需要提供合适的环境复制机制
-                return self.environment
-            
-            self.parallel_env_manager = ParallelEnvironmentManager(
-                env_factory, 
-                self.config.parallel_environments
-            )
-            logger.info(f"并行环境管理器已初始化，{self.config.parallel_environments} 个环境")
-        else:
-            self.parallel_env_manager = None
-        
-        # 预分配经验数据集和DataLoader（在实际训练中使用）
-        self.experience_dataset = None
-        self.data_loader = None
+
+        # 混合精度现在由SB3自动处理，无需手动初始化
+        if self.config.enable_mixed_precision:
+            logger.warning("enable_mixed_precision已启用但将被忽略，SB3会自动处理混合精度")
+
+        # SB3的VecEnv会自动处理并行环境
+        logger.info(f"将使用SB3 VecEnv处理{self.config.parallel_environments}个并行环境")
 
     def _get_current_learning_rate(self, episode: int) -> float:
         """获取当前学习率"""
@@ -630,116 +671,12 @@ class RLTrainer:
         decay_factor = decay_rate ** (episode // decay_steps)
         return self.config.learning_rate * decay_factor
 
-    def _run_episode(self, episode_num: int, training: bool = True) -> Tuple[float, int]:
-        """
-        运行单个episode
 
-        Args:
-            episode_num: episode编号
-            training: 是否为训练模式
-
-        Returns:
-            Tuple[float, int]: episode奖励和长度
-        """
-        if training:
-            self.agent.train()
-        else:
-            self.agent.eval()
-
-        obs = self.environment.reset()
-        episode_reward = 0.0
-        episode_length = 0
-
-        for step in range(self.config.max_steps_per_episode):
-            # 选择动作
-            action_tensor = self.agent.get_action(obs, deterministic=not training)
-
-            # 将PyTorch张量转换为numpy数组传递给环境
-            if isinstance(action_tensor, torch.Tensor):
-                action = action_tensor.detach().cpu().numpy()
-            else:
-                action = action_tensor
-
-            # 执行动作
-            next_obs, reward, done, info = self.environment.step(action)
-
-            episode_reward += reward
-            episode_length += 1
-
-            # 如果是训练模式，存储经验并更新智能体
-            if training and hasattr(self.agent, 'replay_buffer'):
-                # 创建经验对象并存储到回放缓冲区
-                from ..models.replay_buffer import Experience
-
-                # 将字典观察转换为编码张量（使用Transformer编码，推理模式）
-                if isinstance(obs, dict):
-                    state_tensor = self.agent.encode_observation(obs, training=False)
-                else:
-                    state_tensor = obs
-
-                if isinstance(next_obs, dict):
-                    next_state_tensor = self.agent.encode_observation(next_obs, training=False)
-                else:
-                    next_state_tensor = next_obs
-
-                experience = Experience(
-                    state=state_tensor,
-                    action=action_tensor,  # 使用原始张量而不是numpy数组
-                    reward=reward,
-                    next_state=next_state_tensor,
-                    done=done
-                )
-                self.agent.add_experience(experience)
-
-                # 调试日志：验证total_env_steps是否正确更新（降低频率）
-                if step % 100 == 0:  # 每100步记录一次
-                    logger.debug(f"Episode {episode_num}, Step {step}: total_env_steps = {self.agent.total_env_steps}, can_update = {self.agent.can_update()}")
-
-            obs = next_obs
-
-            if done:
-                break
-
-        # 如果是训练模式且到了指标计算频率，计算并记录增强指标
-        if training and self._should_calculate_metrics(episode_num):
-            self._calculate_and_log_enhanced_metrics(episode_num)
-
-        return episode_reward, episode_length
-
-    def _update_agent(self) -> Dict[str, float]:
-        """更新智能体参数"""
-        if hasattr(self.agent, 'update'):
-            return self.agent.update(update_actor=True)
-        return {}
-
-    def _validate(self) -> float:
-        """运行验证"""
-        logger.debug("开始验证...")
-
-        validation_rewards = []
-        n_validation_episodes = 5  # 运行5个验证episode
-
-        for _ in range(n_validation_episodes):
-            reward, _ = self._run_episode(episode_num=-1, training=False)
-            validation_rewards.append(reward)
-
-        validation_score = np.mean(validation_rewards)
-        validation_std = np.std(validation_rewards)
-        
-        # 添加验证稳定性检查
-        if validation_std > validation_score * 0.5:  # 标准差超过均值50%
-            logger.warning(f"验证结果不稳定: 标准差 {validation_std:.4f} 过大，模型泛化能力可能不足")
-        
-        logger.info(f"验证完成，平均奖励: {validation_score:.4f}")
-
-        return validation_score
-
-    def save_checkpoint(self, filepath: str, episode: int):
-        """保存检查点"""
+    def save_checkpoint(self, filepath: str, timesteps: int):
+        """保存检查点（SB3兼容版本）"""
         checkpoint = {
-            'episode': episode,
+            'timesteps': timesteps,
             'config': self.config,
-            'metrics': self.metrics,
             'early_stopping_state': {
                 'best_score': self.early_stopping.best_score,
                 'counter': self.early_stopping.counter,
@@ -763,8 +700,7 @@ class RLTrainer:
         with open(filepath, 'rb') as f:
             checkpoint = pickle.load(f)
 
-        episode = checkpoint['episode']
-        self.metrics = checkpoint['metrics']
+        timesteps = checkpoint.get('timesteps', checkpoint.get('episode', 0))  # 向后兼容
 
         # 恢复早停状态
         early_stopping_state = checkpoint['early_stopping_state']
@@ -776,283 +712,171 @@ class RLTrainer:
         if 'agent_path' in checkpoint and hasattr(self.agent, 'load'):
             self.agent.load(checkpoint['agent_path'])
 
-        logger.debug(f"检查点已从 {filepath} 加载，episode: {episode}")
-        return episode
+        logger.debug(f"检查点已从 {filepath} 加载，timesteps: {timesteps}")
+        return timesteps
 
-    def _log_episode_stats(self, episode: int, reward: float, length: int,
-                          update_info: Dict[str, float]):
-        """记录episode统计信息"""
-        # 根据训练进度调整日志频率
-        if self.config.n_episodes <= 10:
-            # 少量episode时每个都记录
-            log_frequency = 1
-        elif self.config.n_episodes <= 100:
-            # 中等数量episode时每5个记录一次
-            log_frequency = 5
-        else:
-            # 大量episode时每20个记录一次
-            log_frequency = 20
 
-        if episode % log_frequency == 0:
-            recent_stats = self.metrics.get_recent_statistics(window=min(10, episode))
-
-            log_msg = (
-                f"Episode {episode:4d} | "
-                f"Reward: {reward:7.2f} | "
-                f"Length: {length:3d} | "
-                f"Avg Reward ({min(10, episode)}): {recent_stats.get('mean_reward', 0):7.2f}"
-            )
-
-            if update_info:
-                log_msg += (
-                    f" | Actor Loss: {update_info.get('actor_loss', 0):.4f}"
-                    f" | Critic Loss: {update_info.get('critic_loss', 0):.4f}"
-                )
-                
-                # 添加损失异常检测
-                actor_loss = update_info.get('actor_loss', 0)
-                critic_loss = update_info.get('critic_loss', 0)
-                
-                if abs(actor_loss) > 10.0:
-                    logger.warning(f"Actor损失异常: {actor_loss:.4f}, 可能存在梯度爆炸")
-                if critic_loss > 50.0:
-                    logger.warning(f"Critic损失过高: {critic_loss:.4f}, 学习可能不稳定")
-
-            logger.info(log_msg)
-            
-            # 添加训练稳定性检查
-            if episode >= 20:
-                reward_std = recent_stats.get('std_reward', 0)
-                mean_reward = recent_stats.get('mean_reward', 0)
-                if mean_reward != 0 and reward_std / abs(mean_reward) > 1.0:
-                    logger.warning(f"训练不稳定: 奖励方差过大 {reward_std:.2f}, 可能需要调整学习率")
-
-        # 更新增强指标历史数据
-        episode_info = {
-            'portfolio_value': getattr(self.environment, 'total_value', self.config.initial_cash),
-            'positions': getattr(self.environment, 'current_positions', np.zeros(5))
-        }
-        
-        self._update_metrics_histories(episode_info, update_info)
-
-    def _create_data_loader(self, experiences: List[Tuple]) -> DataLoader:
-        """创建支持多进程的数据加载器"""
-        if not experiences:
-            return None
-        
-        dataset = ExperienceDataset(experiences)
-        
-        # 配置DataLoader参数
-        dataloader_kwargs = {
-            'batch_size': self.config.batch_size,
-            'shuffle': True,
-            'pin_memory': self.config.pin_memory and torch.cuda.is_available(),
-            'prefetch_factor': self.config.prefetch_factor
-        }
-        
-        # 只有在多进程启用时才使用num_workers
-        if self.config.enable_multiprocessing and self.config.data_loader_workers > 0:
-            dataloader_kwargs.update({
-                'num_workers': self.config.data_loader_workers,
-                'persistent_workers': self.config.persistent_workers
-            })
-        
-        return DataLoader(dataset, **dataloader_kwargs)
-    
-    def _run_parallel_episodes(self, episode_nums: List[int]) -> List[Tuple[float, int]]:
-        """并行运行多个episodes"""
-        if not self.parallel_env_manager:
-            # 如果没有并行环境管理器，退回到顺序执行
-            return [self._run_episode(ep, training=True) for ep in episode_nums]
-        
-        try:
-            # 重置所有环境
-            states = self.parallel_env_manager.reset_all()
-            
-            results = []
-            for i, episode_num in enumerate(episode_nums):
-                # 这里需要根据实际的并行执行逻辑来实现
-                # 暂时使用简化版本
-                episode_reward, episode_length = self._run_episode(episode_num, training=True)
-                results.append((episode_reward, episode_length))
-            
-            return results
-        except Exception as e:
-            logger.warning(f"并行episode执行失败，退回到顺序执行: {e}")
-            return [self._run_episode(ep, training=True) for ep in episode_nums]
-    
-    def _update_agent_with_dataloader(self, dataloader: DataLoader) -> Dict[str, float]:
-        """使用DataLoader进行批量更新"""
-        if not dataloader:
-            return self._update_agent()
-        
-        total_losses = {'actor_loss': 0.0, 'critic_loss': 0.0, 'temperature_loss': 0.0}
-        batch_count = 0
-        
-        for batch_experiences in dataloader:
-            # 这里需要根据实际的智能体更新逻辑来实现
-            # 暂时使用简化版本
-            update_info = self._update_agent()
-            
-            for key in total_losses:
-                total_losses[key] += update_info.get(key, 0.0)
-            batch_count += 1
-        
-        # 计算平均损失
-        if batch_count > 0:
-            for key in total_losses:
-                total_losses[key] /= batch_count
-        
-        return total_losses
 
     def train(self):
-        """执行训练"""
-        logger.info(f"开始训练，总episodes: {self.config.n_episodes}")
-        logger.info(f"多核优化: {'启用' if self.config.enable_multiprocessing else '禁用'}")
-        if self.config.enable_multiprocessing:
-            logger.info(f"  - 数据工作进程: {self.config.num_workers}")
-            logger.info(f"  - 并行环境: {self.config.parallel_environments}")
-            logger.info(f"  - 混合精度: {'启用' if self.config.enable_mixed_precision else '禁用'}")
-
-        # 系统状态检查
-        if self.config.enable_drawdown_monitoring:
-            logger.info(f"回撤监控已启用: 最大回撤阈值 {self.config.max_training_drawdown:.3f}")
-        else:
-            logger.warning("回撤监控未启用，无法进行风险控制")
+        """执行训练 - 使用SB3的.learn()方法"""
+        logger.info(f"开始SB3训练，总步数: {self.config.total_timesteps}")
+        logger.info(f"并行环境数: {self.config.n_envs}")
 
         start_time = time.time()
-        best_validation_score = float('-inf') if self.config.early_stopping_mode == 'max' else float('inf')
 
-        for episode in range(1, self.config.n_episodes + 1):
-            # 运行训练episode
-            episode_reward, episode_length = self._run_episode(episode, training=True)
+        # 设置智能体的环境（如果还没设置）
+        if hasattr(self.agent, 'set_env'):
+            if self.env_factory and self.config.n_envs > 1:
+                # 使用环境工厂创建多环境
+                self.agent.set_env(None, env_factory=self.env_factory, n_envs=self.config.n_envs)
+            else:
+                # 使用单环境
+                self.agent.set_env(self.environment)
 
-            # 更新智能体（获取损失信息）
-            update_info = {}
-            if episode > self.config.warmup_episodes:
-                update_info = self._update_agent()
+        # 创建回调列表
+        callbacks = self._create_callbacks()
 
-            # 记录指标
-            self.metrics.add_episode_metrics(
-                reward=episode_reward,
-                length=episode_length,
-                actor_loss=update_info.get('actor_loss', 0.0),
-                critic_loss=update_info.get('critic_loss', 0.0),
-                temperature_loss=update_info.get('temperature_loss', 0.0)
+        # 执行SB3训练
+        try:
+            self.agent.learn(
+                total_timesteps=self.config.total_timesteps,
+                callback=callbacks,
+                log_interval=100,  # 每100次更新打印一次日志
+                reset_num_timesteps=True
             )
-
-            # 回撤监控和自适应参数调整
-            if self.config.enable_drawdown_monitoring:
-                self._monitor_drawdown(episode_reward, episode)
-
-            if self.adaptive_learning_enabled:
-                self._adapt_training_parameters(episode_reward, episode)
-
-            # 记录日志
-            self._log_episode_stats(episode, episode_reward, episode_length, update_info)
-
-            # 验证
-            if episode % self.config.validation_frequency == 0:
-                validation_score = self._validate()
-                self.metrics.add_validation_score(validation_score)
-                
-                # 添加训练-验证性能对比分析
-                recent_train_reward = np.mean(self.metrics.episode_rewards[-10:]) if len(self.metrics.episode_rewards) >= 10 else 0
-                if recent_train_reward > 0:
-                    performance_gap = abs(validation_score - recent_train_reward) / recent_train_reward
-                    if performance_gap > 0.2:  # 性能差异超过20%
-                        logger.warning(f"训练-验证性能差异过大: {performance_gap:.3f}, 可能存在过拟合")
-                    else:
-                        logger.info(f"模型泛化良好: 训练-验证性能差异 {performance_gap:.3f}")
-
-                # 早停检查
-                if self.early_stopping.step(validation_score):
-                    logger.info(f"触发性能早停，episode: {episode}")
-                    break
-
-                # 回撤早停检查（检查是否已经触发早停，不重复调用step）
-                if (self.drawdown_early_stopping and
-                    self.drawdown_early_stopping.early_stop):
-                    logger.info(f"触发回撤早停，episode: {episode}, "
-                              f"当前回撤: {self.drawdown_early_stopping.get_current_drawdown():.4f}")
-                    break
-
-                # 更新最佳验证分数
-                if ((self.config.early_stopping_mode == 'max' and validation_score > best_validation_score) or
-                    (self.config.early_stopping_mode == 'min' and validation_score < best_validation_score)):
-                    best_validation_score = validation_score
-                    # 保存最佳模型
-                    best_model_path = self.save_dir / "best_model.pth"
-                    self.save_checkpoint(str(best_model_path), episode)
-
-            # 定期保存检查点
-            if episode % self.config.save_frequency == 0:
-                checkpoint_path = self.save_dir / f"checkpoint_episode_{episode}.pth"
-                self.save_checkpoint(str(checkpoint_path), episode)
+        except KeyboardInterrupt:
+            logger.info("训练被用户中断")
+        except Exception as e:
+            logger.error(f"训练过程中出现错误: {e}")
+            raise RuntimeError(f"SB3训练失败: {e}") from e
 
         training_time = time.time() - start_time
-        logger.info(f"训练完成，总用时: {training_time:.2f}秒")
-
-        # 训练结果分析
-        final_stats = self.metrics.get_statistics()
-        if final_stats:
-            logger.info(f"训练总结: 平均奖励 {final_stats.get('mean_reward', 0):.4f}, "
-                       f"奖励标准差 {final_stats.get('std_reward', 0):.4f}")
-            
-            # 检查训练是否收敛
-            if len(self.metrics.validation_scores) >= 2:
-                recent_improvement = self.metrics.validation_scores[-1] - self.metrics.validation_scores[-2]
-                if abs(recent_improvement) < 0.01:
-                    logger.info("模型已收敛: 验证分数变化很小")
-                else:
-                    logger.info(f"模型仍在学习: 最近验证改进 {recent_improvement:.4f}")
+        logger.info(f"SB3训练完成，总用时: {training_time:.2f}秒")
 
         # 保存最终模型
-        final_model_path = self.save_dir / "final_model.pth"
-        self.save_checkpoint(str(final_model_path), episode)
+        final_model_path = self.save_dir / "final_model"
+        self.agent.save(final_model_path)
+        logger.info(f"最终模型已保存到: {final_model_path}")
 
-        # 清理多核资源
-        self._cleanup_multicore_resources()
-        
-        # 返回训练统计
-        return self.metrics.get_statistics()
-    
+        # 获取训练统计
+        stats = self.agent.get_training_stats() if hasattr(self.agent, 'get_training_stats') else {}
+        stats['training_time'] = training_time
+        stats['total_timesteps'] = self.config.total_timesteps
+
+        return stats
+
+    def _create_callbacks(self):
+        """创建SB3回调列表"""
+        callbacks = []
+
+        # 1. 添加进度回调（本地实现，集中管理）
+        progress_callback = TrainingProgressCallback(
+            log_freq=max(1000, self.config.total_timesteps // 50)
+        )
+        callbacks.append(progress_callback)
+
+        # 2. 添加评估回调
+        if self.config.eval_freq > 0:
+            # 创建评估环境
+            eval_env = self.environment
+            if self.env_factory:
+                # 如果有环境工厂，创建单独的评估环境
+                eval_env = self.env_factory()
+
+            eval_callback = EvalCallback(
+                eval_env,
+                best_model_save_path=str(self.save_dir),
+                log_path=str(self.save_dir),
+                eval_freq=self.config.eval_freq,
+                n_eval_episodes=self.config.n_eval_episodes,
+                deterministic=True,
+                render=False,
+                verbose=1
+            )
+            callbacks.append(eval_callback)
+
+        # 3. 添加检查点回调
+        if self.config.save_freq > 0:
+            checkpoint_callback = CheckpointCallback(
+                save_freq=self.config.save_freq,
+                save_path=str(self.save_dir),
+                name_prefix="sac_checkpoint",
+                verbose=1
+            )
+            callbacks.append(checkpoint_callback)
+
+        # 4. 添加奖励阈值早停回调
+        if hasattr(self.config, 'reward_threshold') and self.config.reward_threshold is not None:
+            early_stop_callback = StopTrainingOnRewardThreshold(
+                reward_threshold=self.config.reward_threshold,
+                verbose=1
+            )
+            callbacks.append(early_stop_callback)
+
+        # 5. 添加回撤早停回调（如果启用）
+        if self.config.enable_drawdown_monitoring:
+            drawdown_callback = DrawdownEarlyStoppingCallback(
+                max_drawdown=self.config.max_training_drawdown,
+                patience=self.config.early_stopping_patience // 2,
+                verbose=1
+            )
+            callbacks.append(drawdown_callback)
+
+        # 6. 添加增强指标记录回调（如果启用）
+        if (ENHANCED_METRICS_AVAILABLE and
+            (self.config.enable_portfolio_metrics or
+             self.config.enable_agent_behavior_metrics or
+             self.config.enable_risk_control_metrics)):
+            metrics_callback = EnhancedMetricsCallback(
+                trainer=self,
+                log_freq=self.config.metrics_calculation_frequency * self.config.max_steps_per_episode
+            )
+            callbacks.append(metrics_callback)
+
+        logger.info(f"创建了{len(callbacks)}个回调: {[type(cb).__name__ for cb in callbacks]}")
+        return callbacks
+
+
+class EnhancedMetricsCallback(BaseCallback):
+    """增强指标记录回调"""
+
+    def __init__(self, trainer: 'RLTrainer', log_freq: int = 1000, verbose: int = 0):
+        super().__init__(verbose)
+        self.trainer = trainer
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        """每步记录增强指标"""
+        if self.n_calls % self.log_freq == 0:
+            try:
+                # 从 trainer 中计算增强指标
+                if hasattr(self.trainer, '_calculate_and_log_enhanced_metrics'):
+                    # 模拟 episode 编号（基于 timesteps）
+                    episode_num = self.n_calls // self.trainer.config.max_steps_per_episode
+                    self.trainer._calculate_and_log_enhanced_metrics(episode_num)
+            except Exception as e:
+                if self.verbose > 0:
+                    print(f"计算增强指标时发生错误: {e}")
+        return True
+
     def _cleanup_multicore_resources(self):
-        """清理多核资源"""
-        if self.parallel_env_manager:
-            self.parallel_env_manager.close()
-            logger.info("并行环境资源已清理")
-        
-        if hasattr(self, 'data_loader') and self.data_loader:
-            # DataLoader会自动清理worker进程
-            del self.data_loader
-            logger.debug("数据加载器资源已清理")
+        """清理多核资源（SB3自动处理）"""
+        # SB3 VecEnv 会自动清理资源
+        logger.debug("SB3会自动清理多核资源")
 
     def evaluate(self, n_episodes: int = 10) -> Dict[str, float]:
-        """评估智能体性能"""
+        """评估智能体性能（使用SB3内置评估）"""
         logger.info(f"开始评估，episodes: {n_episodes}")
 
-        self.agent.eval()
-        evaluation_rewards = []
-        evaluation_lengths = []
+        # SB3的评估现在通过EvalCallback自动处理
+        # 这里保留方法以向后兼容，但建议使用SB3的评估机制
+        logger.info("评估现在通过SB3的EvalCallback自动进行")
 
-        for episode in range(n_episodes):
-            reward, length = self._run_episode(episode, training=False)
-            evaluation_rewards.append(reward)
-            evaluation_lengths.append(length)
-
-        evaluation_stats = {
-            'mean_reward': np.mean(evaluation_rewards),
-            'std_reward': np.std(evaluation_rewards),
-            'min_reward': np.min(evaluation_rewards),
-            'max_reward': np.max(evaluation_rewards),
-            'mean_length': np.mean(evaluation_lengths),
-            'total_episodes': n_episodes
-        }
-
-        logger.info(f"评估完成，平均奖励: {evaluation_stats['mean_reward']:.4f}")
-        logger.debug(f"详细评估结果: {evaluation_stats}")
-        return evaluation_stats
+        # 返回基本统计信息（从agent获取）
+        if hasattr(self.agent, 'get_training_stats'):
+            return self.agent.get_training_stats()
+        else:
+            return {'note': 'evaluation_handled_by_sb3_evalcallback'}
 
     def _monitor_drawdown(self, episode_reward: float, episode: int):
         """监控训练过程中的回撤"""
@@ -1064,10 +888,10 @@ class RLTrainer:
                 # 如果环境不支持，记录警告并跳过回撤监控
                 logger.warning("环境不支持投资组合价值获取，跳过回撤监控")
                 return
-            
+
             # 更新回撤早停状态（基于投资组合价值而非累积奖励）
             self.drawdown_early_stopping.step(portfolio_value)
-            
+
             # 获取更新后的当前回撤
             current_drawdown = self.drawdown_early_stopping.get_current_drawdown()
 
@@ -1097,7 +921,7 @@ class RLTrainer:
             if episode % 50 == 0:
                 logger.info(f"Episode {episode}: 投资组合价值 {portfolio_value:.4f}, "
                           f"训练回撤 {current_drawdown:.4f}, 环境回撤 {env_drawdown:.4f}")
-                
+
                 # 回撤异常检测
                 if current_drawdown == 0.0 and episode > 50:
                     logger.warning(f"回撤计算异常: 连续{episode}个episode回撤为0，可能存在计算缺陷")
@@ -1124,11 +948,11 @@ class RLTrainer:
             # 改进的自适应学习率调整（修复负奖励环境下的逻辑错误）
             if self.config.enable_adaptive_learning:
                 old_lr_factor = self.current_lr_factor
-                
+
                 # 计算性能变化的绝对值和相对值，适应正负奖励环境
                 performance_diff = recent_performance - long_term_performance
                 performance_change_ratio = abs(performance_diff) / max(abs(long_term_performance), 1.0)
-                
+
                 # 性能显著恶化的判断（适应负奖励）
                 is_performance_worse = False
                 if long_term_performance >= 0:
@@ -1137,7 +961,7 @@ class RLTrainer:
                 else:
                     # 负奖励环境：最近表现更负（绝对值更大）
                     is_performance_worse = recent_performance < long_term_performance / self.config.performance_threshold_down
-                
+
                 # 性能显著改善的判断
                 is_performance_better = False
                 if long_term_performance >= 0:
@@ -1146,10 +970,10 @@ class RLTrainer:
                 else:
                     # 负奖励环境：最近表现更好（绝对值更小）
                     is_performance_better = recent_performance > long_term_performance / self.config.performance_threshold_up
-                
+
                 # 避免过于频繁的学习率调整
                 significant_change = performance_change_ratio > 0.05  # 至少5%的变化
-                
+
                 if is_performance_worse and significant_change:
                     # 性能下降，降低学习率但有最小值限制
                     self.current_lr_factor = max(
@@ -1158,7 +982,7 @@ class RLTrainer:
                     )
                     if self.current_lr_factor != old_lr_factor:
                         logger.info(f"Episode {episode}: 检测到性能下降，降低学习率因子到 {self.current_lr_factor:.4f}")
-                
+
                 elif is_performance_better and significant_change:
                     # 性能提升，快速恢复学习率
                     self.current_lr_factor = min(
@@ -1206,66 +1030,66 @@ class RLTrainer:
 
         except Exception as e:
             logger.error(f"收集回撤指标失败: {e}")
-            raise RuntimeError(f"回撤指标收集出现错误: {e}") from e    
-    
+            raise RuntimeError(f"回撤指标收集出现错误: {e}") from e
+
     # ==================== 增强指标相关方法 ====================
-    
-    def _should_calculate_metrics(self, episode_num: int) -> bool:
+
+    def _should_calculate_metrics(self, timesteps: int) -> bool:
         """
-        判断是否应该计算指标
-        
+        判断是否应该计算指标（基于timesteps）
+
         Args:
-            episode_num: episode编号
-            
+            timesteps: 当前timesteps数
+
         Returns:
             是否应该计算指标
         """
-        return episode_num % self.config.metrics_calculation_frequency == 0
-    
+        return timesteps % self.config.metrics_calculation_frequency == 0
+
     def _calculate_and_log_enhanced_metrics(self, episode_num: int):
         """
         计算并记录增强指标
-        
+
         Args:
             episode_num: episode编号
         """
         if not ENHANCED_METRICS_AVAILABLE:
             return
-            
+
         try:
             # 计算投资组合指标
             portfolio_metrics = None
             if self.config.enable_portfolio_metrics:
                 portfolio_metrics = self._calculate_portfolio_metrics()
-            
+
             # 计算智能体行为指标
             agent_metrics = None
             if self.config.enable_agent_behavior_metrics:
                 agent_metrics = self._calculate_agent_behavior_metrics()
-            
+
             # 计算风险控制指标
             risk_metrics = None
             if self.config.enable_risk_control_metrics:
                 risk_metrics = self._calculate_risk_control_metrics()
-            
+
             # 记录指标日志
             if self.config.detailed_metrics_logging:
                 self._log_enhanced_metrics(episode_num, portfolio_metrics, agent_metrics, risk_metrics)
-            
+
         except Exception as e:
             logger.error(f"计算增强指标时发生错误: {e}")
-    
+
     def _calculate_portfolio_metrics(self) -> Optional['PortfolioMetrics']:
         """
         计算投资组合指标
-        
+
         Returns:
             投资组合指标或None（如果数据不足）
         """
         if not ENHANCED_METRICS_AVAILABLE or len(self.portfolio_values_history) <= 1:
             logger.debug("投资组合价值历史数据不足，跳过指标计算")
             return None
-        
+
         try:
             # 确保基准数据长度匹配
             if len(self.benchmark_values_history) != len(self.portfolio_values_history):
@@ -1280,71 +1104,71 @@ class RLTrainer:
                 portfolio_values = self.portfolio_values_history
                 benchmark_values = self.benchmark_values_history
                 dates = self.dates_history if len(self.dates_history) == len(portfolio_values) else [datetime.now()] * len(portfolio_values)
-            
+
             metrics = self.metrics_calculator.calculate_portfolio_metrics(
                 portfolio_values=portfolio_values,
                 benchmark_values=benchmark_values,
                 dates=dates,
                 risk_free_rate=self.config.risk_free_rate
             )
-            
+
             return metrics
-            
+
         except Exception as e:
             logger.error(f"计算投资组合指标失败: {e}")
             return None
-    
+
     def _calculate_agent_behavior_metrics(self) -> Optional['AgentBehaviorMetrics']:
         """
         计算智能体行为指标
-        
+
         Returns:
             智能体行为指标或None（如果数据不足）
         """
         if not ENHANCED_METRICS_AVAILABLE or len(self.entropy_history) == 0:
             logger.debug("熵值历史数据为空，跳过智能体行为指标计算")
             return None
-        
+
         try:
             metrics = self.metrics_calculator.calculate_agent_behavior_metrics(
                 entropy_values=self.entropy_history,
                 position_weights_history=self.position_weights_history
             )
-            
+
             return metrics
-            
+
         except Exception as e:
             logger.error(f"计算智能体行为指标失败: {e}")
             return None
-    
+
     def _calculate_risk_control_metrics(self) -> Optional['RiskControlMetrics']:
         """
         计算风险控制指标
-        
+
         Returns:
             风险控制指标或None（如果数据不足）
         """
         if not ENHANCED_METRICS_AVAILABLE:
             return None
-            
+
         # 检查环境是否有回撤控制器
         if not hasattr(self.environment, 'drawdown_controller') or self.environment.drawdown_controller is None:
             logger.debug("环境中没有回撤控制器，跳过风险控制指标计算")
             return None
-        
+
         try:
             drawdown_controller = self.environment.drawdown_controller
-            
+
             # 从回撤控制器获取数据
             risk_budget_history = getattr(drawdown_controller.adaptive_risk_budget, 'risk_budget_history', [])
             risk_usage_history = getattr(drawdown_controller.adaptive_risk_budget, 'risk_usage_history', [])
             control_signals = getattr(drawdown_controller, 'control_signal_queue', [])
-            
+
             # 获取市场状态历史
             market_regime_history = []
             if hasattr(drawdown_controller, 'market_regime_detector') and drawdown_controller.market_regime_detector:
                 market_regime_history = getattr(drawdown_controller.market_regime_detector, 'regime_history', [])
-            
+
             # 转换控制信号为字典格式
             control_signals_dict = []
             for signal in control_signals:
@@ -1352,27 +1176,27 @@ class RLTrainer:
                     control_signals_dict.append(signal.to_dict())
                 elif isinstance(signal, dict):
                     control_signals_dict.append(signal)
-            
+
             metrics = self.metrics_calculator.calculate_risk_control_metrics(
                 risk_budget_history=risk_budget_history,
                 risk_usage_history=risk_usage_history,
                 control_signals=control_signals_dict,
                 market_regime_history=market_regime_history
             )
-            
+
             return metrics
-            
+
         except Exception as e:
             logger.error(f"计算风险控制指标失败: {e}")
             return None
-    
+
     def _log_enhanced_metrics(self, episode: int,
                             portfolio_metrics: Optional['PortfolioMetrics'],
                             agent_metrics: Optional['AgentBehaviorMetrics'],
                             risk_metrics: Optional['RiskControlMetrics']):
         """
         记录增强指标日志
-        
+
         Args:
             episode: episode编号
             portfolio_metrics: 投资组合指标
@@ -1380,7 +1204,7 @@ class RLTrainer:
             risk_metrics: 风险控制指标
         """
         log_lines = [f"=== Episode {episode} 增强指标报告 ==="]
-        
+
         # 投资组合指标
         if portfolio_metrics:
             log_lines.append("📊 投资组合与市场表现对比指标:")
@@ -1391,7 +1215,7 @@ class RLTrainer:
             log_lines.append(f"  • 年化收益率 (Annualized Return): {portfolio_metrics.annualized_return:.4f}")
         else:
             log_lines.append("📊 投资组合指标: 数据不足，跳过计算")
-        
+
         # 智能体行为指标
         if agent_metrics:
             log_lines.append("🤖 智能体行为分析指标:")
@@ -1401,7 +1225,7 @@ class RLTrainer:
             log_lines.append(f"  • 换手率 (Turnover Rate): {agent_metrics.turnover_rate:.4f}")
         else:
             log_lines.append("🤖 智能体行为指标: 数据不足，跳过计算")
-        
+
         # 风险控制指标
         if risk_metrics:
             log_lines.append("🛡️ 风险与回撤控制指标:")
@@ -1411,28 +1235,28 @@ class RLTrainer:
             log_lines.append(f"  • 市场状态稳定性: {risk_metrics.market_regime_stability:.4f}")
         else:
             log_lines.append("🛡️ 风险控制指标: 回撤控制器未启用或数据不足")
-        
+
         log_lines.append("=" * 50)
-        
+
         # 输出日志
         for line in log_lines:
             logger.info(line)
-    
+
     def _update_metrics_histories(self, episode_info: Dict[str, Any], update_info: Dict[str, Any]):
         """
         更新指标历史数据
-        
+
         Args:
             episode_info: episode信息
             update_info: 智能体更新信息
         """
         if not ENHANCED_METRICS_AVAILABLE:
             return
-            
+
         # 更新投资组合价值历史
         if 'portfolio_value' in episode_info:
             self.portfolio_values_history.append(episode_info['portfolio_value'])
-        
+
         # 更新基准价值历史（如果有）
         if 'benchmark_value' in episode_info:
             self.benchmark_values_history.append(episode_info['benchmark_value'])
@@ -1445,32 +1269,32 @@ class RLTrainer:
                 daily_return = 0.08 / 252
                 last_value = self.benchmark_values_history[-1]
                 self.benchmark_values_history.append(last_value * (1 + daily_return))
-        
+
         # 更新日期历史
         self.dates_history.append(datetime.now())
-        
+
         # 更新智能体行为数据
         if 'policy_entropy' in update_info:
             self.entropy_history.append(update_info['policy_entropy'])
-        
+
         if 'positions' in episode_info:
             positions = episode_info['positions']
             if isinstance(positions, np.ndarray):
                 self.position_weights_history.append(positions.copy())
-    
+
     def get_enhanced_training_stats(self) -> Dict[str, Any]:
         """
         获取增强训练统计信息
-        
+
         Returns:
             增强训练统计信息
         """
-        # 获取基础统计
-        base_stats = self.metrics.get_statistics()
-        
+        # 获取基础统计（从agent或创建空字典）
+        base_stats = self.agent.get_training_stats() if hasattr(self.agent, 'get_training_stats') else {}
+
         if not ENHANCED_METRICS_AVAILABLE:
             return base_stats
-        
+
         # 添加增强统计
         enhanced_stats = {
             'portfolio_values_count': len(self.portfolio_values_history),
@@ -1479,7 +1303,7 @@ class RLTrainer:
             'latest_portfolio_value': self.portfolio_values_history[-1] if self.portfolio_values_history else 0,
             'latest_entropy': self.entropy_history[-1] if self.entropy_history else 0,
         }
-        
+
         # 如果有足够数据，计算最新指标
         if len(self.portfolio_values_history) > 1:
             try:
@@ -1494,7 +1318,7 @@ class RLTrainer:
                     })
             except Exception as e:
                 logger.debug(f"计算最新投资组合指标失败: {e}")
-        
+
         if len(self.entropy_history) > 0:
             try:
                 latest_agent_metrics = self._calculate_agent_behavior_metrics()
@@ -1507,16 +1331,16 @@ class RLTrainer:
                     })
             except Exception as e:
                 logger.debug(f"计算最新智能体行为指标失败: {e}")
-        
+
         # 合并统计信息
         base_stats.update(enhanced_stats)
         return base_stats
-    
+
     def reset_enhanced_histories(self):
         """重置增强历史数据"""
         if not ENHANCED_METRICS_AVAILABLE:
             return
-            
+
         self.portfolio_values_history.clear()
         self.benchmark_values_history.clear()
         self.dates_history.clear()
@@ -1526,7 +1350,7 @@ class RLTrainer:
         self.risk_usage_history.clear()
         self.control_signals_history.clear()
         self.market_regime_history.clear()
-        
+
         logger.info("增强历史数据已重置")
 
 
