@@ -15,7 +15,9 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecTransposeDict
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import VecTransposeImage 
+
 
 from .transformer import TimeSeriesTransformer, TransformerConfig
 
@@ -64,13 +66,17 @@ class SACConfig:
     # - n_eval_episodes
     
     def get_activation_fn(self):
-        """获取激活函数"""
+        """获取激活函数类（返回类而非实例，SB3会自动实例化）"""
         if self.activation_fn == "relu":
             return nn.ReLU
         elif self.activation_fn == "tanh":
             return nn.Tanh
         elif self.activation_fn == "elu":
             return nn.ELU
+        elif self.activation_fn == "leaky_relu":
+            return nn.LeakyReLU
+        elif self.activation_fn == "gelu":
+            return nn.GELU
         else:
             raise ValueError(f"不支持的激活函数: {self.activation_fn}")
 
@@ -105,28 +111,57 @@ class TransformerFeaturesExtractor(BaseFeaturesExtractor):
         """
         # 处理字典观察
         if isinstance(observations, dict):
-            features = observations['features']
+            # 对于MultiInputPolicy，只处理'features'键
+            features = observations.get('features', observations)
         else:
             features = observations
             
-        # 确保输入是正确的维度格式
-        if features.dim() == 3:
-            features = features.unsqueeze(0)  # 添加批次维度
-        elif features.dim() == 2:
-            features = features.unsqueeze(0).unsqueeze(0)  # 添加批次和序列维度
-            
-        # 通过 Transformer 编码
-        encoded = self.transformer(features)
+        # 记录原始维度用于调试
+        original_shape = features.shape
         
-        # 如果输出是 3D 的，对股票维度进行平均池化
-        if encoded.dim() == 3:
-            encoded = encoded.mean(dim=1)
+        # 智能维度处理：只在必要时添加维度
+        if features.dim() == 2:
+            # (seq_len, n_features) -> (1, seq_len, n_features)
+            features = features.unsqueeze(0)
+        elif features.dim() == 1:
+            # (n_features,) -> (1, 1, n_features)
+            features = features.unsqueeze(0).unsqueeze(0)
+        elif features.dim() > 3:
+            # 如果维度过多，展平多余维度
+            batch_size = features.size(0)
+            features = features.view(batch_size, -1, features.size(-1))
             
-        # 移除批次维度（如果只有一个样本）
-        if encoded.size(0) == 1:
-            encoded = encoded.squeeze(0)
+        # 确保输入是浮点类型
+        if features.dtype != torch.float32:
+            features = features.float()
             
-        return encoded
+        try:
+            # 通过 Transformer 编码
+            encoded = self.transformer(features)
+            
+            # 智能输出处理
+            if encoded.dim() == 3:
+                # (batch, seq, features) -> (batch, features) 通过平均池化
+                encoded = encoded.mean(dim=1)
+            elif encoded.dim() == 2:
+                # 已经是正确的 (batch, features) 格式
+                pass
+            elif encoded.dim() == 1:
+                # (features,) -> (1, features)
+                encoded = encoded.unsqueeze(0)
+                
+            # 确保输出维度正确
+            if encoded.dim() != 2:
+                raise RuntimeError(f"Transformer输出维度错误: {encoded.shape}, 期望2D")
+                
+            return encoded
+            
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Transformer前向传播失败: 输入形状={original_shape}, "
+                        f"处理后形状={features.shape}, 错误={e}")
+            raise RuntimeError(f"Transformer特征提取失败: {e}") from e
 
 
 class SACAgent:
@@ -183,12 +218,24 @@ class SACAgent:
         # 注入核心参数（以TrainingConfig为准）
         self.learning_rate = training_config.learning_rate
         self.batch_size = training_config.batch_size
-        self.buffer_size = training_config.buffer_size
         self.gamma = training_config.gamma
         self.tau = training_config.tau
         self.total_timesteps = training_config.total_timesteps
         self.eval_freq = training_config.eval_freq
         self.n_eval_episodes = training_config.n_eval_episodes
+        
+        # 智能调整 buffer_size（避免内存浪费）
+        original_buffer_size = training_config.buffer_size
+        # 对于A股日频数据，通常数据集较小，调整buffer大小
+        optimal_buffer_size = min(
+            original_buffer_size,
+            max(50000, self.total_timesteps * 2)  # 至少50k，最多为总步数的2倍
+        )
+        
+        if optimal_buffer_size != original_buffer_size:
+            self.logger.info(f"根据数据集大小调整buffer_size: {original_buffer_size} -> {optimal_buffer_size}")
+        
+        self.buffer_size = optimal_buffer_size
         
         self.logger.info(f"已从TrainingConfig注入参数: lr={self.learning_rate}, "
                         f"batch_size={self.batch_size}, buffer_size={self.buffer_size}")
@@ -212,61 +259,72 @@ class SACAgent:
                 self._vec_env = DummyVecEnv([lambda: self.env])
                 self.n_envs = 1
         elif self.env_factory is not None:
-            # 首先检查env_factory是否返回VecEnv（带异常处理）
+            # 直接使用环境工厂创建向量化环境，避免提前创建测试环境
             try:
-                test_env = self.env_factory()
-                if hasattr(test_env, 'num_envs'):
-                    # env_factory返回的已经是VecEnv，直接使用
-                    self.logger.info("env_factory返回VecEnv，直接使用而不重复包装")
-                    self._vec_env = test_env
-                    self.n_envs = test_env.num_envs
+                # 包装环境工厂以增强异常追踪
+                def safe_env_factory():
+                    try:
+                        return self.env_factory()
+                    except Exception as e:
+                        import traceback
+                        self.logger.error(f"环境工厂创建环境失败: {e}")
+                        self.logger.error(f"完整traceback: {traceback.format_exc()}")
+                        raise RuntimeError(f"环境工厂创建环境失败: {e}") from e
+                
+                if self.n_envs > 1:
+                    # 多环境使用SubprocVecEnv
+                    self._vec_env = make_vec_env(
+                        safe_env_factory,
+                        n_envs=self.n_envs,
+                        vec_env_cls=SubprocVecEnv,
+                        vec_env_kwargs={'start_method': 'spawn'}  # 兼容性设置
+                    )
                 else:
-                    # env_factory返回普通环境，需要向量化包装
-                    if self.n_envs > 1:
-                        # 包装环境工厂以增强异常追踪
-                        def safe_env_factory():
-                            try:
-                                return self.env_factory()
-                            except Exception as e:
-                                import traceback
-                                self.logger.error(f"环境工厂创建环境失败: {e}")
-                                self.logger.error(f"完整traceback: {traceback.format_exc()}")
-                                raise RuntimeError(f"环境工厂创建环境失败: {e}") from e
-                        
-                        self._vec_env = make_vec_env(
-                            safe_env_factory,
-                            n_envs=self.n_envs,
-                            vec_env_cls=SubprocVecEnv,
-                            vec_env_kwargs={'start_method': 'spawn'}  # 兼容性设置
-                        )
-                    else:
-                        self._vec_env = make_vec_env(
-                            self.env_factory,
-                            n_envs=1,
-                            vec_env_cls=DummyVecEnv
-                        )
+                    # 单环境使用DummyVecEnv
+                    self._vec_env = make_vec_env(
+                        safe_env_factory,
+                        n_envs=1,
+                        vec_env_cls=DummyVecEnv
+                    )
             except Exception as e:
                 import traceback
-                self.logger.error(f"环境工厂测试失败: {e}")
+                self.logger.error(f"环境工厂创建向量化环境失败: {e}")
                 self.logger.error(f"完整traceback: {traceback.format_exc()}")
-                raise RuntimeError(f"环境工厂测试失败，无法创建向量化环境: {e}") from e
+                raise RuntimeError(f"环境工厂创建向量化环境失败: {e}") from e
         else:
             raise ValueError("需要提供env或env_factory参数")
             
-        # 检查是否需要VecTransposeDict包装
+        # 智能检查是否需要VecTransposeImage包装
+        # 只在观察空间是字典且包含图像类型数据时才使用
         if hasattr(self._vec_env.observation_space, 'spaces'):
-            self._vec_env = VecTransposeDict(self._vec_env)
-            self.logger.info("已应用VecTransposeDict包装器")
+            # 检查是否有图像类型的观察空间
+            needs_transpose = False
+            for space_name, space in self._vec_env.observation_space.spaces.items():
+                if len(space.shape) >= 3:  # 可能是图像数据 (H, W, C)
+                    needs_transpose = True
+                    break
+            
+            if needs_transpose:
+                self._vec_env = VecTransposeImage(self._vec_env)
+                self.logger.info("检测到图像类型观察空间，已应用 VecTransposeImage 包装器")
+            else:
+                self.logger.info("观察空间为字典类型但不包含图像数据，跳过 VecTransposeImage 包装")
+        elif hasattr(self._vec_env.observation_space, 'spaces'):
+            self.logger.warning("VecTransposeImage 不可用，跳过图像转置包装（可能影响图像观察空间的处理）")
             
         self.logger.info(f"创建了{self.n_envs}个并行环境")
         return self._vec_env
         
     def _create_model(self, vec_env) -> SAC:
         """创建 SB3 SAC 模型"""
+        # 在创建模型前刷新参数（确保使用最新的training_config参数）
+        if self.training_config:
+            self._inject_training_params(self.training_config)
+        
         # 准备策略参数
         policy_kwargs = {
             "net_arch": self.config.net_arch,
-            "activation_fn": self.config.get_activation_fn(),
+            "activation_fn": self.config.get_activation_fn(),  # 传递类而非实例
         }
         
         # 如果使用 Transformer，添加自定义特征提取器
@@ -345,6 +403,21 @@ class SACAgent:
             # 如果模型还没创建，现在创建它
             vec_env = self._create_vec_env()
             self._model = self._create_model(vec_env)
+    
+    def refresh_training_params(self, training_config):
+        """
+        刷新训练参数（当training_config修改后调用）
+        
+        Args:
+            training_config: 更新后的TrainingConfig实例
+        """
+        self.training_config = training_config
+        self._inject_training_params(training_config)
+        
+        # 如果模型已创建，需要重新创建以应用新参数
+        if self._model is not None:
+            self.logger.info("检测到训练参数变更，将在下次访问时重新创建模型")
+            self._model = None  # 标记需要重新创建
             
     def get_action(self, state, deterministic: bool = False, return_log_prob: bool = False):
         """
@@ -425,25 +498,32 @@ class SACAgent:
         保存模型
         
         Args:
-            path: 保存路径
+            path: 保存路径（目录路径，SB3模型将保存为 path/sac_model.zip）
         """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         
         if self._model is not None:
-            # 保存SB3模型
-            self.model.save(path / "sac_model")
+            # 保存SB3模型（SB3会自动添加.zip后缀）
+            model_file_path = path / "sac_model"
+            self.model.save(model_file_path)
             
             # 保存配置
-            with open(path / 'config.json', 'w') as f:
+            config_file_path = path / 'config.json'
+            with open(config_file_path, 'w', encoding='utf-8') as f:
                 # 将配置转换为可序列化的字典
                 config_dict = {
                     k: v for k, v in self.config.__dict__.items() 
                     if isinstance(v, (int, float, str, bool, list, type(None)))
                 }
-                json.dump(config_dict, f, indent=2)
+                json.dump(config_dict, f, indent=2, ensure_ascii=False)
             
-            self.logger.info(f"模型已保存到 {path}")
+            # 验证文件是否成功保存
+            expected_model_file = model_file_path.with_suffix('.zip')
+            if expected_model_file.exists() and config_file_path.exists():
+                self.logger.info(f"模型已成功保存到 {path} (模型文件: {expected_model_file.name})")
+            else:
+                raise RuntimeError(f"模型保存验证失败: 模型文件={expected_model_file.exists()}, 配置文件={config_file_path.exists()}")
         else:
             raise RuntimeError("模型尚未初始化，无法保存")
     
@@ -452,17 +532,38 @@ class SACAgent:
         加载模型
         
         Args:
-            path: 模型路径
+            path: 模型路径（目录路径，期望包含 sac_model.zip 文件）
         """
         path = Path(path)
         
-        # 加载SB3模型
-        model_path = path / "sac_model"
-        if model_path.with_suffix('.zip').exists():
-            self._model = SAC.load(model_path, env=self.env)
-            self.logger.info(f"模型已从 {path} 加载")
+        if not path.exists():
+            raise FileNotFoundError(f"模型目录不存在: {path}")
+        
+        # 加载SB3模型（SB3会自动查找.zip文件）
+        model_file_path = path / "sac_model"
+        expected_zip_file = model_file_path.with_suffix('.zip')
+        
+        if expected_zip_file.exists():
+            # 创建环境（如果需要）
+            env_for_loading = self.env
+            if env_for_loading is None and self.env_factory is not None:
+                env_for_loading = self.env_factory()
+            
+            self._model = SAC.load(model_file_path, env=env_for_loading)
+            
+            # 尝试加载配置（如果存在）
+            config_file_path = path / 'config.json'
+            if config_file_path.exists():
+                try:
+                    with open(config_file_path, 'r', encoding='utf-8') as f:
+                        saved_config = json.load(f)
+                    self.logger.info(f"已加载保存的配置: {len(saved_config)} 个参数")
+                except Exception as e:
+                    self.logger.warning(f"加载配置文件失败，使用当前配置: {e}")
+            
+            self.logger.info(f"模型已从 {path} 成功加载 (模型文件: {expected_zip_file.name})")
         else:
-            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+            raise FileNotFoundError(f"模型文件不存在: {expected_zip_file}")
     
     def can_update(self) -> bool:
         """检查是否可以更新（兼容性方法）"""

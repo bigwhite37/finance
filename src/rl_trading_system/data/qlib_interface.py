@@ -408,8 +408,13 @@ class QlibDataInterface(DataInterface):
                     # 通常A股数据从2005年左右开始比较完整
                     conservative_start = "2005-01-01"
                     return conservative_start, latest_possible
-            except Exception:
-                pass
+            except (ValueError, KeyError, AttributeError) as e:
+                # 数据访问相关的预期异常，继续尝试其他方法
+                logger.debug(f"获取最近数据失败: {e}")
+            except Exception as e:
+                # 其他未预期异常，记录并继续
+                logger.warning(f"获取最近数据时发生未预期错误: {e}")
+                # 不抛出异常，继续尝试历史数据
             
             # 如果最近一年没有数据，尝试历史数据
             # 测试过去几年是否有数据
@@ -425,7 +430,13 @@ class QlibDataInterface(DataInterface):
                     if not test_data.empty:
                         # 找到有数据的年份
                         return test_start, test_end
-                except Exception:
+                except (ValueError, KeyError, AttributeError) as e:
+                    # 数据访问相关的预期异常，继续尝试下一年
+                    logger.debug(f"测试年份 {test_year} 数据失败: {e}")
+                    continue
+                except Exception as e:
+                    # 其他未预期异常，记录但继续尝试
+                    logger.warning(f"测试年份 {test_year} 时发生未预期错误: {e}")
                     continue
             
             # 如果都没有找到数据，抛出异常

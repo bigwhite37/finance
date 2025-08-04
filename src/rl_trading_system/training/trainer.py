@@ -27,6 +27,71 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 logger = logging.getLogger(__name__)
 
 
+class TrainingMetrics:
+    """训练指标收集器"""
+    
+    def __init__(self):
+        """初始化训练指标"""
+        self.episode_rewards: List[float] = []
+        self.episode_lengths: List[int] = []
+        self.actor_losses: List[float] = []
+        self.critic_losses: List[float] = []
+        self.validation_scores: List[float] = []
+        
+    def add_episode_metrics(self, reward: float, length: int, actor_loss: float, critic_loss: float):
+        """添加episode指标"""
+        self.episode_rewards.append(reward)
+        self.episode_lengths.append(length)
+        self.actor_losses.append(actor_loss)
+        self.critic_losses.append(critic_loss)
+        
+    def add_validation_score(self, score: float):
+        """添加验证分数"""
+        self.validation_scores.append(score)
+        
+    def get_statistics(self) -> Dict[str, float]:
+        """获取统计信息"""
+        if not self.episode_rewards:
+            return {}
+            
+        return {
+            'mean_reward': np.mean(self.episode_rewards),
+            'std_reward': np.std(self.episode_rewards),
+            'mean_length': np.mean(self.episode_lengths),
+            'mean_actor_loss': np.mean(self.actor_losses),
+            'mean_critic_loss': np.mean(self.critic_losses),
+            'total_episodes': len(self.episode_rewards)
+        }
+        
+    def get_recent_statistics(self, window: int = 100) -> Dict[str, float]:
+        """获取最近window个episode的统计信息"""
+        if not self.episode_rewards:
+            return {}
+            
+        start_idx = max(0, len(self.episode_rewards) - window)
+        recent_rewards = self.episode_rewards[start_idx:]
+        recent_lengths = self.episode_lengths[start_idx:]
+        recent_actor_losses = self.actor_losses[start_idx:]
+        recent_critic_losses = self.critic_losses[start_idx:]
+        
+        return {
+            'mean_reward': np.mean(recent_rewards),
+            'std_reward': np.std(recent_rewards),
+            'mean_length': np.mean(recent_lengths),
+            'mean_actor_loss': np.mean(recent_actor_losses),
+            'mean_critic_loss': np.mean(recent_critic_losses),
+            'episodes_count': len(recent_rewards)
+        }
+        
+    def reset(self):
+        """重置所有指标"""
+        self.episode_rewards.clear()
+        self.episode_lengths.clear()
+        self.actor_losses.clear()
+        self.critic_losses.clear()
+        self.validation_scores.clear()
+
+
 class TrainingProgressCallback(BaseCallback):
     """
     改进的训练进度回调函数
@@ -40,8 +105,9 @@ class TrainingProgressCallback(BaseCallback):
     def __init__(self, log_freq: int = 1000, verbose: int = 0):
         super().__init__(verbose)
         self.log_freq = log_freq
-        self.logger = logging.getLogger(__name__)
+        self._custom_logger = logging.getLogger(__name__)
         self.last_logged_timestep = 0
+        self._n_envs = None  # 将在第一次调用时获取
         
         # 获取当前进程rank（用于多进程环境）
         self.rank = os.environ.get('RANK', '0')
@@ -53,11 +119,25 @@ class TrainingProgressCallback(BaseCallback):
         if not self.is_main_process:
             return True
             
+        # 获取环境数量（第一次调用时）
+        if self._n_envs is None:
+            if hasattr(self.training_env, 'num_envs'):
+                self._n_envs = self.training_env.num_envs
+            else:
+                self._n_envs = 1
+            
+            # 根据环境数量调整日志频率
+            if self._n_envs > 1:
+                self._custom_logger.info(f"检测到{self._n_envs}个并行环境，日志频率已自动调整")
+            
         # 使用model.num_timesteps而不是n_calls（如sb3.md建议）
         current_timesteps = self.model.num_timesteps
         
-        # 每隔log_freq个timesteps打印一次统计信息  
-        if current_timesteps - self.last_logged_timestep >= self.log_freq:
+        # 计算实际的日志间隔（考虑多环境）
+        effective_log_freq = self.log_freq * self._n_envs
+        
+        # 每隔effective_log_freq个timesteps打印一次统计信息  
+        if current_timesteps - self.last_logged_timestep >= effective_log_freq:
             self.last_logged_timestep = current_timesteps
             
             # 获取训练统计信息
@@ -286,9 +366,14 @@ class TrainingConfig:
         if self.parallel_environments > max_workers:
             self.parallel_environments = max_workers
 
-        # 同步n_envs与parallel_environments
+        # 同步n_envs与parallel_environments（确保单一数据源）
         if self.n_envs == 1 and self.parallel_environments > 1:
             self.n_envs = self.parallel_environments
+            logger.info(f"已将n_envs同步为parallel_environments: {self.n_envs}")
+        elif self.n_envs > 1 and self.parallel_environments != self.n_envs:
+            # 如果两者都不是默认值且不相等，以n_envs为准
+            self.parallel_environments = self.n_envs
+            logger.info(f"已将parallel_environments同步为n_envs: {self.parallel_environments}")
 
         # 增强指标配置验证
         if self.metrics_calculation_frequency <= 0:
@@ -341,8 +426,111 @@ class TrainingConfig:
             )
 
 
+class EarlyStoppingCallback(BaseCallback):
+    """
+    基于SB3的早停回调
+    
+    监控评估指标，当指标在指定步数内没有改进时停止训练
+    """
+
+    def __init__(self, patience: int = 20000, min_delta: float = 0.001, mode: str = 'max', 
+                 check_freq: int = 1000, verbose: int = 0):
+        """
+        初始化早停回调
+
+        Args:
+            patience: 耐心值（以timesteps计）
+            min_delta: 最小改进幅度
+            mode: 'max'表示分数越高越好，'min'表示分数越低越好
+            check_freq: 检查频率（以timesteps计）
+            verbose: 详细程度
+        """
+        super().__init__(verbose)
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.check_freq = check_freq
+        self.best_score = None
+        self.last_check_timestep = 0
+        self.no_improvement_timesteps = 0
+        self.early_stop = False
+
+        if mode == 'max':
+            self.is_better = lambda score, best: score > best + min_delta
+        else:
+            self.is_better = lambda score, best: score < best - min_delta
+
+    def _on_step(self) -> bool:
+        """每步调用的回调"""
+        current_timesteps = self.model.num_timesteps
+        
+        # 按指定频率检查
+        if current_timesteps - self.last_check_timestep >= self.check_freq:
+            self.last_check_timestep = current_timesteps
+            
+            # 从模型logger获取评估分数
+            score = self._get_evaluation_score()
+            if score is not None:
+                should_stop = self._update_early_stopping(score, current_timesteps)
+                if should_stop:
+                    if self.verbose > 0:
+                        print(f"\n早停触发: 在 {self.no_improvement_timesteps} 个timesteps内无改进")
+                    return False
+        
+        return True
+    
+    def _get_evaluation_score(self) -> Optional[float]:
+        """从模型logger获取评估分数"""
+        if hasattr(self.model, 'logger') and self.model.logger is not None:
+            record = self.model.logger.name_to_value
+            
+            # 尝试获取评估奖励
+            if 'eval/mean_reward' in record:
+                return float(record['eval/mean_reward'])
+            elif 'rollout/ep_rew_mean' in record:
+                return float(record['rollout/ep_rew_mean'])
+        
+        return None
+    
+    def _update_early_stopping(self, score: float, current_timesteps: int) -> bool:
+        """
+        更新早停状态
+
+        Args:
+            score: 当前分数
+            current_timesteps: 当前时间步
+
+        Returns:
+            bool: 是否应该早停
+        """
+        if self.best_score is None:
+            self.best_score = score
+            self.no_improvement_timesteps = 0
+            return False
+
+        if self.is_better(score, self.best_score):
+            self.best_score = score
+            self.no_improvement_timesteps = 0
+            if self.verbose > 0:
+                print(f"新的最佳分数: {score:.4f} (timestep {current_timesteps})")
+        else:
+            self.no_improvement_timesteps += self.check_freq
+
+        if self.no_improvement_timesteps >= self.patience:
+            self.early_stop = True
+            return True
+
+        return False
+
+    def reset(self):
+        """重置早停状态"""
+        self.best_score = None
+        self.no_improvement_timesteps = 0
+        self.early_stop = False
+
+
 class EarlyStopping:
-    """早停机制"""
+    """早停机制（向后兼容类）"""
 
     def __init__(self, patience: int = 20, min_delta: float = 0.001, mode: str = 'max'):
         """
@@ -399,52 +587,112 @@ class EarlyStopping:
 
 
 class DrawdownEarlyStoppingCallback(BaseCallback):
-    """基于回撤的早停回调"""
+    """
+    基于回撤的早停回调
+    
+    监控训练过程中的投资组合回撤，当回撤超过阈值时停止训练
+    """
 
-    def __init__(self, max_drawdown: float = 0.3, patience: int = 10, verbose: int = 0):
+    def __init__(self, max_drawdown: float = 0.3, patience: int = 10, check_freq: int = 100, verbose: int = 0):
         super().__init__(verbose)
         self.max_drawdown = max_drawdown
         self.patience = patience
+        self.check_freq = check_freq
         self.peak_value = None
         self.counter = 0
         self.drawdown_history = []
+        self.last_check_timestep = 0
 
     def _on_step(self) -> bool:
         """每步检查回撤"""
-        # 从环境获取投资组合价值
-        if hasattr(self.training_env, 'get_attr'):
-            try:
-                portfolio_values = self.training_env.get_attr('total_value')
-                if portfolio_values:
-                    current_value = portfolio_values[0]  # 第一个环境的值
-
-                    if self.peak_value is None:
-                        self.peak_value = current_value
-                        return True
-
-                    if current_value > self.peak_value:
-                        self.peak_value = current_value
-
-                    current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
-                    current_drawdown = max(current_drawdown, 0.0)
-
-                    self.drawdown_history.append(current_drawdown)
-
-                    if current_drawdown > self.max_drawdown:
-                        self.counter += 1
-                    else:
-                        self.counter = 0
-
-                    if self.counter >= self.patience:
-                        if self.verbose > 0:
-                            print(f"\n触发回撤早停: 当前回撤 {current_drawdown:.4f} > 阈值 {self.max_drawdown:.4f}")
-                        return False
-            except:
-                pass
+        current_timesteps = self.model.num_timesteps
+        
+        # 按指定频率检查
+        if current_timesteps - self.last_check_timestep >= self.check_freq:
+            self.last_check_timestep = current_timesteps
+            
+            # 从环境获取投资组合价值
+            current_value = self._get_portfolio_value()
+            if current_value is not None:
+                should_stop = self._update_drawdown_monitoring(current_value)
+                if should_stop:
+                    return False
+        
         return True
+    
+    def _get_portfolio_value(self) -> Optional[float]:
+        """获取当前投资组合价值"""
+        try:
+            if hasattr(self.training_env, 'get_attr'):
+                portfolio_values = self.training_env.get_attr('total_value')
+                if portfolio_values and len(portfolio_values) > 0:
+                    return float(portfolio_values[0])  # 第一个环境的值
+            elif hasattr(self.training_env, 'total_value'):
+                return float(self.training_env.total_value)
+        except AttributeError:
+            # 环境不支持获取投资组合价值
+            if self.verbose > 1:
+                print("警告: 环境不支持投资组合价值获取，跳过回撤监控")
+        except Exception as e:
+            # 其他异常需要记录
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"获取投资组合价值时发生错误: {e}")
+        
+        return None
+    
+    def _update_drawdown_monitoring(self, current_value: float) -> bool:
+        """
+        更新回撤监控状态
+
+        Args:
+            current_value: 当前投资组合价值
+
+        Returns:
+            bool: 是否应该早停
+        """
+        if self.peak_value is None:
+            self.peak_value = current_value
+            self.drawdown_history.append(0.0)
+            return False
+
+        # 更新峰值
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+
+        # 计算当前回撤
+        if self.peak_value > 0:
+            current_drawdown = (self.peak_value - current_value) / self.peak_value
+            current_drawdown = max(current_drawdown, 0.0)
+        else:
+            current_drawdown = 0.0
+
+        self.drawdown_history.append(current_drawdown)
+
+        # 检查是否超过回撤阈值
+        if current_drawdown > self.max_drawdown:
+            self.counter += 1
+            if self.verbose > 0:
+                print(f"回撤警告: {current_drawdown:.4f} > {self.max_drawdown:.4f} (连续 {self.counter} 次)")
+        else:
+            self.counter = 0
+
+        # 判断是否需要早停
+        if self.counter >= self.patience:
+            if self.verbose > 0:
+                print(f"\n触发回撤早停: 当前回撤 {current_drawdown:.4f} > 阈值 {self.max_drawdown:.4f} "
+                      f"(连续 {self.counter} 次检查)")
+            return True
+
+        return False
 
     def get_current_drawdown(self) -> float:
+        """获取当前回撤"""
         return self.drawdown_history[-1] if self.drawdown_history else 0.0
+    
+    def get_max_drawdown(self) -> float:
+        """获取历史最大回撤"""
+        return max(self.drawdown_history) if self.drawdown_history else 0.0
 
 
 class DrawdownEarlyStopping:
@@ -643,12 +891,21 @@ class RLTrainer:
         logger.info(f"配置多核优化: {self.config.num_workers} 个数据工作进程, "
                    f"{self.config.parallel_environments} 个并行环境")
 
-        # 设置PyTorch多进程上下文
+        # 设置PyTorch多进程上下文（只在主进程中设置）
         try:
-            mp.set_start_method('spawn', force=True)
-        except RuntimeError:
-            # 如果已经设置了start method，忽略错误
-            pass
+            # 检查是否已经设置了start method
+            current_method = mp.get_start_method(allow_none=True)
+            if current_method is None:
+                mp.set_start_method('spawn')
+                logger.info("已设置多进程启动方法为 'spawn'")
+            else:
+                logger.info(f"多进程启动方法已设置为: {current_method}")
+        except RuntimeError as e:
+            # 如果在子进程中调用或已经设置，记录警告但不中断
+            logger.warning(f"无法设置多进程启动方法: {e}")
+        except Exception as e:
+            logger.error(f"设置多进程启动方法时发生未预期错误: {e}")
+            raise RuntimeError(f"多进程配置失败: {e}") from e
 
         # 设置cuDNN基准测试（如果启用GPU优化）
         if self.config.enable_cudnn_benchmark and torch.cuda.is_available():
@@ -770,8 +1027,10 @@ class RLTrainer:
         callbacks = []
 
         # 1. 添加进度回调（本地实现，集中管理）
+        # 计算基础日志频率（不考虑多环境，回调内部会自动调整）
+        base_log_freq = max(1000, self.config.total_timesteps // 50)
         progress_callback = TrainingProgressCallback(
-            log_freq=max(1000, self.config.total_timesteps // 50)
+            log_freq=base_log_freq
         )
         callbacks.append(progress_callback)
 
@@ -805,24 +1064,36 @@ class RLTrainer:
             )
             callbacks.append(checkpoint_callback)
 
-        # 4. 添加奖励阈值早停回调
-        if hasattr(self.config, 'reward_threshold') and self.config.reward_threshold is not None:
-            early_stop_callback = StopTrainingOnRewardThreshold(
-                reward_threshold=self.config.reward_threshold,
+        # 4. 添加基于评估指标的早停回调
+        if self.config.early_stopping_patience > 0:
+            early_stop_callback = EarlyStoppingCallback(
+                patience=self.config.early_stopping_patience,
+                min_delta=self.config.early_stopping_min_delta,
+                mode=self.config.early_stopping_mode,
+                check_freq=max(1000, self.config.eval_freq // 2),  # 检查频率为评估频率的一半
                 verbose=1
             )
             callbacks.append(early_stop_callback)
 
-        # 5. 添加回撤早停回调（如果启用）
-        if self.config.enable_drawdown_monitoring:
+        # 5. 添加奖励阈值早停回调
+        if hasattr(self.config, 'reward_threshold') and self.config.reward_threshold is not None:
+            reward_threshold_callback = StopTrainingOnRewardThreshold(
+                reward_threshold=self.config.reward_threshold,
+                verbose=1
+            )
+            callbacks.append(reward_threshold_callback)
+
+        # 6. 添加回撤早停回调（如果启用）
+        if self.config.enable_drawdown_monitoring and self.config.drawdown_early_stopping:
             drawdown_callback = DrawdownEarlyStoppingCallback(
                 max_drawdown=self.config.max_training_drawdown,
-                patience=self.config.early_stopping_patience // 2,
+                patience=max(5, self.config.early_stopping_patience // (self.config.max_steps_per_episode * 10)),  # 转换为合理的检查次数
+                check_freq=max(100, self.config.max_steps_per_episode),  # 每个episode检查一次
                 verbose=1
             )
             callbacks.append(drawdown_callback)
 
-        # 6. 添加增强指标记录回调（如果启用）
+        # 7. 添加增强指标记录回调（如果启用）
         if (ENHANCED_METRICS_AVAILABLE and
             (self.config.enable_portfolio_metrics or
              self.config.enable_agent_behavior_metrics or
@@ -868,15 +1139,47 @@ class EnhancedMetricsCallback(BaseCallback):
         """评估智能体性能（使用SB3内置评估）"""
         logger.info(f"开始评估，episodes: {n_episodes}")
 
-        # SB3的评估现在通过EvalCallback自动处理
-        # 这里保留方法以向后兼容，但建议使用SB3的评估机制
-        logger.info("评估现在通过SB3的EvalCallback自动进行")
-
-        # 返回基本统计信息（从agent获取）
-        if hasattr(self.agent, 'get_training_stats'):
-            return self.agent.get_training_stats()
-        else:
-            return {'note': 'evaluation_handled_by_sb3_evalcallback'}
+        try:
+            from stable_baselines3.common.evaluation import evaluate_policy
+            
+            # 创建评估环境
+            eval_env = self.environment
+            if self.env_factory:
+                # 如果有环境工厂，创建单独的评估环境
+                eval_env = self.env_factory()
+            
+            # 使用SB3的evaluate_policy进行评估
+            mean_reward, std_reward = evaluate_policy(
+                self.agent.model if hasattr(self.agent, 'model') else self.agent,
+                eval_env,
+                n_eval_episodes=n_episodes,
+                deterministic=True,
+                render=False,
+                return_episode_rewards=False
+            )
+            
+            logger.info(f"评估完成: 平均奖励={mean_reward:.4f}, 标准差={std_reward:.4f}")
+            
+            # 返回评估结果
+            results = {
+                'mean_reward': mean_reward,
+                'std_reward': std_reward,
+                'n_episodes': n_episodes
+            }
+            
+            # 如果智能体有额外的统计信息，也包含进来
+            if hasattr(self.agent, 'get_training_stats'):
+                agent_stats = self.agent.get_training_stats()
+                results.update(agent_stats)
+                
+            return results
+            
+        except ImportError as e:
+            logger.error("无法导入stable_baselines3.common.evaluation.evaluate_policy")
+            raise RuntimeError("SB3评估功能不可用，请检查stable_baselines3安装") from e
+        except Exception as e:
+            logger.error(f"评估过程中出现错误: {e}")
+            raise RuntimeError(f"智能体评估失败: {e}") from e
 
     def _monitor_drawdown(self, episode_reward: float, episode: int):
         """监控训练过程中的回撤"""

@@ -237,8 +237,13 @@ class MetricsCalculator:
             monthly_values = portfolio_values.resample('M').last()
             monthly_returns = monthly_values.pct_change().dropna()
             return monthly_returns.tolist()
-        except Exception:
-            # 如果重采样失败，使用简单分组
+        except (ValueError, KeyError, AttributeError) as e:
+            # 重采样相关的预期异常，使用简单分组作为备选方案
+            logger.debug(f"重采样失败，使用简单分组: {e}")
+        except Exception as e:
+            # 其他未预期异常，记录并使用备选方案
+            logger.warning(f"计算月度收益时发生未预期错误: {e}")
+            # 使用简单分组
             n_days = len(portfolio_values)
             days_per_month = 21  # 大约每月21个交易日
             

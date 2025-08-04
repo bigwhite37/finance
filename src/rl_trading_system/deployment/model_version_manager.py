@@ -547,10 +547,15 @@ class ModelVersionManager:
                 # 使用pickle作为通用序列化方法
                 with open(model_file_path, 'wb') as f:
                     pickle.dump(model, f)
-        except Exception:
-            # 如果torch.save失败（比如Mock对象），回退到pickle
+        except (AttributeError, TypeError, RuntimeError) as e:
+            # torch.save失败的预期异常（比如Mock对象），回退到pickle
+            logger.debug(f"torch.save失败，使用pickle作为备选: {e}")
             with open(model_file_path, 'wb') as f:
                 pickle.dump(model, f)
+        except Exception as e:
+            # 其他未预期异常，记录并重新抛出
+            logger.error(f"模型保存失败: {e}")
+            raise RuntimeError(f"无法保存模型到 {model_file_path}: {e}") from e
         
         return model_file_path
     

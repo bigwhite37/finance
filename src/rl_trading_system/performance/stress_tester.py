@@ -73,8 +73,13 @@ class LoadGenerator:
                 try:
                     future.result(timeout=5)
                     completed_tasks += 1
-                except Exception:
-                    pass
+                except TimeoutError:
+                    # 任务超时，记录但继续
+                    logger.warning("常量负载测试中任务执行超时")
+                except Exception as e:
+                    # 任务执行失败，记录错误
+                    logger.error(f"常量负载测试中任务执行失败: {e}")
+                    # 不重新抛出，继续处理其他任务
         
         total_duration = time.time() - start_time
         
@@ -119,8 +124,13 @@ class LoadGenerator:
                     try:
                         future.result(timeout=10)
                         total_completed += 1
-                    except Exception:
-                        pass
+                    except TimeoutError:
+                        # 任务超时，记录但继续
+                        logger.warning("突发负载测试中任务执行超时")
+                    except Exception as e:
+                        # 任务执行失败，记录错误
+                        logger.error(f"突发负载测试中任务执行失败: {e}")
+                        # 不重新抛出，继续处理其他任务
                 
                 # 等待间隔
                 if burst_id < num_bursts - 1:
@@ -184,8 +194,13 @@ class LoadGenerator:
                 try:
                     future.result(timeout=5)
                     completed_tasks += 1
-                except Exception:
-                    pass
+                except TimeoutError:
+                    # 任务超时，记录但继续
+                    logger.warning("斜坡负载测试中任务执行超时")
+                except Exception as e:
+                    # 任务执行失败，记录错误
+                    logger.error(f"斜坡负载测试中任务执行失败: {e}")
+                    # 不重新抛出，继续处理其他任务
         
         total_duration = time.time() - start_time
         
@@ -244,8 +259,13 @@ class LoadGenerator:
                 try:
                     future.result(timeout=5)
                     completed_tasks += 1
-                except Exception:
-                    pass
+                except TimeoutError:
+                    # 任务超时，记录但继续
+                    logger.warning("峰值负载测试中任务执行超时")
+                except Exception as e:
+                    # 任务执行失败，记录错误
+                    logger.error(f"峰值负载测试中任务执行失败: {e}")
+                    # 不重新抛出，继续处理其他任务
         
         total_duration = time.time() - start_time
         

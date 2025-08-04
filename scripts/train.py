@@ -50,6 +50,29 @@ def setup_logging(output_dir: str, log_level: str = "INFO"):
     return logging.getLogger(__name__)
 
 
+def get_training_config_value(model_config: dict, key: str, default=None):
+    """
+    统一获取训练配置值，处理不同的配置层级
+    
+    Args:
+        model_config: 模型配置字典
+        key: 配置键名
+        default: 默认值
+        
+    Returns:
+        配置值
+    """
+    # 优先级：model.training > training > default
+    if "model" in model_config and "training" in model_config["model"]:
+        if key in model_config["model"]["training"]:
+            return model_config["model"]["training"][key]
+    
+    if "training" in model_config and key in model_config["training"]:
+        return model_config["training"][key]
+        
+    return default
+
+
 def create_training_components(model_config: dict, trading_config: dict, output_dir: str):
     """创建训练所需的组件"""
     logger = logging.getLogger(__name__)
@@ -150,15 +173,10 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         n_features=model_config["model"]["transformer"]["n_features"]
     )
 
-    # 创建SAC配置，集成Transformer（使用SB3标准参数）
+    # 创建SAC配置，集成Transformer（只包含SAC特有参数）
     sac_config = SACConfig(
-        learning_rate=model_config["model"]["sac"].get("learning_rate", 0.0003),
-        gamma=model_config["model"]["sac"]["gamma"],
-        tau=model_config["model"]["sac"]["tau"],
         ent_coef=model_config["model"]["sac"].get("ent_coef", "auto"),
         target_entropy=model_config["model"]["sac"].get("target_entropy", "auto"),
-        batch_size=model_config["model"]["sac"]["batch_size"],
-        buffer_size=model_config["model"]["sac"]["buffer_size"],
         learning_starts=model_config["model"]["sac"].get("learning_starts", 1000),
         train_freq=model_config["model"]["sac"].get("train_freq", 1),
         gradient_steps=model_config["model"]["sac"].get("gradient_steps", 1),
@@ -167,9 +185,6 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         activation_fn=model_config["model"]["sac"].get("activation_fn", "relu"),
         use_transformer=True,  # 启用Transformer集成
         transformer_config=transformer_config,  # 传入Transformer配置
-        total_timesteps=model_config["model"]["training"].get("total_timesteps", model_config["training"]["n_episodes"] * 252),
-        eval_freq=model_config["model"]["training"].get("eval_freq", 5000),
-        n_eval_episodes=model_config["model"]["training"].get("n_eval_episodes", 10),
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
 
@@ -225,27 +240,34 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         )
     
     # 获取并行环境数量
-    n_envs = model_config["model"]["training"].get("parallel_environments", 1)
+    n_envs = get_training_config_value(model_config, "parallel_environments", 1)
     
     # 先创建训练配置（适配SB3参数）
     training_config = TrainingConfig(
         # SB3核心参数
-        total_timesteps=model_config["model"]["training"].get("total_timesteps", model_config["training"]["n_episodes"] * 252),
+        total_timesteps=get_training_config_value(model_config, "total_timesteps", get_training_config_value(model_config, "n_episodes", 1000) * 252),
         n_envs=n_envs,
-        eval_freq=model_config["model"]["training"].get("eval_freq", 5000),
-        save_freq=model_config["model"]["training"].get("save_freq", 10000),
-        n_eval_episodes=model_config["model"]["training"].get("n_eval_episodes", 10),
+        eval_freq=get_training_config_value(model_config, "eval_freq", 5000),
+        save_freq=get_training_config_value(model_config, "save_freq", 10000),
+        n_eval_episodes=get_training_config_value(model_config, "n_eval_episodes", 10),
+        
+        # SAC核心参数（从SACConfig迁移）
+        learning_rate=model_config["model"]["sac"].get("learning_rate", 0.0003),
+        gamma=model_config["model"]["sac"]["gamma"],
+        tau=model_config["model"]["sac"]["tau"],
+        batch_size=model_config["model"]["sac"]["batch_size"],
+        buffer_size=model_config["model"]["sac"]["buffer_size"],
         
         # 向后兼容参数
-        n_episodes=model_config["training"]["n_episodes"],
-        save_frequency=model_config["training"].get("eval_freq", 100),
-        validation_frequency=model_config["training"].get("eval_freq", 100),
-        early_stopping_patience=model_config["training"].get("patience", 50),
-        early_stopping_min_delta=model_config["training"].get("min_delta", 0.001),
+        n_episodes=get_training_config_value(model_config, "n_episodes", 1000),
+        save_frequency=get_training_config_value(model_config, "eval_freq", 100),
+        validation_frequency=get_training_config_value(model_config, "eval_freq", 100),
+        early_stopping_patience=get_training_config_value(model_config, "patience", 50),
+        early_stopping_min_delta=get_training_config_value(model_config, "min_delta", 0.001),
         save_dir=output_dir,
         
         # 奖励阈值（用于早停）
-        reward_threshold=model_config["model"]["training"].get("reward_threshold", None),
+        reward_threshold=get_training_config_value(model_config, "reward_threshold", None),
         
         # 增强指标配置
         enable_portfolio_metrics=trading_config.get("enhanced_metrics", {}).get("enable_portfolio_metrics", True),
@@ -372,7 +394,7 @@ def main():
         print(f"  {formatter.success('✅ 交易配置文件')}: {formatter.path(args.data_config)}")
         
         # 安全地获取训练轮数
-        n_episodes = model_config.get("model", {}).get("training", {}).get("n_episodes", 100)
+        n_episodes = get_training_config_value(model_config, "n_episodes", 100)
         print(f"  {formatter.info('训练轮数')}: {formatter.number(str(n_episodes))}")
         print(f"  {formatter.info('输出目录')}: {formatter.path(args.output_dir)}")
         print(f"  {formatter.info('训练设备')}: {formatter.highlight(device)}")
@@ -418,9 +440,12 @@ def main():
         print_evaluation_results(evaluation_stats, formatter)
 
         # 显示模型保存信息和使用建议（SB3模型路径）
-        model_paths = {
-            'final_model': str(output_dir / "final_model"),  # SB3模型不用.pth后缀
-        }
+        model_paths = {}
+        
+        # 检查最终模型（由trainer.train()保存）
+        final_model_path = output_dir / "final_model"
+        if final_model_path.exists() or (final_model_path / "sac_model.zip").exists():
+            model_paths['final_model'] = str(final_model_path)
         
         # 检查是否有最佳模型（SB3 EvalCallback保存的最佳模型）
         best_model_path = output_dir / "best_model"

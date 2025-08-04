@@ -130,8 +130,13 @@ class MemoryOptimizer:
             if optimized_df[col].dtype == 'object':
                 try:
                     optimized_df[col] = optimized_df[col].astype('category')
-                except Exception:
-                    pass
+                except (ValueError, TypeError) as e:
+                    # 类型转换失败是预期的，某些对象类型无法转为category
+                    logger.debug(f"列 {col} 无法转换为category类型: {e}")
+                except Exception as e:
+                    # 其他未预期异常需要记录
+                    logger.warning(f"列 {col} 类型转换时发生未预期错误: {e}")
+                    # 继续处理其他列
         
         memory_after = optimized_df.memory_usage(deep=True).sum() / 1024 / 1024
         
