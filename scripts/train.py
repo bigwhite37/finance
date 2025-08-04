@@ -20,7 +20,6 @@ sys.path.insert(0, str(project_root / "src"))
 
 from rl_trading_system.config import ConfigManager
 from rl_trading_system.training import RLTrainer, TrainingConfig, create_split_strategy, SplitConfig
-from rl_trading_system.training.enhanced_trainer import EnhancedRLTrainer, EnhancedTrainingConfig
 from rl_trading_system.data import QlibDataInterface, FeatureEngineer, DataProcessor
 from rl_trading_system.models import TimeSeriesTransformer, SACAgent, TransformerConfig, SACConfig
 from rl_trading_system.trading import PortfolioEnvironment, PortfolioConfig
@@ -160,7 +159,7 @@ def create_training_components(model_config: dict, trading_config: dict, output_
         target_entropy='auto',  # 自动设置目标熵
         batch_size=model_config["model"]["sac"]["batch_size"],
         buffer_size=model_config["model"]["sac"]["buffer_size"],
-        learning_starts=1000,  # 开始学习的最小步数
+        learning_starts=100,  # 开始学习的最小步数（降低以便更快开始学习）
         net_arch=[model_config["model"]["sac"]["hidden_dim"]] * 2,  # 使用两层隐藏层
         use_transformer=True,  # 启用Transformer集成
         transformer_config=transformer_config,  # 传入Transformer配置
@@ -213,8 +212,8 @@ def create_training_components(model_config: dict, trading_config: dict, output_
     sac_agent = SACAgent(sac_config, env=portfolio_env)
     sac_agent.set_env(portfolio_env)
 
-    # 创建增强训练配置
-    training_config = EnhancedTrainingConfig(
+    # 创建训练配置
+    training_config = TrainingConfig(
         n_episodes=model_config["training"]["n_episodes"],
         save_frequency=model_config["training"].get("eval_freq", 100),
         validation_frequency=model_config["training"].get("eval_freq", 100),
@@ -355,9 +354,9 @@ def main():
         # 设置设备
         training_config.device = device
 
-        # 创建增强训练器
-        logger_instance.info("初始化增强训练器...")
-        trainer = EnhancedRLTrainer(training_config, environment, agent, data_split)
+        # 创建训练器
+        logger_instance.info("初始化训练器...")
+        trainer = RLTrainer(training_config, environment, agent, data_split)
 
         # 从检查点恢复（如果指定）
         start_episode = 0
