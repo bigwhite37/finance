@@ -24,8 +24,8 @@ from model import PortfolioMetrics
 logger = logging.getLogger(__name__)
 
 # 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+from font_config import setup_chinese_font
+setup_chinese_font()
 
 
 class RLStrategy(BaseStrategy):

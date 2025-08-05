@@ -22,8 +22,8 @@ from qlib.utils import flatten_dict
 logger = logging.getLogger(__name__)
 
 # 设置中文字体和样式
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+from font_config import setup_chinese_font
+setup_chinese_font()
 plt.style.use('seaborn-v0_8')
 
 
@@ -142,8 +142,8 @@ class QlibVisualizer:
         ax.grid(True, alpha=0.3)
 
         # 添加关键统计信息
-        final_rl = rl_norm.iloc[-1] if len(rl_norm) > 0 else 1
-        final_bench = bench_norm.iloc[-1] if len(bench_norm) > 0 else 1
+        final_rl = rl_norm[-1] if len(rl_norm) > 0 else 1
+        final_bench = bench_norm[-1] if len(bench_norm) > 0 else 1
         ax.text(0.02, 0.98, f'RL最终收益: {(final_rl-1):.2%}\n基准最终收益: {(final_bench-1):.2%}',
                 transform=ax.transAxes, va='top', ha='left',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))

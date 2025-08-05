@@ -204,10 +204,25 @@ def prepare_test_data(config: dict, args, logger: logging.Logger):
     logger.info(f"股票数量: {data_config['stock_limit']}")
 
     # 初始化数据加载器
-    data_loader = QlibDataLoader(data_config)
-
+    data_loader = QlibDataLoader(data_config.get('data_root'))
+    
+    # 初始化Qlib
+    data_loader.initialize_qlib(data_config.get('provider_uri'))
+    
+    # 获取股票列表
+    stock_list = data_loader.get_stock_list(
+        market=data_config.get('market', 'all'),
+        limit=data_config.get('stock_limit')
+    )
+    
     # 加载测试数据
-    _, _, test_data = data_loader.load_data()
+    test_data = data_loader.load_data(
+        instruments=stock_list,
+        start_time=data_config['test_start'],
+        end_time=data_config['test_end'],
+        freq=data_config.get('freq', 'day'),
+        fields=data_config.get('fields')
+    )
 
     logger.info(f"测试数据形状: {test_data.shape}")
     logger.info(f"数据时间范围: {test_data.index.get_level_values(1).min()} - {test_data.index.get_level_values(1).max()}")

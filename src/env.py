@@ -10,6 +10,10 @@ from typing import Dict, Tuple, Any, Optional, List
 import logging
 from collections import deque
 import matplotlib.pyplot as plt
+from font_config import setup_chinese_font
+
+# 设置中文字体
+setup_chinese_font()
 
 logger = logging.getLogger(__name__)
 
