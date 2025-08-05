@@ -1,5 +1,6 @@
 # SAC算法分钟线数据配置文件
 # 适用于高频交易策略，使用分钟线数据进行训练
+# 基于fix.md分析报告的优化改进
 
 # 数据配置
 data:
@@ -9,6 +10,8 @@ data:
     day: "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
   market: "csi300"
   stock_limit: 30  # 分钟线数据计算量大，减少股票数量
+  # 可选：自定义股票池（如果指定则优先使用，否则使用market参数）
+  custom_stocks: null  # 例: ["sh600000", "sz000001", "sh600036"]
   start_time: "2022-01-01"
   end_time: "2023-12-31"
   train_start: "2022-01-01"
@@ -31,8 +34,8 @@ environment:
   initial_cash: 1000000
   lookback_window: 60  # 1小时历史窗口
   transaction_cost: 0.005  # 分钟线交易成本稍高
-  max_drawdown_threshold: 0.10  # 更严格的回撤控制
-  reward_penalty: 3.0  # 加大回撤惩罚
+  max_drawdown_threshold: 0.08  # 更严格的回撤控制（分钟线更严格）
+  reward_penalty: 5.0  # 增强回撤惩罚力度
   features:
     - "$close"
     - "$open"
@@ -41,11 +44,12 @@ environment:
     - "$volume"
     - "$vwap"
   rebalance_freq: "1min"
+  max_steps: 240  # 确保episode足够长（对分钟线约240分钟）
 
 # 模型配置
 model:
   algorithm: "SAC"
-  learning_rate: 1e-4  # 分钟线数据较小学习率
+  learning_rate: 0.003  # 提高学习率以适应新的奖励尺度
   batch_size: 512
   gamma: 0.995  # 更重视长期奖励
   buffer_size: 2000000  # 更大的经验回放缓存
@@ -73,9 +77,12 @@ callbacks:
   enable_checkpoint: true
   save_freq: 100000
   enable_drawdown_stopping: true
-  max_training_drawdown: 0.10
-  drawdown_patience: 50
+  max_training_drawdown: 0.08      # 更严格的回撤阈值
+  drawdown_patience: 20            # 更快的早停响应
   enable_tensorboard: true
+  enable_training_metrics: true     # 启用训练指标监控
+  metrics_log_interval: 2000       # 每2000步输出基础指标
+  metrics_eval_interval: 10000     # 更频繁的详细评估
 
 # 评估配置
 evaluation:

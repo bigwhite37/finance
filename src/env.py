@@ -10,10 +10,18 @@ from typing import Dict, Tuple, Any, Optional, List
 import logging
 from collections import deque
 import matplotlib.pyplot as plt
-from font_config import setup_chinese_font
 
-# 设置中文字体
-setup_chinese_font()
+# 尝试设置中文字体，如果失败就使用默认字体
+try:
+    from font_config import setup_chinese_font
+    setup_chinese_font()
+except ImportError:
+    # 如果font_config不存在，使用基本的中文字体设置
+    try:
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+    except:
+        pass  # 如果字体设置失败，使用默认字体
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +45,8 @@ class PortfolioEnv(gym.Env):
                  max_drawdown_threshold: float = 0.15,
                  reward_penalty: float = 2.0,
                  features: List[str] = None,
-                 rebalance_freq: str = "daily"):
+                 rebalance_freq: str = "daily",
+                 max_steps: int = None):
         """
         初始化组合环境
 
@@ -50,6 +59,7 @@ class PortfolioEnv(gym.Env):
             reward_penalty: 回撤惩罚系数
             features: 特征列名列表
             rebalance_freq: 调仓频率
+            max_steps: 最大步数（None则使用全部数据长度）
         """
         super().__init__()
 
@@ -67,6 +77,17 @@ class PortfolioEnv(gym.Env):
         self.time_index = sorted(data.index.get_level_values(1).unique())
         self.num_stocks = len(self.stock_list)
         self.num_periods = len(self.time_index)
+        
+        # 设置最大步数（确保有足够长的episode）
+        if max_steps is None:
+            # 默认使用全部可用步数
+            self.max_steps = self.num_periods - self.lookback_window - 1
+        else:
+            # 用户指定的步数，但不能超过数据长度
+            self.max_steps = min(max_steps, self.num_periods - self.lookback_window - 1)
+        
+        # 确保最小episode长度
+        self.max_steps = max(self.max_steps, 60)  # 至少60步（约3个月日频数据）
 
         # 特征列
         if features is None:
@@ -110,12 +131,110 @@ class PortfolioEnv(gym.Env):
         if missing_features:
             raise ValueError(f"数据中缺少特征列: {missing_features}")
 
-        # 检查数据是否有缺失值
-        if self.data.isnull().any().any():
-            logger.warning("数据中存在缺失值，将进行前向填充")
-            self.data = self.data.ffill().bfill()
+        # 详细检查数据缺失情况
+        self._check_and_handle_missing_data()
 
         logger.info(f"数据验证完成：{self.num_stocks}只股票，{self.num_periods}个时间点")
+
+    def _check_and_handle_missing_data(self):
+        """检查并处理数据缺失值"""
+        # 统计缺失值情况
+        missing_stats = self.data.isnull().sum()
+        total_missing = missing_stats.sum()
+        
+        if total_missing == 0:
+            logger.info("数据完整，无缺失值")
+            return
+            
+        # 详细报告缺失情况
+        total_points = len(self.data)
+        missing_ratio = total_missing / (total_points * len(self.features))
+        
+        logger.warning(f"数据缺失值统计:")
+        logger.warning(f"总缺失点数: {total_missing}")
+        logger.warning(f"缺失比例: {missing_ratio:.2%}")
+        
+        # 按特征统计缺失情况
+        for feature in self.features:
+            if feature in missing_stats and missing_stats[feature] > 0:
+                feature_missing_ratio = missing_stats[feature] / total_points
+                logger.warning(f"特征 {feature} 缺失: {missing_stats[feature]} 个点 ({feature_missing_ratio:.2%})")
+        
+        # 缺失值处理策略
+        if missing_ratio > 0.1:  # 缺失超过10%
+            raise RuntimeError(
+                f"数据缺失过多 ({missing_ratio:.2%})，可能影响模型质量。\n"
+                f"建议检查数据源或调整时间范围。缺失统计: {dict(missing_stats[missing_stats > 0])}"
+            )
+        elif missing_ratio > 0.05:  # 缺失5%-10%
+            logger.error(
+                f"数据缺失较多 ({missing_ratio:.2%})，将使用智能填充处理，但建议检查数据质量。\n"
+                f"缺失统计: {dict(missing_stats[missing_stats > 0])}"
+            )
+        else:  # 缺失少于5%
+            logger.info(
+                f"数据存在少量缺失 ({missing_ratio:.2%})，属于正常现象（停牌/新股），将使用智能填充处理。\n"
+                f"缺失统计: {dict(missing_stats[missing_stats > 0])}"
+            )
+        
+        # 使用智能缺失值填充策略
+        original_data = self.data.copy()
+        
+        # 1. 对于价格相关特征，使用前向填充（保持最后已知价格）
+        price_features = [f for f in self.features if any(p in f for p in ['close', 'open', 'high', 'low', 'price'])]
+        for feature in price_features:
+            if feature in self.data.columns:
+                self.data[feature] = self.data[feature].ffill()
+        
+        # 2. 对于成交量相关特征，使用0填充（停牌期间成交量为0）
+        volume_features = [f for f in self.features if 'volume' in f]
+        for feature in volume_features:
+            if feature in self.data.columns:
+                self.data[feature] = self.data[feature].fillna(0)
+        
+        # 3. 对于涨跌相关特征，使用0填充（停牌期间涨跌为0）
+        change_features = [f for f in self.features if 'change' in f]
+        for feature in change_features:
+            if feature in self.data.columns:
+                self.data[feature] = self.data[feature].fillna(0)
+        
+        # 4. 对于factor类特征，使用前向填充
+        factor_features = [f for f in self.features if 'factor' in f]
+        for feature in factor_features:
+            if feature in self.data.columns:
+                self.data[feature] = self.data[feature].ffill()
+        
+        # 5. 处理剩余缺失值
+        remaining_missing = self.data.isnull().sum().sum()
+        if remaining_missing > 0:
+            logger.warning(f"智能填充后仍有 {remaining_missing} 个缺失值，使用后向填充和均值填充")
+            self.data = self.data.bfill()  # 后向填充
+            
+            # 最后使用均值填充
+            for feature in self.features:
+                if self.data[feature].isnull().any():
+                    feature_mean = original_data[feature].mean()
+                    if pd.isna(feature_mean):
+                        # 使用合理的默认值
+                        if any(p in feature for p in ['close', 'open', 'high', 'low', 'price']):
+                            default_value = 100.0  # 价格类特征默认值
+                        elif 'volume' in feature:
+                            default_value = 0.0  # 成交量默认值（停牌时为0）
+                        elif 'change' in feature:
+                            default_value = 0.0  # 涨跌默认值
+                        else:
+                            default_value = 1.0  # 其他特征默认值
+                        logger.warning(f"特征 {feature} 均值为NaN，使用默认值 {default_value}")
+                        self.data[feature].fillna(default_value, inplace=True)
+                    else:
+                        self.data[feature].fillna(feature_mean, inplace=True)
+        
+        # 最终验证
+        final_missing = self.data.isnull().sum().sum()
+        if final_missing > 0:
+            raise RuntimeError(f"数据处理后仍有 {final_missing} 个缺失值，无法继续处理")
+        
+        logger.info("数据缺失值处理完成")
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """重置环境状态"""
@@ -178,7 +297,7 @@ class PortfolioEnv(gym.Env):
         reward = self._calculate_reward(old_weights, action, trade_cost)
 
         # 检查终止条件
-        terminated = (self.current_step >= self.num_periods - 1 or
+        terminated = (self.current_step >= min(self.num_periods - 1, self.lookback_window + self.max_steps) or
                      self.current_drawdown >= self.max_drawdown_threshold)
 
         # 记录交易历史

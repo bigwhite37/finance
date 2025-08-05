@@ -1,5 +1,5 @@
-# PPO算法日线数据配置文件
-# 适用于中长期投资策略，使用日线数据进行训练
+# SAC算法日线数据配置文件
+# 适用于中长期投资策略，使用SAC算法和日线数据进行训练
 # 基于fix.md分析报告的优化改进
 
 # 数据配置
@@ -9,9 +9,9 @@ data:
     1min: "/Users/shuzhenyi/.qlib/qlib_data/cn_data_1min"
     day: "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
   market: "csi300"
-  stock_limit: 50
+  stock_limit: 50          # 增加股票数量以提高多样性
   # 可选：自定义股票池（如果指定则优先使用，否则使用market参数）
-  custom_stocks: ["sh600919", "sh601288", "sh600036"]
+  custom_stocks: null  # 例: ["sh600000", "sz000001", "sh600036"]
   start_time: "2020-01-01"
   end_time: "2023-12-31"
   train_start: "2020-01-01"
@@ -50,22 +50,21 @@ environment:
 
 # 模型配置
 model:
-  algorithm: "PPO"
+  algorithm: "SAC"
   learning_rate: 0.003             # 提高学习率以适应新的奖励尺度
   batch_size: 256
   gamma: 0.99
-  n_steps: 2048  # PPO特有参数
-  n_epochs: 10
-  clip_range: 0.2
-  ent_coef: 0.01  # 熵系数，鼓励探索
-  vf_coef: 0.5    # 价值函数损失系数
-  max_grad_norm: 0.5  # 梯度裁剪
+  # SAC特定参数
+  buffer_size: 1000000
+  tau: 0.005
+  target_update_interval: 1
+  learning_starts: 1000            # 减少学习开始步数
   use_custom_policy: false
-  net_arch: [256, 256]             # 增加网络复杂度
+  net_arch: [256, 256]
 
 # 训练配置
 training:
-  total_timesteps: 5000         # 大幅增加训练步数
+  total_timesteps: 1000000         # 增加训练步数
   n_envs: 4
   seed: 42
   log_interval: 10

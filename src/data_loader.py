@@ -48,7 +48,7 @@ class QlibDataLoader:
                 dir_path = os.path.join(path, dir_name)
                 if not os.path.exists(dir_path):
                     logger.warning(f"可能缺少必要目录: {dir_path}")
-            
+
             # 检查关键文件（根据数据频率）
             if freq == "day":
                 calendar_file = os.path.join(path, "calendars", "day.txt")
@@ -56,9 +56,9 @@ class QlibDataLoader:
                 calendar_file = os.path.join(path, "calendars", "1min.txt")
             else:
                 calendar_file = os.path.join(path, "calendars", f"{freq}.txt")
-                
+
             instruments_file = os.path.join(path, "instruments", "all.txt")
-            
+
             for file_path in [calendar_file, instruments_file]:
                 if not os.path.exists(file_path):
                     logger.warning(f"关键文件不存在: {file_path}")
@@ -78,13 +78,14 @@ class QlibDataLoader:
             logger.error(f"Qlib初始化失败: {e}")
             raise RuntimeError(f"Qlib初始化失败: {e}")
 
-    def get_stock_list(self, market: str = "all", limit: int = None) -> list:
+    def get_stock_list(self, market: str = "all", limit: int = None, custom_pool: list = None) -> list:
         """
         获取股票列表
 
         Args:
             market: 市场类型，"all", "csi300", "csi500"等
             limit: 限制返回数量
+            custom_pool: 自定义股票池列表，如果提供则使用此列表
 
         Returns:
             股票代码列表
@@ -93,14 +94,23 @@ class QlibDataLoader:
             raise RuntimeError("请先初始化Qlib")
 
         try:
+            # 如果提供了自定义股票池，直接使用
+            if custom_pool:
+                stock_list = [stock.lower() if not stock.islower() else stock for stock in custom_pool]
+                if limit:
+                    stock_list = stock_list[:limit]
+                logger.info(f"使用自定义股票池，获取到{len(stock_list)}只股票")
+                return stock_list
+            
+            # 从qlib数据文件中读取股票池
             if market == "all":
                 instruments_file = os.path.join(self.data_root, "cn_data", "instruments", "all.txt")
             else:
                 instruments_file = os.path.join(self.data_root, "cn_data", "instruments", f"{market}.txt")
-            
+
             if not os.path.exists(instruments_file):
                 raise FileNotFoundError(f"股票池文件不存在: {instruments_file}")
-            
+
             stock_list = []
             with open(instruments_file, 'r') as f:
                 for line in f:
@@ -115,7 +125,7 @@ class QlibDataLoader:
             if limit:
                 stock_list = stock_list[:limit]
 
-            logger.info(f"获取到{len(stock_list)}只股票")
+            logger.info(f"从{market}市场获取到{len(stock_list)}只股票")
             return stock_list
 
         except Exception as e:
@@ -298,49 +308,77 @@ class QlibDataLoader:
         """验证加载的数据质量"""
         if data.empty:
             raise RuntimeError("加载的数据为空")
-        
+
         # 检查数据形状
         expected_columns = len(fields)
         actual_columns = len(data.columns)
         if actual_columns != expected_columns:
             logger.warning(f"数据列数不匹配: 期望 {expected_columns}, 实际 {actual_columns}")
+
+        # 按股票检查缺失值（正确的检测方式）
+        total_missing = 0
+        missing_instruments = []
         
-        # 检查缺失值
-        missing_stats = data.isnull().sum()
-        total_missing = missing_stats.sum()
+        if isinstance(data.index, pd.MultiIndex) and data.index.names[0] == 'instrument':
+            # qlib的多索引格式：(instrument, datetime)
+            for instrument in instruments:
+                try:
+                    instrument_data = data.xs(instrument, level=0)
+                    missing_stats = instrument_data.isnull().sum()
+                    instrument_missing = missing_stats.sum()
+                    
+                    if instrument_missing > 0:
+                        total_missing += instrument_missing
+                        missing_instruments.append(instrument)
+                        
+                        # 找出缺失的日期范围
+                        missing_mask = instrument_data.isnull().any(axis=1)
+                        missing_dates = instrument_data[missing_mask].index
+                        
+                        if len(missing_dates) > 0:
+                            date_ranges = self._get_date_ranges(missing_dates)
+                            logger.warning(f"股票 {instrument} 数据缺失:")
+                            logger.warning(f"  缺失天数: {len(missing_dates)} 天")
+                            logger.warning(f"  缺失日期: {date_ranges}")
+                            logger.warning(f"  缺失特征: {list(missing_stats[missing_stats > 0].index)}")
+                    else:
+                        logger.debug(f"股票 {instrument} 数据完整")
+                        
+                except KeyError:
+                    logger.error(f"股票 {instrument} 在数据中不存在")
+                    raise RuntimeError(f"股票 {instrument} 数据缺失")
+        else:
+            # 简单索引格式的缺失值检测
+            missing_stats = data.isnull().sum()
+            total_missing = missing_stats.sum()
+            
+            if total_missing > 0:
+                logger.warning(f"数据存在缺失值: {dict(missing_stats[missing_stats > 0])}")
         
+        # 总体评估
         if total_missing > 0:
-            total_points = len(data)
-            missing_ratio = total_missing / (total_points * len(data.columns))
+            total_expected_points = len(instruments) * len(data.index.get_level_values(1).unique()) * len(fields)
+            missing_ratio = total_missing / total_expected_points
             
-            logger.warning(f"数据加载时发现缺失值:")
-            logger.warning(f"总缺失点数: {total_missing} / {total_points * len(data.columns)} ({missing_ratio:.2%})")
-            
-            # 按列统计缺失情况
-            for col in data.columns:
-                if missing_stats[col] > 0:
-                    col_missing_ratio = missing_stats[col] / total_points
-                    logger.warning(f"列 {col} 缺失: {missing_stats[col]} ({col_missing_ratio:.2%})")
+            logger.info(f"数据质量评估:")
+            logger.info(f"  总股票数: {len(instruments)}")
+            logger.info(f"  缺失股票数: {len(missing_instruments)}")
+            logger.info(f"  总缺失率: {missing_ratio:.2%}")
             
             # 根据缺失比例决定处理策略
-            if missing_ratio > 0.2:  # 缺失超过20%
+            if missing_ratio > 0.1:  # 缺失超过10%
                 raise RuntimeError(
-                    f"数据缺失过多 ({missing_ratio:.2%})，无法继续处理。\n"
-                    f"建议检查：\n"
-                    f"1. 数据源是否正常\n"
-                    f"2. 股票代码是否正确\n"
-                    f"3. 时间范围是否合理\n"
-                    f"缺失统计: {dict(missing_stats[missing_stats > 0])}"
+                    f"数据缺失过多 ({missing_ratio:.2%})，可能影响模型质量。\n"
+                    f"缺失股票: {missing_instruments}\n"
+                    f"建议检查数据源或调整股票池。"
                 )
-            elif missing_ratio > 0.1:  # 缺失10%-20%
-                logger.error(
-                    f"数据缺失较多 ({missing_ratio:.2%})，将在环境中进行处理，但建议检查数据质量。"
-                )
+            elif missing_ratio > 0.05:  # 缺失5%-10%
+                logger.warning(f"数据缺失较多 ({missing_ratio:.2%})，将自动处理，但建议检查数据质量")
             else:
-                logger.info(f"数据存在少量缺失 ({missing_ratio:.2%})，将在环境中进行处理")
+                logger.info(f"数据存在少量缺失 ({missing_ratio:.2%})，属于正常现象（停牌等），将自动处理")
         else:
-            logger.info("数据加载完整，无缺失值")
-        
+            logger.info("所有股票数据完整，无缺失值")
+
         # 检查数据范围合理性
         for col in data.columns:
             if '$' in col and ('price' in col or 'close' in col or 'open' in col or 'high' in col or 'low' in col):
@@ -353,8 +391,40 @@ class QlibDataLoader:
                 negative_volume = (data[col] < 0).sum()
                 if negative_volume > 0:
                     logger.warning(f"发现 {negative_volume} 个负成交量在列 {col}")
-        
+
         logger.info("数据质量检查完成")
+    
+    def _get_date_ranges(self, dates):
+        """将日期列表转换为范围描述"""
+        if len(dates) == 0:
+            return "无"
+        elif len(dates) <= 3:
+            return [d.strftime('%Y-%m-%d') for d in dates]
+        else:
+            # 找连续日期段
+            sorted_dates = sorted(dates)
+            ranges = []
+            start_date = sorted_dates[0]
+            end_date = sorted_dates[0]
+            
+            for i in range(1, len(sorted_dates)):
+                if (sorted_dates[i] - end_date).days <= 2:  # 允许周末间隔
+                    end_date = sorted_dates[i]
+                else:
+                    if start_date == end_date:
+                        ranges.append(start_date.strftime('%Y-%m-%d'))
+                    else:
+                        ranges.append(f"{start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}")
+                    start_date = sorted_dates[i]
+                    end_date = sorted_dates[i]
+            
+            # 添加最后一个范围
+            if start_date == end_date:
+                ranges.append(start_date.strftime('%Y-%m-%d'))
+            else:
+                ranges.append(f"{start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}")
+            
+            return ranges
 
     def get_calendar(self, start_time: str, end_time: str, freq: str = "day") -> list:
         """

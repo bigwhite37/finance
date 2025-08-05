@@ -36,18 +36,18 @@ class TrainingQualityAnalyzer:
         self.metrics_history = []
         self.quality_scores = {}
         
-    def analyze_training_stability(self, rewards: List[float], window_size: int = 100) -> Dict[str, float]:
+    def analyze_training_stability(self, rewards: List[float], window_size: int = 50) -> Dict[str, float]:
         """
         分析训练稳定性
         
         Args:
             rewards: 奖励历史
-            window_size: 滑动窗口大小
+            window_size: 滑动窗口大小（默认50而非100）
             
         Returns:
             稳定性指标字典
         """
-        if len(rewards) < window_size:
+        if len(rewards) < 10:  # 最少需要10个奖励值
             return {
                 'stability_score': 0.0, 
                 'trend_score': 0.0, 
@@ -56,29 +56,44 @@ class TrainingQualityAnalyzer:
                 'variance': 0.0
             }
         
-        # 计算滑动平均
-        moving_avg = []
-        for i in range(window_size, len(rewards)):
-            window_rewards = rewards[i-window_size:i]
-            moving_avg.append(np.mean(window_rewards))
+        # 动态调整窗口大小避免过大
+        actual_window_size = min(window_size, max(10, len(rewards) // 2))
+        
+        # 如果数据不足窗口大小，直接用所有数据
+        if len(rewards) < actual_window_size:
+            moving_avg = [np.mean(rewards)]
+        else:
+            # 计算滑动平均
+            moving_avg = []
+            for i in range(actual_window_size, len(rewards) + 1):
+                window_rewards = rewards[i-actual_window_size:i]
+                moving_avg.append(np.mean(window_rewards))
         
         if len(moving_avg) < 2:
-            return {
-                'stability_score': 0.0, 
-                'trend_score': 0.0, 
-                'variance_score': 0.0,
-                'slope': 0.0,
-                'variance': 0.0
-            }
+            # 如果滑动平均不足2个点，直接分析原始奖励
+            x = np.arange(len(rewards))
+            slope = np.polyfit(x, rewards, 1)[0] if len(rewards) > 1 else 0.0
+            variance = np.var(rewards)
+            mean_reward = np.mean(rewards)
+        else:
+            # 趋势分析 - 线性回归斜率
+            x = np.arange(len(moving_avg))
+            slope = np.polyfit(x, moving_avg, 1)[0]
+            variance = np.var(moving_avg)
+            mean_reward = np.mean(moving_avg)
         
-        # 趋势分析 - 线性回归斜率
-        x = np.arange(len(moving_avg))
-        slope = np.polyfit(x, moving_avg, 1)[0]
-        trend_score = max(0, min(1, (slope + 0.01) / 0.02))  # 归一化到[0,1]
+        # 改进的趋势评分：考虑负奖励情况
+        if mean_reward < 0:
+            # 对于负奖励，斜率为正（趋向0或正值）得高分
+            trend_score = max(0, min(1, (slope + 0.1) / 0.2))
+        else:
+            # 对于正奖励，斜率为正得高分
+            trend_score = max(0, min(1, (slope + 0.01) / 0.02))
         
-        # 方差分析
-        variance = np.var(moving_avg)
-        variance_score = max(0, min(1, 1 - variance / (np.mean(moving_avg) ** 2 + 1e-8)))
+        # 改进的方差评分：考虑奖励的绝对值
+        abs_mean = abs(mean_reward) + 1e-8
+        relative_variance = variance / (abs_mean ** 2)
+        variance_score = max(0, min(1, 1 - relative_variance / 10))  # 调整方差容忍度
         
         # 综合稳定性得分
         stability_score = 0.6 * trend_score + 0.4 * variance_score
@@ -297,7 +312,7 @@ class TrainingQualityAnalyzer:
 class DrawdownStoppingCallback(BaseCallback):
     """回撤早停回调，用于Stable-Baselines3"""
 
-    def __init__(self, max_drawdown: float = 0.15, patience: int = 100, verbose: int = 0):
+    def __init__(self, max_drawdown: float = 0.12, patience: int = 20, verbose: int = 0):
         super().__init__(verbose)
         self.max_drawdown = max_drawdown
         self.patience = patience
@@ -697,7 +712,8 @@ class RLTrainer:
         # 获取股票列表
         market = data_config.get('market', 'csi300')
         stock_limit = data_config.get('stock_limit', 50)
-        stock_list = self.data_loader.get_stock_list(market, stock_limit)
+        custom_stocks = data_config.get('custom_stocks', None)
+        stock_list = self.data_loader.get_stock_list(market, stock_limit, custom_stocks)
 
         logger.info(f"获取{len(stock_list)}只股票用于训练")
 
@@ -744,7 +760,8 @@ class RLTrainer:
                     transaction_cost=env_config.get('transaction_cost', 0.003),
                     max_drawdown_threshold=env_config.get('max_drawdown_threshold', 0.15),
                     reward_penalty=env_config.get('reward_penalty', 2.0),
-                    features=env_config.get('features')
+                    features=env_config.get('features'),
+                    max_steps=env_config.get('max_steps')
                 )
 
                 # 添加Monitor包装器用于记录
@@ -881,8 +898,8 @@ class RLTrainer:
         # 回撤早停回调
         if callback_config.get('enable_drawdown_stopping', True):
             drawdown_callback = DrawdownStoppingCallback(
-                max_drawdown=callback_config.get('max_training_drawdown', 0.15),
-                patience=callback_config.get('drawdown_patience', 100),
+                max_drawdown=callback_config.get('max_training_drawdown', 0.12),
+                patience=callback_config.get('drawdown_patience', 20),
                 verbose=1
             )
             callbacks.append(drawdown_callback)
@@ -975,7 +992,8 @@ class RLTrainer:
                 transaction_cost=env_config.get('transaction_cost', 0.003),
                 max_drawdown_threshold=env_config.get('max_drawdown_threshold', 0.15),
                 reward_penalty=env_config.get('reward_penalty', 2.0),
-                features=env_config.get('features')
+                features=env_config.get('features'),
+                max_steps=env_config.get('max_steps')
             )
         else:
             eval_env = self.eval_env.envs[0]
@@ -1128,13 +1146,14 @@ if __name__ == "__main__":
             'initial_cash': 1000000,
             'lookback_window': 30,
             'transaction_cost': 0.003,
-            'max_drawdown_threshold': 0.15,
-            'reward_penalty': 2.0,
-            'features': ['$close', '$open', '$high', '$low', '$volume']
+            'max_drawdown_threshold': 0.12,   # 更严格的回撤阈值
+            'reward_penalty': 5.0,             # 增强回撤惩罚
+            'features': ['$close', '$open', '$high', '$low', '$volume'],
+            'max_steps': 240                   # 确保episode足够长（约1年日频数据）
         },
         'model': {
             'algorithm': 'SAC',
-            'learning_rate': 3e-4,
+            'learning_rate': 3e-3,  # 提高学习率以适应新的奖励尺度
             'batch_size': 256,
             'gamma': 0.99,
             'buffer_size': 1000000,
@@ -1151,15 +1170,15 @@ if __name__ == "__main__":
         'callbacks': {
             'enable_training_metrics': True,
             'metrics_log_interval': 1000,      # 每1000步输出基础指标
-            'metrics_eval_interval': 10000,    # 每10000步输出详细指标
+            'metrics_eval_interval': 5000,     # 更频繁的详细评估
             'enable_eval': True,
             'eval_freq': 10000,
             'n_eval_episodes': 3,
             'enable_checkpoint': True,
             'save_freq': 50000,
             'enable_drawdown_stopping': True,
-            'max_training_drawdown': 0.15,
-            'drawdown_patience': 100,
+            'max_training_drawdown': 0.12,     # 更严格的回撤阈值
+            'drawdown_patience': 20,           # 更快的早停
             'enable_tensorboard': True
         },
         'evaluation': {

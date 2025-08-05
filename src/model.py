@@ -302,16 +302,19 @@ class RiskAwareRewardWrapper:
     """
     
     def __init__(self, 
-                 base_penalty: float = 2.0,
+                 base_penalty: float = 5.0,  # 增强回撤惩罚系数
                  volatility_threshold: float = 0.02,
                  drawdown_threshold: float = 0.05,
-                 adaptive_penalty: bool = True):
+                 adaptive_penalty: bool = True,
+                 scale_factor: float = 1.0):  # 移除奖励缩放
         self.base_penalty = base_penalty
         self.volatility_threshold = volatility_threshold
         self.drawdown_threshold = drawdown_threshold
         self.adaptive_penalty = adaptive_penalty
+        self.scale_factor = scale_factor
         
         # 自适应参数
+        from collections import deque
         self.recent_volatility = deque(maxlen=20)
         self.recent_drawdowns = deque(maxlen=20)
     
@@ -340,18 +343,20 @@ class RiskAwareRewardWrapper:
             self.recent_drawdowns.append(current_drawdown)
         
         # 基础收益奖励
-        reward = portfolio_return
+        reward = portfolio_return * self.scale_factor
         
-        # 动态回撤惩罚
+        # 动态回撤惩罚 - 增强力度
         if current_drawdown > self.drawdown_threshold:
             if self.adaptive_penalty and len(self.recent_drawdowns) > 5:
                 # 基于历史回撤调整惩罚强度
                 avg_drawdown = np.mean(list(self.recent_drawdowns))
-                penalty_multiplier = min(3.0, 1 + avg_drawdown / self.drawdown_threshold)
+                penalty_multiplier = min(5.0, 1 + 2 * avg_drawdown / self.drawdown_threshold)
             else:
                 penalty_multiplier = 1.0
             
-            drawdown_penalty = self.base_penalty * penalty_multiplier * (current_drawdown - self.drawdown_threshold)
+            # 使用动态lambda - 回撤越大惩罚越重
+            lambda_penalty = 1 + 4 * max(0, current_drawdown - 0.05)
+            drawdown_penalty = self.base_penalty * penalty_multiplier * lambda_penalty * (current_drawdown - self.drawdown_threshold)
             reward -= drawdown_penalty
         
         # 波动率惩罚
@@ -363,8 +368,8 @@ class RiskAwareRewardWrapper:
         cost_penalty = trade_cost / total_value
         reward -= cost_penalty
         
-        # 奖励平滑（避免极端值）
-        reward = np.clip(reward, -0.1, 0.1)
+        # 移除过度的奖励裁剪，只防止极端异常
+        reward = np.clip(reward, -1.0, 1.0)
         
         return reward
 
