@@ -200,7 +200,8 @@ class TrainingQualityAnalyzer:
                               rewards: List[float],
                               losses: List[float],
                               config: Dict[str, Any],
-                              portfolio_values: List[float]) -> str:
+                              portfolio_values: List[float],
+                              env_data=None) -> str:
         """
         生成训练质量报告
 
@@ -267,15 +268,261 @@ class TrainingQualityAnalyzer:
             report.append(f"  最小值: {min(portfolio_values):,.0f}")
             report.append(f"  最大值: {max(portfolio_values):,.0f}")
             
+            # 等权投资baseline计算
+            # 添加调试信息
+            report.append(f"\n🔍 环境数据调试信息:")
+            if env_data is None:
+                report.append(f"  环境数据: None")
+            else:
+                report.append(f"  环境数据类型: {type(env_data)}")
+                report.append(f"  环境属性: {[attr for attr in dir(env_data) if not attr.startswith('_')][:10]}")
+                if hasattr(env_data, 'data'):
+                    report.append(f"  数据形状: {env_data.data.shape}")
+                    report.append(f"  数据列: {list(env_data.data.columns)[:10]}")
+                if hasattr(env_data, 'time_index'):
+                    report.append(f"  时间索引长度: {len(env_data.time_index)}")
+                if hasattr(env_data, 'stock_list'):
+                    report.append(f"  股票列表: {env_data.stock_list}")
+            
+            if not config or 'data' not in config or 'custom_stocks' not in config['data']:
+                raise RuntimeError("配置信息不足，无法计算baseline")
+                
+            stocks = config['data']['custom_stocks']
+            num_stocks = len(stocks)
+            
+            if env_data is not None:
+                # 使用环境数据计算更精确的等权baseline
+                report.append(f"\n📊 等权投资Baseline:")
+                report.append(f"  股票池: {stocks}")
+                report.append(f"  股票数量: {num_stocks}")
+                
+                # 获取环境的历史数据
+                has_data = (hasattr(env_data, 'data') and 
+                           hasattr(env_data, 'time_index') and 
+                           hasattr(env_data, 'stock_list'))
+                
+                report.append(f"  数据可用性检查: {has_data}")
+                if hasattr(env_data, 'data'):
+                    report.append(f"  有data属性: True, 形状: {getattr(env_data.data, 'shape', 'N/A')}")
+                else:
+                    report.append(f"  有data属性: False")
+                if hasattr(env_data, 'time_index'):
+                    report.append(f"  有time_index属性: True, 长度: {len(getattr(env_data, 'time_index', []))}")
+                else:
+                    report.append(f"  有time_index属性: False")
+                if hasattr(env_data, 'stock_list'):
+                    report.append(f"  有stock_list属性: True, 内容: {getattr(env_data, 'stock_list', [])}")
+                else:
+                    report.append(f"  有stock_list属性: False")
+                
+                if has_data:
+                    # 计算等权组合在相同时间段的表现
+                    equal_weight = 1.0 / num_stocks
+                    initial_value = portfolio_values[0]
+                    
+                    # 使用实际股票价格数据计算等权收益
+                    start_idx = max(0, len(env_data.time_index) - len(portfolio_values))
+                    end_idx = len(env_data.time_index) - 1
+                    
+                    report.append(f"  时间范围: 索引 {start_idx} -> {end_idx}")
+                    
+                    if start_idx < end_idx and hasattr(env_data, 'data'):
+                        # 检查数据列
+                        close_column = None
+                        for col in ['$close', 'close', 'Close', '$Close']:
+                            if col in env_data.data.columns:
+                                close_column = col
+                                break
+                        
+                        if not close_column:
+                            raise RuntimeError(f"数据中找不到价格列，可用列: {list(env_data.data.columns)}")
+                        
+                        # 获取起始和结束价格
+                        start_time = env_data.time_index[start_idx]
+                        end_time = env_data.time_index[end_idx]
+                        
+                        report.append(f"  使用价格列: {close_column}")
+                        report.append(f"  时间范围: {start_time} -> {end_time}")
+                        
+                        total_return = 0.0
+                        valid_stocks = 0
+                        stock_details = []
+                        
+                        for stock in stocks:
+                            if (stock, start_time) not in env_data.data.index:
+                                stock_details.append(f"{stock}: 起始时间数据缺失")
+                                continue
+                            if (stock, end_time) not in env_data.data.index:
+                                stock_details.append(f"{stock}: 结束时间数据缺失")
+                                continue
+                                
+                            start_price = env_data.data.loc[(stock, start_time), close_column]
+                            end_price = env_data.data.loc[(stock, end_time), close_column]
+                            
+                            if start_price <= 0 or end_price <= 0:
+                                stock_details.append(f"{stock}: 价格无效 ({start_price}->{end_price})")
+                                continue
+                                
+                            stock_return = (end_price / start_price - 1)
+                            total_return += stock_return * equal_weight
+                            valid_stocks += 1
+                            stock_details.append(f"{stock}: {start_price:.2f}->{end_price:.2f} ({stock_return:+.2%})")
+                        
+                        # 显示股票详情
+                        for detail in stock_details:
+                            report.append(f"  {detail}")
+                        
+                        if valid_stocks == 0:
+                            raise RuntimeError("没有有效的股票数据")
+                        
+                        # 重新归一化权重
+                        total_return = total_return * num_stocks / valid_stocks
+                        baseline_final_value = initial_value * (1 + total_return)
+                        baseline_return = total_return * 100
+                        
+                        report.append(f"  有效股票数: {valid_stocks}/{num_stocks}")
+                        report.append(f"  等权策略期末价值: {baseline_final_value:,.0f}")
+                        report.append(f"  等权策略总收益率: {baseline_return:+.2f}%")
+                    else:
+                        raise RuntimeError(f"时间索引范围无效: {start_idx} -> {end_idx}")
+                        
+                else:
+                    # 如果环境数据不可用，使用收益率方法计算baseline
+                    if hasattr(env_data, 'return_history') and len(env_data.return_history) > 0:
+                        avg_market_return = np.mean(list(env_data.return_history))
+                        baseline_final_value = portfolio_values[0] * (1 + avg_market_return * len(portfolio_values))
+                        baseline_return = (baseline_final_value / portfolio_values[0] - 1) * 100
+                        
+                        report.append(f"  等权策略期末价值 (估算): {baseline_final_value:,.0f}")
+                        report.append(f"  等权策略总收益率 (估算): {baseline_return:+.2f}%")
+                        report.append(f"  (使用环境平均收益估算)")
+                    else:
+                        # 如果环境数据不可用，使用收益率方法计算baseline
+                        report.append(f"\n  使用收益率方法计算等权baseline...")
+                        
+                        import sys
+                        import os
+                        sys.path.append('src')
+                        import qlib
+                        from qlib.data import D
+                        
+                        # 重新初始化qlib和获取数据
+                        if 'data' not in config or 'provider_uri' not in config['data']:
+                            raise RuntimeError("配置中缺少数据路径信息")
+                            
+                        qlib.init(provider_uri=config['data']['provider_uri']['day'], region='cn')
+                        
+                        # 使用正确的训练时间范围
+                        start_time = config['data']['train_start']
+                        end_time = config['data']['train_end']
+                        
+                        # 获取原始价格数据（不使用标准化）
+                        data = D.features(
+                            instruments=stocks,
+                            fields=['$close'],
+                            start_time=start_time,
+                            end_time=end_time,
+                            freq='day'
+                        )
+                        
+                        if data.empty:
+                            raise RuntimeError("无法获取股票价格数据")
+                            
+                        report.append(f"  原始数据形状: {data.shape}")
+                        report.append(f"  时间范围: {start_time} -> {end_time}")
+                        
+                        # 获取时间索引
+                        time_index = data.index.get_level_values(1).unique().sort_values()
+                        
+                        # 根据portfolio_values的长度计算对应的时间段
+                        portfolio_steps = len(portfolio_values)
+                        total_days = len(time_index)
+                        
+                        # portfolio_steps是训练步数，不等于交易天数
+                        # 需要根据环境的max_steps来计算实际对应的天数
+                        if 'environment' in config and 'max_steps' in config['environment']:
+                            max_episode_steps = config['environment']['max_steps']
+                            # 计算实际使用的交易天数（取较小值）
+                            actual_trading_days = min(portfolio_steps, max_episode_steps, total_days)
+                        else:
+                            # 如果没有配置信息，使用可用天数
+                            actual_trading_days = min(portfolio_steps, total_days)
+                        
+                        if actual_trading_days <= 1:
+                            raise RuntimeError(f"计算的交易天数太少: {actual_trading_days}")
+                        
+                        # 使用最近的actual_trading_days天计算baseline
+                        baseline_start_idx = total_days - actual_trading_days
+                        baseline_end_idx = total_days - 1
+                        
+                        baseline_start_time = time_index[baseline_start_idx]
+                        baseline_end_time = time_index[baseline_end_idx]
+                        
+                        report.append(f"  总训练步数: {portfolio_steps}")
+                        report.append(f"  可用交易天数: {total_days}")
+                        report.append(f"  实际计算天数: {actual_trading_days}")
+                        report.append(f"  baseline计算时间段: {baseline_start_time} -> {baseline_end_time}")
+                        
+                        # 计算每只股票的收益率
+                        equal_weight = 1.0 / num_stocks
+                        total_return = 0.0
+                        valid_stocks = 0
+                        
+                        for stock in stocks:
+                            if (stock, baseline_start_time) not in data.index or (stock, baseline_end_time) not in data.index:
+                                report.append(f"  {stock}: 缺少时间点数据")
+                                continue
+                                
+                            start_price = data.loc[(stock, baseline_start_time), '$close']
+                            end_price = data.loc[(stock, baseline_end_time), '$close']
+                            
+                            if start_price <= 0 or end_price <= 0:
+                                report.append(f"  {stock}: 价格无效 ({start_price:.2f}->{end_price:.2f})")
+                                continue
+                            
+                            stock_return = (end_price / start_price - 1)
+                            total_return += stock_return * equal_weight
+                            valid_stocks += 1
+                            
+                            report.append(f"  {stock}: {start_price:.2f}->{end_price:.2f} ({stock_return:+.2%})")
+                        
+                        if valid_stocks == 0:
+                            raise RuntimeError("没有有效的股票数据用于计算baseline")
+                        
+                        # 重新归一化权重（如果有股票数据缺失）
+                        if valid_stocks < num_stocks:
+                            total_return = total_return * num_stocks / valid_stocks
+                            report.append(f"  权重归一化: {valid_stocks}/{num_stocks}只股票有效")
+                        
+                        baseline_final_value = portfolio_values[0] * (1 + total_return)
+                        baseline_return = total_return * 100
+                        
+                        report.append(f"  ✅ 成功计算等权baseline:")
+                        report.append(f"  有效股票数: {valid_stocks}/{num_stocks}")
+                        report.append(f"  等权策略期末价值: {baseline_final_value:,.0f}")
+                        report.append(f"  等权策略总收益率: {baseline_return:+.2f}%")
+            else:
+                raise RuntimeError("没有可用的环境数据计算baseline")
+            
             # 暂时用简单计算查看问题
             if len(portfolio_values) > 1:
                 initial_value = portfolio_values[0]
                 final_value = portfolio_values[-1]
                 total_return = (final_value / initial_value - 1) * 100
                 
+                report.append(f"\n  === 策略 vs Baseline 对比 ===")
                 report.append(f"  初始值: {initial_value:,.0f}")
                 report.append(f"  最终值: {final_value:,.0f}")
-                report.append(f"  总收益率: {total_return:+.2f}%")
+                report.append(f"  策略总收益率: {total_return:+.2f}%")
+                
+                # 与baseline对比
+                if 'baseline_return' in locals():
+                    excess_return = total_return - baseline_return
+                    report.append(f"  超额收益 (vs 等权): {excess_return:+.2f}%")
+                    if excess_return > 0:
+                        report.append(f"  ✅ 策略跑赢等权baseline")
+                    else:
+                        report.append(f"  ❌ 策略跑输等权baseline")
                 
                 # 简单回撤计算来找问题
                 peak = portfolio_values[0]
@@ -694,11 +941,54 @@ class TrainingMetricsCallback(BaseCallback):
             # 获取配置信息（需要从父类传递）
             config = getattr(self, 'config', {})
 
+            # 尝试获取环境数据进行调试
+            env_data = None
+            debug_info = []
+            
+            debug_info.append(f"training_env类型: {type(self.training_env)}")
+            debug_info.append(f"training_env属性: {[attr for attr in dir(self.training_env) if not attr.startswith('_')][:15]}")
+            
+            if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+                # VecEnv情况
+                env_data = self.training_env.envs[0]
+                debug_info.append(f"从VecEnv获取: {type(env_data)}")
+            elif hasattr(self.training_env, 'env'):
+                # Monitor包装的情况
+                env_data = self.training_env.env
+                debug_info.append(f"从Monitor获取: {type(env_data)}")
+            else:
+                # 直接环境
+                env_data = self.training_env
+                debug_info.append(f"直接环境: {type(env_data)}")
+                
+            # 进一步解包Monitor
+            if hasattr(env_data, 'env'):
+                env_data = env_data.env
+                debug_info.append(f"进一步解包: {type(env_data)}")
+                
+            # 尝试通过get_attr获取环境数据
+            if env_data is None and hasattr(self.training_env, 'get_attr'):
+                env_attrs = self.training_env.get_attr('data')
+                if len(env_attrs) > 0:
+                    # 创建一个临时对象来存储数据
+                    class TempEnv:
+                        def __init__(self):
+                            self.data = env_attrs[0]
+                            self.time_index = self.training_env.get_attr('time_index')[0]
+                            self.stock_list = self.training_env.get_attr('stock_list')[0]
+                    env_data = TempEnv()
+                    debug_info.append(f"通过get_attr创建临时环境")
+
+            # 将调试信息加入报告
+            for info in debug_info:
+                logger.info(f"环境调试: {info}")
+
             quality_report = self.quality_analyzer.generate_quality_report(
                 rewards=rewards_history,
                 losses=self.losses_history,
                 config=config,
-                portfolio_values=self.portfolio_values_history  # 使用统一历史记录
+                portfolio_values=self.portfolio_values_history,  # 使用统一历史记录
+                env_data=env_data
             )
 
             logger.info("\n" + quality_report)

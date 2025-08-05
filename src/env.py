@@ -250,6 +250,9 @@ class PortfolioEnv(gym.Env):
         self.value_history = deque([self.initial_cash], maxlen=252)  # 保留一年的历史
         self.return_history = deque(maxlen=252)
         self.drawdown_history = deque(maxlen=252)
+        
+        # 重置episode奖励历史（用于动态归一化）
+        self.episode_rewards = []
 
         # 滚动峰值回撤计算
         self.peak_window = deque([self.initial_cash], maxlen=252)  # 一年峰值窗口
@@ -493,45 +496,82 @@ class PortfolioEnv(gym.Env):
 
     def _calculate_reward(self, old_weights: np.ndarray, new_weights: np.ndarray, trade_cost: float) -> float:
         """
-        重新平衡的奖励函数：解决负奖励问题
-        关键改进：惩罚系数缩放到与收益同尺度
+        修复的奖励函数：解决训练停滞问题
+        主要修复：去除有问题的归一化、修正动态权重、添加基础奖励
         """
-        # 基础收益率奖励（放大100倍到百分点尺度）
-        if len(self.return_history) > 0:
-            portfolio_return = self.return_history[-1] * 100  # 转换为百分点
+        # 1. 多尺度收益信息（降低放大系数避免过度波动）
+        current_return = self.return_history[-1] if len(self.return_history) > 0 else 0.0
+        
+        # 短期收益（5日）
+        if len(self.return_history) >= 5:
+            short_term_return = np.mean(list(self.return_history)[-5:])
         else:
-            portfolio_return = 0.0
-
-        # 计算动态波动率
+            short_term_return = current_return
+            
+        # 中期收益（20日）
+        if len(self.return_history) >= 20:
+            medium_term_return = np.mean(list(self.return_history)[-20:])
+        else:
+            medium_term_return = short_term_return
+            
+        # 复合收益信号（降低放大系数从100到50）
+        composite_return = (0.5 * current_return + 0.3 * short_term_return + 0.2 * medium_term_return) * 50
+        
+        # 2. 计算Sharpe比率奖励（风险调整收益）
+        sharpe_reward = 0.0
+        if len(self.return_history) >= 10:
+            recent_returns = np.array(list(self.return_history)[-20:]) if len(self.return_history) >= 20 else np.array(list(self.return_history))
+            if len(recent_returns) > 1 and np.std(recent_returns) > 0:
+                # 年化Sharpe比率（假设无风险利率3%）
+                excess_return = np.mean(recent_returns) - 0.03/252
+                sharpe_ratio = excess_return / np.std(recent_returns) * np.sqrt(252)
+                sharpe_reward = np.clip(sharpe_ratio * 0.3, -1.0, 1.0)  # 减少Sharpe影响
+        
+        # 3. 修正的动态风险惩罚权重（压力期降低惩罚）
         volatility = self._get_current_volatility()
-
-        # 重新设计惩罚系数 - 大幅降低惩罚强度
-        lambda_dd = 0.1 + 0.2 * max(0, volatility - 0.03)  # 回撤惩罚降低5倍
-        lambda_cvar = 0.05 + 0.1 * max(0, volatility - 0.02)  # CVaR惩罚降低6倍
-
-        # 回撤惩罚（轻微化）
+        market_stress = min(1.0, volatility / 0.3)  # 市场压力因子
+        
+        # 修正：压力期实际降低惩罚
+        lambda_dd = 0.03 * (1 - market_stress * 0.3)  # 压力大时降低回撤惩罚
+        lambda_cvar = 0.02 * (1 - market_stress * 0.2)  # 压力大时降低CVaR惩罚
+        
+        # 4. 风险惩罚项
         drawdown_penalty = lambda_dd * (self.current_drawdown * 100)
-
-        # CVaR惩罚（轻微化）
         cvar_penalty = lambda_cvar * (self.cvar_value * 100)
-
-        # 交易成本惩罚（降低影响）
-        cost_penalty = (trade_cost / self.total_value * 50) if self.total_value > 0 else 0  # 降低一半
-
-        # 波动率惩罚（几乎取消）
-        volatility_penalty = 0.5 * max(0, volatility - 0.1)  # 只有极端高波动才惩罚
-
-        # 大幅提高基础奖励
-        base_reward = 2.0  # 提高20倍，确保正向激励
-
-        # 综合奖励
-        reward = (base_reward + portfolio_return - drawdown_penalty
-                 - cvar_penalty - cost_penalty - volatility_penalty)
-
-        # 放宽奖励裁剪范围，允许更大的正奖励
-        reward = np.clip(reward, -15.0, 15.0)
-
-        return reward
+        
+        # 5. 交易成本惩罚（减少惩罚强度）
+        cost_bps = (trade_cost / self.total_value * 10000) if self.total_value > 0 else 0
+        cost_penalty = cost_bps * 0.005  # 降低成本惩罚
+        
+        # 6. 波动率奖励/惩罚（降低惩罚强度）
+        target_volatility = 0.15
+        vol_deviation = abs(volatility - target_volatility)
+        vol_penalty = 0.2 * max(0, vol_deviation - 0.08)  # 提高容忍度并降低惩罚
+        
+        # 7. 组合分散度奖励
+        diversity_reward = 0.0
+        if len(new_weights) > 1:
+            hhi = np.sum(new_weights ** 2)
+            optimal_hhi = 1.0 / len(new_weights)
+            diversity_score = 1.0 - (hhi - optimal_hhi) / (1.0 - optimal_hhi)
+            diversity_reward = diversity_score * 0.1  # 降低分散度奖励影响
+        
+        # 8. 添加基础奖励以避免持续负值
+        base_reward = 0.5  # 基础正奖励
+        
+        # 9. 综合奖励计算
+        raw_reward = (base_reward + composite_return + sharpe_reward + diversity_reward
+                     - drawdown_penalty - cvar_penalty - cost_penalty - vol_penalty)
+        
+        # 10. 简单裁剪，移除有问题的归一化和tanh压缩
+        final_reward = np.clip(raw_reward, -5.0, 5.0)
+        
+        # 11. 保存原始奖励用于分析（可选）
+        if not hasattr(self, 'episode_rewards'):
+            self.episode_rewards = []
+        self.episode_rewards.append(final_reward)
+        
+        return final_reward
 
     def _get_current_volatility(self) -> float:
         """计算当前30日年化波动率"""
