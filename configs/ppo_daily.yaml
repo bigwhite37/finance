@@ -34,7 +34,7 @@ data:
 environment:
   initial_cash: 1000000
   lookback_window: 30  # 30天历史窗口
-  transaction_cost: 0.0025          # 调整到更现实的交易成本（0.25%）
+  transaction_cost: 0.001           # 降低交易成本到0.1%，避免过度惩罚
   max_drawdown_threshold: 0.20    # 环境内回撤阈值，允许更大的探索空间
   reward_penalty: 6.0              # 增强回撤惩罚力度
   features:

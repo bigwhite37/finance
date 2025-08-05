@@ -90,10 +90,10 @@ class TrainingQualityAnalyzer:
             # 对于正奖励，斜率为正得高分
             trend_score = max(0, min(1, (slope + 0.01) / 0.02))
 
-        # 改进的方差评分：考虑奖励的绝对值
-        abs_mean = abs(mean_reward) + 1e-8
-        relative_variance = variance / (abs_mean ** 2)
-        variance_score = max(0, min(1, 1 - relative_variance / 10))  # 调整方差容忍度
+        # 针对百分点尺度的方差评分：直接用标准差评估
+        std_dev = np.sqrt(variance)
+        # 对于百分点尺度奖励，标准差超过2.0认为是高方差
+        variance_score = max(0, min(1, 1 - std_dev / 3.0))  # 标准差超过3.0得分为0
 
         # 综合稳定性得分
         stability_score = 0.6 * trend_score + 0.4 * variance_score
@@ -258,39 +258,46 @@ class TrainingQualityAnalyzer:
         report.append(f"  交易成本得分: {hyperparams['transaction_cost_score']:.3f}")
         report.append(f"  综合超参数得分: {hyperparams['overall_hyperparameter_score']:.3f}")
 
-        # 组合表现分析
+        # 组合表现分析 - 需要调试数据来源问题
         if portfolio_values and len(portfolio_values) > 1:
-            initial_value = portfolio_values[0]
-            final_value = portfolio_values[-1]
-            total_return = (final_value / initial_value - 1) * 100
-
-            # 计算最大回撤
-            peak = portfolio_values[0]
-            max_drawdown = 0
-            for value in portfolio_values:
-                if value > peak:
-                    peak = value
-                drawdown = (peak - value) / peak
-                if drawdown > max_drawdown:
-                    max_drawdown = drawdown
-
-            report.append(f"\n💰 组合表现分析:")
-            report.append(f"  总收益率: {total_return:+.2f}%")
-            report.append(f"  最大回撤: {max_drawdown:.2%}")
-
-            # 风险调整收益 - 使用RoMaD (Return over Max Drawdown)
-            if max_drawdown > 0:
-                # RoMaD = 年化收益率 / 最大回撤
-                annualized_return = total_return * (252 / len(portfolio_values))  # 假设日频数据
-                romad = annualized_return / (max_drawdown * 100)
-                report.append(f"  RoMaD (年化收益/最大回撤): {romad:.3f}")
-
-                if romad > 2.0:
-                    report.append("  ✅ RoMaD优秀 (>2.0)")
-                elif romad > 1.0:
-                    report.append("  ⚠️  RoMaD一般 (1.0-2.0)")
-                else:
-                    report.append("  ❌ RoMaD较差 (<1.0)，需要优化风险控制")
+            report.append(f"\n💰 组合表现分析 (DEBUG):")
+            report.append(f"  数据点总数: {len(portfolio_values)}")
+            report.append(f"  前10个值: {portfolio_values[:10]}")
+            report.append(f"  后10个值: {portfolio_values[-10:]}")
+            report.append(f"  最小值: {min(portfolio_values):,.0f}")
+            report.append(f"  最大值: {max(portfolio_values):,.0f}")
+            
+            # 暂时用简单计算查看问题
+            if len(portfolio_values) > 1:
+                initial_value = portfolio_values[0]
+                final_value = portfolio_values[-1]
+                total_return = (final_value / initial_value - 1) * 100
+                
+                report.append(f"  初始值: {initial_value:,.0f}")
+                report.append(f"  最终值: {final_value:,.0f}")
+                report.append(f"  总收益率: {total_return:+.2f}%")
+                
+                # 简单回撤计算来找问题
+                peak = portfolio_values[0]
+                max_drawdown = 0
+                for value in portfolio_values:
+                    if value > peak:
+                        peak = value
+                    drawdown = (peak - value) / peak
+                    if drawdown > max_drawdown:
+                        max_drawdown = drawdown
+                        
+                report.append(f"  最大回撤: {max_drawdown:.2%}")
+                report.append(f"  峰值: {peak:,.0f}")
+                
+                # 找出导致最大回撤的值
+                for i, value in enumerate(portfolio_values):
+                    if value > peak:
+                        peak = value
+                    drawdown = (peak - value) / peak
+                    if abs(drawdown - max_drawdown) < 0.001:
+                        report.append(f"  最大回撤发生在索引{i}: 峰值{peak:,.0f} -> 当前{value:,.0f}")
+                        break
 
         # 总体建议
         report.append(f"\n🔍 总体建议:")
@@ -528,8 +535,10 @@ class TrainingMetricsCallback(BaseCallback):
         rolling_peaks = self.training_env.get_attr('rolling_peak')
 
         if len(total_values) > 0:
-            self.portfolio_values_history.extend(total_values)
-            self.drawdowns.extend(drawdowns)
+            # 改进：只记录第一个环境的数据，避免多环境混淆
+            # 这样可以得到一个连续的组合价值序列
+            self.portfolio_values_history.append(total_values[0])  # 只取第一个环境
+            self.drawdowns.append(drawdowns[0])  # 只取第一个环境
 
             # 基础指标记录到TensorBoard
             self.logger.record('env/mean_total_value', np.mean(total_values))

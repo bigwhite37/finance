@@ -453,7 +453,7 @@ def split_data(data: pd.DataFrame,
                train_start: str, train_end: str,
                valid_start: str, valid_end: str,
                test_start: str, test_end: str,
-               apply_scaling: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+               apply_scaling: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     分割数据为训练集、验证集、测试集
 
@@ -511,24 +511,34 @@ def split_data(data: pd.DataFrame,
                 # 为当前数据集创建scaler
                 scaler = StandardScaler()
                 
-                # 只对数值型列进行标准化
+                # 只对特定数值型列进行标准化，排除价格和成交量等不应标准化的列
                 numeric_columns = dataset.select_dtypes(include=[np.number]).columns
-                if len(numeric_columns) == 0:
-                    logger.warning(f"{name}数据集没有数值型列，跳过标准化")
+                
+                # 排除价格相关列（不应该标准化为负数）
+                exclude_patterns = ['$close', '$open', '$high', '$low', '$volume', '$factor']
+                scalable_columns = [col for col in numeric_columns 
+                                  if not any(pattern in col for pattern in exclude_patterns)]
+                
+                if len(scalable_columns) == 0:
+                    logger.info(f"{name}数据集没有需要标准化的列（价格/成交量列已排除），跳过标准化")
                     scaled_datasets[name] = dataset
                     continue
                 
                 # 复制数据避免修改原始数据
                 scaled_data = dataset.copy()
                 
-                # fit并transform当前数据集
-                scaled_values = scaler.fit_transform(dataset[numeric_columns])
-                scaled_data[numeric_columns] = scaled_values
+                # 只对可标准化的列进行fit并transform
+                if len(scalable_columns) > 0:
+                    scaled_values = scaler.fit_transform(dataset[scalable_columns])
+                    scaled_data[scalable_columns] = scaled_values
+                    logger.info(f"{name}数据集标准化列: {scalable_columns}")
+                else:
+                    logger.info(f"{name}数据集无需标准化的列")
                 
                 scalers[name] = scaler
                 scaled_datasets[name] = scaled_data
                 
-                logger.info(f"{name}数据集标准化完成 - 特征数: {len(numeric_columns)}")
+                logger.info(f"{name}数据集标准化完成 - 标准化特征数: {len(scalable_columns)}, 保留原值特征数: {len(numeric_columns) - len(scalable_columns)}")
             
             train_data = scaled_datasets['train']
             valid_data = scaled_datasets['valid'] 
