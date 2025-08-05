@@ -1,0 +1,76 @@
+# 快速测试配置
+# 用于验证系统功能，使用较小的数据集和较少的训练步数
+
+# 数据配置
+data:
+  data_root: "/Users/shuzhenyi/.qlib/qlib_data"
+  provider_uri:
+    1min: "/Users/shuzhenyi/.qlib/qlib_data/cn_data_1min"
+    day: "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
+  market: "csi300"
+  stock_limit: 10  # 减少股票数量
+  start_time: "2023-01-01"
+  end_time: "2023-12-31"
+  train_start: "2023-01-01"
+  train_end: "2023-08-31"
+  valid_start: "2023-09-01"
+  valid_end: "2023-10-31"
+  test_start: "2023-11-01"
+  test_end: "2023-12-31"
+  freq: "day"
+  fields:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+
+# 环境配置
+environment:
+  initial_cash: 1000000
+  lookback_window: 20  # 较短的回溯窗口
+  transaction_cost: 0.003
+  max_drawdown_threshold: 0.15
+  reward_penalty: 2.0
+  features:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+
+# 模型配置
+model:
+  algorithm: "PPO"
+  learning_rate: 0.001
+  batch_size: 64  # 较小的批次
+  gamma: 0.99
+  n_steps: 512   # 较少的步数
+  n_epochs: 4
+  clip_range: 0.2
+  ent_coef: 0.01
+  use_custom_policy: false
+  net_arch: [128, 64]
+
+# 训练配置
+training:
+  total_timesteps: 5000  # 非常少的训练步数用于快速测试
+  n_envs: 2
+  seed: 42
+  log_interval: 5
+
+# 回调配置
+callbacks:
+  enable_eval: true
+  eval_freq: 1000
+  n_eval_episodes: 2
+  enable_checkpoint: false
+  enable_drawdown_stopping: false
+  enable_tensorboard: true
+
+# 评估配置
+evaluation:
+  n_episodes: 2
+
+# 日志配置
+log_level: "INFO"

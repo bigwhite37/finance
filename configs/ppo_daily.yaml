@@ -1,0 +1,107 @@
+# PPO算法日线数据配置文件
+# 适用于中长期投资策略，使用日线数据进行训练
+
+# 数据配置
+data:
+  data_root: "/Users/shuzhenyi/.qlib/qlib_data"
+  provider_uri:
+    1min: "/Users/shuzhenyi/.qlib/qlib_data/cn_data_1min"
+    day: "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
+  market: "csi300"
+  stock_limit: 50
+  start_time: "2020-01-01"
+  end_time: "2023-12-31"
+  train_start: "2020-01-01"
+  train_end: "2022-12-31"
+  valid_start: "2023-01-01"
+  valid_end: "2023-06-30"
+  test_start: "2023-07-01"
+  test_end: "2023-12-31"
+  freq: "day"
+  fields:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+    - "$change"
+    - "$factor"
+
+# 环境配置
+environment:
+  initial_cash: 1000000
+  lookback_window: 30  # 30天历史窗口
+  transaction_cost: 0.003
+  max_drawdown_threshold: 0.15
+  reward_penalty: 2.0
+  features:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+    - "$change"
+    - "$factor"
+  rebalance_freq: "daily"
+
+# 模型配置
+model:
+  algorithm: "PPO"
+  learning_rate: 0.0003
+  batch_size: 256
+  gamma: 0.99
+  n_steps: 2048  # PPO特有参数
+  n_epochs: 10
+  clip_range: 0.2
+  ent_coef: 0.01  # 熵系数，鼓励探索
+  vf_coef: 0.5    # 价值函数损失系数
+  max_grad_norm: 0.5  # 梯度裁剪
+  use_custom_policy: false
+  net_arch: [256, 128]
+
+# 训练配置
+training:
+  total_timesteps: 5000
+  n_envs: 4
+  seed: 42
+  log_interval: 10
+
+# 回调配置
+callbacks:
+  enable_eval: true
+  eval_freq: 10000
+  n_eval_episodes: 5
+  enable_checkpoint: true
+  save_freq: 50000
+  enable_drawdown_stopping: true
+  max_training_drawdown: 0.15
+  drawdown_patience: 100
+  enable_tensorboard: true
+
+# 评估配置
+evaluation:
+  n_episodes: 5
+
+# 日志配置
+log_level: "INFO"
+
+# 风险控制
+risk_control:
+  max_position_ratio: 0.15
+  stop_loss_ratio: 0.08
+  take_profit_ratio: 0.15
+  volatility_limit: 0.03
+
+# 特征工程配置
+feature_engineering:
+  enable_technical_indicators: true
+  indicators:
+    - "MA_5"    # 5日移动平均
+    - "MA_10"   # 10日移动平均
+    - "MA_20"   # 20日移动平均
+    - "RSI_14"  # 14日RSI
+    - "MACD"    # MACD指标
+    - "BOLL"    # 布林带
+  enable_factor_processing: true
+  normalization: "zscore"  # 标准化方法
+  handle_missing: "ffill"  # 缺失值处理

@@ -1,0 +1,150 @@
+# 生产环境配置文件
+# 用于实盘交易的保守配置，强调风险控制和稳定性
+
+# 数据配置
+data:
+  data_root: "/Users/shuzhenyi/.qlib/qlib_data"
+  provider_uri:
+    1min: "/Users/shuzhenyi/.qlib/qlib_data/cn_data_1min"
+    day: "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
+  market: "csi300"
+  stock_limit: 20  # 生产环境减少股票数量，便于管理
+  start_time: "2020-01-01"
+  end_time: "2024-12-31"
+  train_start: "2020-01-01"
+  train_end: "2023-12-31"
+  valid_start: "2024-01-01"
+  valid_end: "2024-06-30"
+  test_start: "2024-07-01"
+  test_end: "2024-12-31"
+  freq: "day"
+  fields:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+    - "$change"
+    - "$factor"
+    - "$turn"     # 换手率
+    - "$market_cap"  # 市值
+
+# 环境配置
+environment:
+  initial_cash: 1000000
+  lookback_window: 40  # 更长的历史窗口
+  transaction_cost: 0.004  # 考虑实际交易成本
+  max_drawdown_threshold: 0.08  # 严格的回撤控制
+  reward_penalty: 5.0  # 强回撤惩罚
+  features:
+    - "$close"
+    - "$open"
+    - "$high"
+    - "$low"
+    - "$volume"
+    - "$change"
+    - "$factor"
+    - "$turn"
+    - "$market_cap"
+  rebalance_freq: "daily"
+
+# 模型配置
+model:
+  algorithm: "SAC"  # SAC在连续控制上更稳定
+  learning_rate: 1e-4  # 保守的学习率
+  batch_size: 512
+  gamma: 0.99
+  buffer_size: 1000000
+  tau: 0.005
+  target_update_interval: 1
+  learning_starts: 5000  # 更多的预热步数
+  use_custom_policy: true
+  net_arch:
+    - 512
+    - 256
+    - 128
+    - 64
+
+# 训练配置
+training:
+  total_timesteps: 2000000  # 充分训练
+  n_envs: 8
+  seed: 2024
+  log_interval: 50
+
+# 回调配置
+callbacks:
+  enable_eval: true
+  eval_freq: 5000  # 更频繁的评估
+  n_eval_episodes: 10
+  enable_checkpoint: true
+  save_freq: 25000
+  enable_drawdown_stopping: true
+  max_training_drawdown: 0.08
+  drawdown_patience: 20  # 更低的容忍度
+  enable_tensorboard: true
+
+# 评估配置
+evaluation:
+  n_episodes: 20  # 更多评估回合
+
+# 日志配置
+log_level: "INFO"
+
+# 严格的风险控制
+risk_control:
+  max_position_ratio: 0.10    # 单只股票最大10%仓位
+  max_leverage: 1.0           # 禁止杠杆
+  stop_loss_ratio: 0.05       # 5%止损
+  take_profit_ratio: 0.12     # 12%止盈
+  volatility_limit: 0.025     # 严格的波动率限制
+  correlation_limit: 0.7      # 持仓相关性限制
+  sector_concentration_limit: 0.3  # 行业集中度限制
+  liquidity_filter: true      # 流动性过滤
+  min_market_cap: 10000000000 # 最小市值要求（100亿）
+
+# 交易规则
+trading_rules:
+  max_daily_trades: 5         # 每日最大交易次数
+  min_holding_period: 3       # 最小持有天数
+  max_turnover_rate: 0.2      # 最大日换手率
+  trading_hours:
+    start: "09:30"
+    end: "15:00"
+  prohibited_dates:           # 禁止交易日期
+    - "2024-02-09"  # 春节前
+    - "2024-02-17"  # 春节后首日
+    - "2024-05-01"  # 劳动节
+    - "2024-10-01"  # 国庆节
+
+# 监控和报警
+monitoring:
+  enable_real_time_monitoring: true
+  alert_thresholds:
+    max_drawdown: 0.05
+    daily_loss: 0.03
+    position_concentration: 0.12
+    correlation_breach: 0.8
+  notification:
+    email: "risk@company.com"
+    sms: "+86138xxxxxxxx"
+    webhook: "https://api.company.com/alerts"
+
+# 模型管理
+model_management:
+  model_validation:
+    min_sharpe_ratio: 1.5
+    max_correlation_with_benchmark: 0.8
+    min_information_ratio: 0.5
+  model_refresh_frequency: "monthly"
+  a_b_testing:
+    enable: true
+    allocation_ratio: 0.8  # 80%新模型，20%基准
+
+# 合规配置
+compliance:
+  enable_compliance_check: true
+  max_individual_position: 0.05  # 监管要求的单一标的上限
+  restricted_stocks: []  # 限制交易股票列表
+  insider_trading_check: true
+  market_manipulation_check: true
