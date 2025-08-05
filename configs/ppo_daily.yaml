@@ -77,6 +77,9 @@ callbacks:
   max_training_drawdown: 0.15
   drawdown_patience: 100
   enable_tensorboard: true
+  enable_training_metrics: true
+  metrics_log_interval: 100      # 基础指标输出间隔
+  metrics_eval_interval: 100    # 详细分析输出间隔
 
 # 评估配置
 evaluation:
