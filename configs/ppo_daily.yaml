@@ -34,7 +34,7 @@ data:
 environment:
   initial_cash: 1000000
   lookback_window: 30  # 30天历史窗口
-  transaction_cost: 0.003
+  transaction_cost: 0.0025          # 调整到更现实的交易成本（0.25%）
   max_drawdown_threshold: 0.12    # 更严格的回撤阈值
   reward_penalty: 5.0              # 增强回撤惩罚力度
   features:
@@ -51,13 +51,13 @@ environment:
 # 模型配置
 model:
   algorithm: "PPO"
-  learning_rate: 0.003             # 提高学习率以适应新的奖励尺度
+  learning_rate: 0.0003           # 恢复合理的学习率（不再人为放大）
   batch_size: 256
   gamma: 0.99
   n_steps: 2048  # PPO特有参数
   n_epochs: 10
   clip_range: 0.2
-  ent_coef: 0.01  # 熵系数，鼓励探索
+  ent_coef: 0.01  # 熵系数，鼓励探索，抑制过度确定性
   vf_coef: 0.5    # 价值函数损失系数
   max_grad_norm: 0.5  # 梯度裁剪
   use_custom_policy: false
@@ -79,7 +79,7 @@ callbacks:
   save_freq: 50000
   enable_drawdown_stopping: true
   max_training_drawdown: 0.12      # 更严格的回撤阈值
-  drawdown_patience: 20            # 更快的早停响应
+  drawdown_patience: 10             # 更快的早停响应（从20改为5）
   enable_tensorboard: true
   enable_training_metrics: true
   metrics_log_interval: 1000       # 每1000步输出基础指标

@@ -17,11 +17,8 @@ try:
     setup_chinese_font()
 except ImportError:
     # 如果font_config不存在，使用基本的中文字体设置
-    try:
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
-    except:
-        pass  # 如果字体设置失败，使用默认字体
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
 
 logger = logging.getLogger(__name__)
 
@@ -71,13 +68,13 @@ class PortfolioEnv(gym.Env):
         self.reward_penalty = reward_penalty
         self.rebalance_freq = rebalance_freq
 
-        # 提取股票列表和时间序列 
+        # 提取股票列表和时间序列
         # Qlib数据索引是(instrument, datetime)
         self.stock_list = list(data.index.get_level_values(0).unique())
         self.time_index = sorted(data.index.get_level_values(1).unique())
         self.num_stocks = len(self.stock_list)
         self.num_periods = len(self.time_index)
-        
+
         # 设置最大步数（确保有足够长的episode）
         if max_steps is None:
             # 默认使用全部可用步数
@@ -85,7 +82,7 @@ class PortfolioEnv(gym.Env):
         else:
             # 用户指定的步数，但不能超过数据长度
             self.max_steps = min(max_steps, self.num_periods - self.lookback_window - 1)
-        
+
         # 确保最小episode长度
         self.max_steps = max(self.max_steps, 60)  # 至少60步（约3个月日频数据）
 
@@ -141,25 +138,25 @@ class PortfolioEnv(gym.Env):
         # 统计缺失值情况
         missing_stats = self.data.isnull().sum()
         total_missing = missing_stats.sum()
-        
+
         if total_missing == 0:
             logger.info("数据完整，无缺失值")
             return
-            
+
         # 详细报告缺失情况
         total_points = len(self.data)
         missing_ratio = total_missing / (total_points * len(self.features))
-        
+
         logger.warning(f"数据缺失值统计:")
         logger.warning(f"总缺失点数: {total_missing}")
         logger.warning(f"缺失比例: {missing_ratio:.2%}")
-        
+
         # 按特征统计缺失情况
         for feature in self.features:
             if feature in missing_stats and missing_stats[feature] > 0:
                 feature_missing_ratio = missing_stats[feature] / total_points
                 logger.warning(f"特征 {feature} 缺失: {missing_stats[feature]} 个点 ({feature_missing_ratio:.2%})")
-        
+
         # 缺失值处理策略
         if missing_ratio > 0.1:  # 缺失超过10%
             raise RuntimeError(
@@ -176,40 +173,40 @@ class PortfolioEnv(gym.Env):
                 f"数据存在少量缺失 ({missing_ratio:.2%})，属于正常现象（停牌/新股），将使用智能填充处理。\n"
                 f"缺失统计: {dict(missing_stats[missing_stats > 0])}"
             )
-        
+
         # 使用智能缺失值填充策略
         original_data = self.data.copy()
-        
+
         # 1. 对于价格相关特征，使用前向填充（保持最后已知价格）
         price_features = [f for f in self.features if any(p in f for p in ['close', 'open', 'high', 'low', 'price'])]
         for feature in price_features:
             if feature in self.data.columns:
                 self.data[feature] = self.data[feature].ffill()
-        
+
         # 2. 对于成交量相关特征，使用0填充（停牌期间成交量为0）
         volume_features = [f for f in self.features if 'volume' in f]
         for feature in volume_features:
             if feature in self.data.columns:
                 self.data[feature] = self.data[feature].fillna(0)
-        
+
         # 3. 对于涨跌相关特征，使用0填充（停牌期间涨跌为0）
         change_features = [f for f in self.features if 'change' in f]
         for feature in change_features:
             if feature in self.data.columns:
                 self.data[feature] = self.data[feature].fillna(0)
-        
+
         # 4. 对于factor类特征，使用前向填充
         factor_features = [f for f in self.features if 'factor' in f]
         for feature in factor_features:
             if feature in self.data.columns:
                 self.data[feature] = self.data[feature].ffill()
-        
+
         # 5. 处理剩余缺失值
         remaining_missing = self.data.isnull().sum().sum()
         if remaining_missing > 0:
             logger.warning(f"智能填充后仍有 {remaining_missing} 个缺失值，使用后向填充和均值填充")
             self.data = self.data.bfill()  # 后向填充
-            
+
             # 最后使用均值填充
             for feature in self.features:
                 if self.data[feature].isnull().any():
@@ -228,12 +225,12 @@ class PortfolioEnv(gym.Env):
                         self.data[feature].fillna(default_value, inplace=True)
                     else:
                         self.data[feature].fillna(feature_mean, inplace=True)
-        
+
         # 最终验证
         final_missing = self.data.isnull().sum().sum()
         if final_missing > 0:
             raise RuntimeError(f"数据处理后仍有 {final_missing} 个缺失值，无法继续处理")
-        
+
         logger.info("数据缺失值处理完成")
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
@@ -255,6 +252,8 @@ class PortfolioEnv(gym.Env):
         self.drawdown_history = deque(maxlen=252)
         self.max_value = self.initial_cash
         self.current_drawdown = 0.0
+        self.max_drawdown_so_far = 0.0  # 添加全局最大回撤跟踪
+        self.steps_taken = 0  # 添加步数跟踪
 
         # 重置交易记录
         self.trade_history = []
@@ -287,6 +286,7 @@ class PortfolioEnv(gym.Env):
 
         # 前进一步
         self.current_step += 1
+        self.steps_taken += 1
 
         # 计算新的组合价值
         if self.current_step < self.num_periods:
@@ -296,9 +296,14 @@ class PortfolioEnv(gym.Env):
         # 计算奖励
         reward = self._calculate_reward(old_weights, action, trade_cost)
 
-        # 检查终止条件
+        # 检查终止条件 - 添加最小步数要求
+        min_steps = min(120, self.max_steps // 2)  # 最少120步或一半max_steps
+
+        # 只有达到最小步数后才允许因回撤提前终止
+        early_termination_allowed = self.steps_taken >= min_steps
+
         terminated = (self.current_step >= min(self.num_periods - 1, self.lookback_window + self.max_steps) or
-                     self.current_drawdown >= self.max_drawdown_threshold)
+                     (early_termination_allowed and self.current_drawdown >= self.max_drawdown_threshold))
 
         # 记录交易历史
         self._record_trade(action, current_prices, trade_cost)
@@ -365,6 +370,10 @@ class PortfolioEnv(gym.Env):
 
         self.current_drawdown = (self.max_value - self.total_value) / self.max_value
         self.drawdown_history.append(self.current_drawdown)
+
+        # 更新全局最大回撤
+        if self.current_drawdown > self.max_drawdown_so_far:
+            self.max_drawdown_so_far = self.current_drawdown
 
     def _calculate_reward(self, old_weights: np.ndarray, new_weights: np.ndarray, trade_cost: float) -> float:
         """
