@@ -31,34 +31,34 @@ logger = logging.getLogger(__name__)
 
 class TrainingQualityAnalyzer:
     """训练质量分析器，用于评估训练参数、代码、模型质量"""
-    
+
     def __init__(self):
         self.metrics_history = []
         self.quality_scores = {}
-        
+
     def analyze_training_stability(self, rewards: List[float], window_size: int = 50) -> Dict[str, float]:
         """
         分析训练稳定性
-        
+
         Args:
             rewards: 奖励历史
             window_size: 滑动窗口大小（默认50而非100）
-            
+
         Returns:
             稳定性指标字典
         """
         if len(rewards) < 10:  # 最少需要10个奖励值
             return {
-                'stability_score': 0.0, 
-                'trend_score': 0.0, 
+                'stability_score': 0.0,
+                'trend_score': 0.0,
                 'variance_score': 0.0,
                 'slope': 0.0,
                 'variance': 0.0
             }
-        
+
         # 动态调整窗口大小避免过大
         actual_window_size = min(window_size, max(10, len(rewards) // 2))
-        
+
         # 如果数据不足窗口大小，直接用所有数据
         if len(rewards) < actual_window_size:
             moving_avg = [np.mean(rewards)]
@@ -68,7 +68,7 @@ class TrainingQualityAnalyzer:
             for i in range(actual_window_size, len(rewards) + 1):
                 window_rewards = rewards[i-actual_window_size:i]
                 moving_avg.append(np.mean(window_rewards))
-        
+
         if len(moving_avg) < 2:
             # 如果滑动平均不足2个点，直接分析原始奖励
             x = np.arange(len(rewards))
@@ -81,7 +81,7 @@ class TrainingQualityAnalyzer:
             slope = np.polyfit(x, moving_avg, 1)[0]
             variance = np.var(moving_avg)
             mean_reward = np.mean(moving_avg)
-        
+
         # 改进的趋势评分：考虑负奖励情况
         if mean_reward < 0:
             # 对于负奖励，斜率为正（趋向0或正值）得高分
@@ -89,15 +89,15 @@ class TrainingQualityAnalyzer:
         else:
             # 对于正奖励，斜率为正得高分
             trend_score = max(0, min(1, (slope + 0.01) / 0.02))
-        
+
         # 改进的方差评分：考虑奖励的绝对值
         abs_mean = abs(mean_reward) + 1e-8
         relative_variance = variance / (abs_mean ** 2)
         variance_score = max(0, min(1, 1 - relative_variance / 10))  # 调整方差容忍度
-        
+
         # 综合稳定性得分
         stability_score = 0.6 * trend_score + 0.4 * variance_score
-        
+
         return {
             'stability_score': stability_score,
             'trend_score': trend_score,
@@ -105,56 +105,56 @@ class TrainingQualityAnalyzer:
             'slope': slope,
             'variance': variance
         }
-    
+
     def analyze_convergence_quality(self, losses: List[float]) -> Dict[str, float]:
         """
         分析收敛质量
-        
+
         Args:
             losses: 损失历史
-            
+
         Returns:
             收敛质量指标
         """
         if len(losses) < 100:
             return {
-                'convergence_score': 0.0, 
+                'convergence_score': 0.0,
                 'oscillation_score': 0.0,
                 'improvement_ratio': 0.0,
                 'oscillation_ratio': 0.0
             }
-        
+
         # 计算损失下降趋势
         recent_losses = losses[-100:]
         early_losses = losses[:100] if len(losses) >= 200 else losses[:len(losses)//2]
-        
+
         improvement = (np.mean(early_losses) - np.mean(recent_losses)) / (np.mean(early_losses) + 1e-8)
         convergence_score = max(0, min(1, improvement))
-        
+
         # 分析震荡程度
         loss_diff = np.diff(recent_losses)
         oscillation = np.std(loss_diff) / (np.mean(np.abs(loss_diff)) + 1e-8)
         oscillation_score = max(0, min(1, 1 - oscillation / 10))
-        
+
         return {
             'convergence_score': convergence_score,
             'oscillation_score': oscillation_score,
             'improvement_ratio': improvement,
             'oscillation_ratio': oscillation
         }
-    
+
     def analyze_hyperparameter_quality(self, config: Dict[str, Any]) -> Dict[str, float]:
         """
         分析超参数质量
-        
+
         Args:
             config: 配置字典
-            
+
         Returns:
             超参数质量评分
         """
         scores = {}
-        
+
         # 学习率评估
         lr = config.get('model', {}).get('learning_rate', 3e-4)
         if 1e-5 <= lr <= 1e-2:
@@ -163,7 +163,7 @@ class TrainingQualityAnalyzer:
             scores['learning_rate_score'] = 0.7
         else:
             scores['learning_rate_score'] = 0.3
-        
+
         # 批次大小评估
         batch_size = config.get('model', {}).get('batch_size', 256)
         if 64 <= batch_size <= 512:
@@ -172,7 +172,7 @@ class TrainingQualityAnalyzer:
             scores['batch_size_score'] = 0.8
         else:
             scores['batch_size_score'] = 0.5
-        
+
         # 网络架构评估
         net_arch = config.get('model', {}).get('net_arch', [256, 256])
         if isinstance(net_arch, list) and 2 <= len(net_arch) <= 4:
@@ -182,7 +182,7 @@ class TrainingQualityAnalyzer:
                 scores['network_arch_score'] = 0.7
         else:
             scores['network_arch_score'] = 0.5
-        
+
         # 环境参数评估
         env_config = config.get('environment', {})
         transaction_cost = env_config.get('transaction_cost', 0.003)
@@ -190,26 +190,26 @@ class TrainingQualityAnalyzer:
             scores['transaction_cost_score'] = 1.0
         else:
             scores['transaction_cost_score'] = 0.6
-        
+
         # 综合评分
         scores['overall_hyperparameter_score'] = np.mean(list(scores.values()))
-        
+
         return scores
-    
-    def generate_quality_report(self, 
+
+    def generate_quality_report(self,
                               rewards: List[float],
                               losses: List[float],
                               config: Dict[str, Any],
                               portfolio_values: List[float]) -> str:
         """
         生成训练质量报告
-        
+
         Args:
             rewards: 奖励历史
-            losses: 损失历史  
+            losses: 损失历史
             config: 配置
             portfolio_values: 组合价值历史
-            
+
         Returns:
             质量报告字符串
         """
@@ -217,7 +217,7 @@ class TrainingQualityAnalyzer:
         report.append("=" * 80)
         report.append("训练质量分析报告")
         report.append("=" * 80)
-        
+
         # 稳定性分析
         if rewards:
             stability = self.analyze_training_stability(rewards)
@@ -226,14 +226,14 @@ class TrainingQualityAnalyzer:
             report.append(f"  趋势得分: {stability['trend_score']:.3f}")
             report.append(f"  方差得分: {stability['variance_score']:.3f}")
             report.append(f"  奖励趋势斜率: {stability['slope']:.6f}")
-            
+
             if stability['stability_score'] > 0.8:
                 report.append("  ✅ 训练稳定性良好")
             elif stability['stability_score'] > 0.6:
                 report.append("  ⚠️  训练稳定性一般，建议调整学习率")
             else:
                 report.append("  ❌ 训练不稳定，建议检查超参数设置")
-        
+
         # 收敛质量分析
         if losses:
             convergence = self.analyze_convergence_quality(losses)
@@ -241,14 +241,14 @@ class TrainingQualityAnalyzer:
             report.append(f"  收敛得分: {convergence['convergence_score']:.3f}")
             report.append(f"  震荡得分: {convergence['oscillation_score']:.3f}")
             report.append(f"  改进比率: {convergence['improvement_ratio']:.3f}")
-            
+
             if convergence['convergence_score'] > 0.7:
                 report.append("  ✅ 模型收敛良好")
             elif convergence['convergence_score'] > 0.4:
                 report.append("  ⚠️  收敛速度较慢，可考虑调整学习率")
             else:
                 report.append("  ❌ 收敛困难，建议检查模型架构或数据质量")
-        
+
         # 超参数质量分析
         hyperparams = self.analyze_hyperparameter_quality(config)
         report.append(f"\n⚙️  超参数质量分析:")
@@ -257,13 +257,13 @@ class TrainingQualityAnalyzer:
         report.append(f"  网络架构得分: {hyperparams['network_arch_score']:.3f}")
         report.append(f"  交易成本得分: {hyperparams['transaction_cost_score']:.3f}")
         report.append(f"  综合超参数得分: {hyperparams['overall_hyperparameter_score']:.3f}")
-        
+
         # 组合表现分析
         if portfolio_values and len(portfolio_values) > 1:
             initial_value = portfolio_values[0]
             final_value = portfolio_values[-1]
             total_return = (final_value / initial_value - 1) * 100
-            
+
             # 计算最大回撤
             peak = portfolio_values[0]
             max_drawdown = 0
@@ -273,39 +273,39 @@ class TrainingQualityAnalyzer:
                 drawdown = (peak - value) / peak
                 if drawdown > max_drawdown:
                     max_drawdown = drawdown
-            
+
             report.append(f"\n💰 组合表现分析:")
             report.append(f"  总收益率: {total_return:+.2f}%")
             report.append(f"  最大回撤: {max_drawdown:.2%}")
-            
+
             # 风险调整收益
             if max_drawdown > 0:
                 risk_adjusted_return = total_return / (max_drawdown * 100)
                 report.append(f"  风险调整收益: {risk_adjusted_return:.3f}")
-                
+
                 if risk_adjusted_return > 2.0:
                     report.append("  ✅ 风险调整收益优秀")
                 elif risk_adjusted_return > 1.0:
                     report.append("  ⚠️  风险调整收益一般")
                 else:
                     report.append("  ❌ 风险调整收益较差，需要优化风险控制")
-        
+
         # 总体建议
         report.append(f"\n🔍 总体建议:")
-        
+
         if rewards and len(rewards) > 100:
             recent_performance = np.mean(rewards[-100:])
             early_performance = np.mean(rewards[:100])
-            
+
             if recent_performance > early_performance * 1.1:
                 report.append("  ✅ 模型持续改进，训练效果良好")
             elif recent_performance > early_performance * 0.9:
                 report.append("  ⚠️  模型性能趋于稳定，可考虑调整探索策略")
             else:
                 report.append("  ❌ 模型性能下降，建议检查过拟合或数据泄露问题")
-        
+
         report.append("=" * 80)
-        
+
         return "\n".join(report)
 
 
@@ -347,13 +347,13 @@ class DrawdownStoppingCallback(BaseCallback):
 class TrainingMetricsCallback(BaseCallback):
     """训练指标监控回调，定期输出训练相关指标"""
 
-    def __init__(self, 
+    def __init__(self,
                  log_interval: int = 1000,
                  eval_interval: int = 10000,
                  verbose: int = 1):
         """
         初始化训练指标回调
-        
+
         Args:
             log_interval: 指标输出间隔（timesteps）
             eval_interval: 详细评估间隔（timesteps）
@@ -362,80 +362,80 @@ class TrainingMetricsCallback(BaseCallback):
         super().__init__(verbose)
         self.log_interval = log_interval
         self.eval_interval = eval_interval
-        
+
         # 指标历史记录
         self.episode_rewards = []
         self.episode_lengths = []
         self.portfolio_values = []
         self.drawdowns = []
         self.actions_history = []
-        
+
         # 统计信息
         self.last_log_step = 0
         self.last_eval_step = 0
         self.episode_count = 0
-        
+
         # 性能指标
         self.best_mean_reward = -np.inf
         self.best_portfolio_value = 0
         self.worst_drawdown = 0
-        
+
         # 质量分析器
         self.quality_analyzer = TrainingQualityAnalyzer()
         self.losses_history = []
-        
+
         logger.info(f"训练指标监控已启用 - 日志间隔: {log_interval}, 评估间隔: {eval_interval}")
 
     def _on_step(self) -> bool:
         """每步执行的监控逻辑"""
         current_step = self.num_timesteps
-        
+
         # 收集环境指标
         self._collect_env_metrics()
-        
+
         # 定期输出基础指标
         if current_step - self.last_log_step >= self.log_interval:
             self._log_basic_metrics(current_step)
             self.last_log_step = current_step
-        
+
         # 定期进行详细评估
         if current_step - self.last_eval_step >= self.eval_interval:
             self._log_detailed_metrics(current_step)
             self._log_quality_analysis(current_step)
             self.last_eval_step = current_step
-        
+
         return True
 
     def _collect_env_metrics(self):
         """收集环境指标"""
         if not hasattr(self.training_env, 'get_attr'):
             return
-            
+
         try:
             # 获取环境状态
             total_values = self.training_env.get_attr('total_value')
             drawdowns = self.training_env.get_attr('current_drawdown')
-            
+
             if len(total_values) > 0:
                 self.portfolio_values.extend(total_values)
                 self.drawdowns.extend(drawdowns)
-                
+
                 # 记录到TensorBoard
                 self.logger.record('env/mean_total_value', np.mean(total_values))
                 self.logger.record('env/max_total_value', np.max(total_values))
                 self.logger.record('env/mean_drawdown', np.mean(drawdowns))
                 self.logger.record('env/max_drawdown', np.max(drawdowns))
-                
+
                 # 更新最佳指标
                 current_max_value = np.max(total_values)
                 current_worst_drawdown = np.max(drawdowns)
-                
+
                 if current_max_value > self.best_portfolio_value:
                     self.best_portfolio_value = current_max_value
-                    
+
                 if current_worst_drawdown > self.worst_drawdown:
                     self.worst_drawdown = current_worst_drawdown
-                    
+
         except Exception as e:
             if self.verbose > 1:
                 logger.warning(f"收集环境指标失败: {e}")
@@ -444,38 +444,38 @@ class TrainingMetricsCallback(BaseCallback):
         """输出基础训练指标"""
         if self.verbose < 1:
             return
-            
+
         try:
             # 获取最近的奖励信息
             if hasattr(self.model, 'ep_info_buffer') and len(self.model.ep_info_buffer) > 0:
                 recent_episodes = list(self.model.ep_info_buffer)[-10:]  # 最近10个回合
                 recent_rewards = [ep['r'] for ep in recent_episodes]
                 recent_lengths = [ep['l'] for ep in recent_episodes]
-                
+
                 mean_reward = np.mean(recent_rewards)
                 mean_length = np.mean(recent_lengths)
-                
+
                 # 更新最佳奖励
                 if mean_reward > self.best_mean_reward:
                     self.best_mean_reward = mean_reward
-                
+
                 # 输出基础指标
                 logger.info(f"[步骤 {current_step:,}] "
                            f"平均奖励: {mean_reward:.4f} | "
                            f"平均回合长度: {mean_length:.1f} | "
                            f"最佳奖励: {self.best_mean_reward:.4f}")
-                
+
                 # 如果有组合价值数据
                 if self.portfolio_values:
                     recent_values = self.portfolio_values[-100:]  # 最近100个值
                     current_value = recent_values[-1] if recent_values else 0
                     value_change = ((current_value / recent_values[0]) - 1) * 100 if len(recent_values) > 1 else 0
-                    
+
                     logger.info(f"[步骤 {current_step:,}] "
                                f"当前组合价值: {current_value:,.0f} | "
                                f"价值变化: {value_change:+.2f}% | "
                                f"最大回撤: {self.worst_drawdown:.2%}")
-                
+
         except Exception as e:
             logger.warning(f"输出基础指标失败: {e}")
 
@@ -483,31 +483,31 @@ class TrainingMetricsCallback(BaseCallback):
         """输出详细训练指标"""
         if self.verbose < 1:
             return
-            
+
         try:
             logger.info("=" * 80)
             logger.info(f"详细训练报告 - 步骤 {current_step:,}")
             logger.info("-" * 80)
-            
+
             # 模型学习率等参数
             if hasattr(self.model, 'learning_rate'):
                 current_lr = self.model.learning_rate
                 if callable(current_lr):
                     current_lr = current_lr(1.0)  # 获取当前学习率
                 logger.info(f"当前学习率: {current_lr:.2e}")
-            
+
             # 回合统计
             if hasattr(self.model, 'ep_info_buffer') and len(self.model.ep_info_buffer) > 0:
                 episodes = list(self.model.ep_info_buffer)
                 if len(episodes) >= 10:
                     rewards = [ep['r'] for ep in episodes[-50:]]  # 最近50个回合
                     lengths = [ep['l'] for ep in episodes[-50:]]
-                    
+
                     logger.info(f"回合统计 (最近50回合):")
                     logger.info(f"  平均奖励: {np.mean(rewards):.4f} ± {np.std(rewards):.4f}")
                     logger.info(f"  奖励范围: [{np.min(rewards):.4f}, {np.max(rewards):.4f}]")
                     logger.info(f"  平均长度: {np.mean(lengths):.1f} ± {np.std(lengths):.1f}")
-            
+
             # 组合性能统计
             if self.portfolio_values:
                 recent_values = self.portfolio_values[-1000:]  # 最近1000个值
@@ -515,18 +515,18 @@ class TrainingMetricsCallback(BaseCallback):
                     initial_value = recent_values[0]
                     current_value = recent_values[-1]
                     total_return = (current_value / initial_value - 1) * 100
-                    
+
                     # 计算波动率
                     returns = np.diff(recent_values) / recent_values[:-1]
                     volatility = np.std(returns) * np.sqrt(252) * 100  # 年化波动率
-                    
+
                     logger.info(f"组合性能统计:")
                     logger.info(f"  初始价值: {initial_value:,.0f}")
                     logger.info(f"  当前价值: {current_value:,.0f}")
                     logger.info(f"  总收益率: {total_return:+.2f}%")
                     logger.info(f"  年化波动率: {volatility:.2f}%")
                     logger.info(f"  最大价值: {self.best_portfolio_value:,.0f}")
-            
+
             # 回撤统计
             if self.drawdowns:
                 recent_drawdowns = self.drawdowns[-1000:]
@@ -534,7 +534,7 @@ class TrainingMetricsCallback(BaseCallback):
                 logger.info(f"  当前回撤: {recent_drawdowns[-1]:.2%}")
                 logger.info(f"  平均回撤: {np.mean(recent_drawdowns):.2%}")
                 logger.info(f"  最大回撤: {np.max(recent_drawdowns):.2%}")
-            
+
             # 训练稳定性指标
             if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
                 metrics = self.model.logger.name_to_value
@@ -544,9 +544,9 @@ class TrainingMetricsCallback(BaseCallback):
                     logger.info(f"策略梯度损失: {metrics['train/policy_gradient_loss']:.6f}")
                 if 'train/value_loss' in metrics:
                     logger.info(f"价值函数损失: {metrics['train/value_loss']:.6f}")
-            
+
             logger.info("=" * 80)
-            
+
         except Exception as e:
             logger.warning(f"输出详细指标失败: {e}")
 
@@ -558,32 +558,32 @@ class TrainingMetricsCallback(BaseCallback):
                 metrics = self.model.logger.name_to_value
                 if 'train/loss' in metrics:
                     self.losses_history.append(metrics['train/loss'])
-            
+
             # 收集奖励历史
             rewards_history = []
             if hasattr(self.model, 'ep_info_buffer') and len(self.model.ep_info_buffer) > 0:
                 episodes = list(self.model.ep_info_buffer)
                 rewards_history = [ep['r'] for ep in episodes]
-            
+
             # 生成质量报告
             if len(rewards_history) > 50 and len(self.portfolio_values) > 50:
                 # 获取配置信息（需要从父类传递）
                 config = getattr(self, 'config', {})
-                
+
                 quality_report = self.quality_analyzer.generate_quality_report(
                     rewards=rewards_history,
                     losses=self.losses_history,
                     config=config,
                     portfolio_values=self.portfolio_values
                 )
-                
+
                 logger.info("\n" + quality_report)
-                
+
                 # 保存质量报告到文件
                 report_path = f"logs/quality_report_{current_step}.txt"
                 with open(report_path, 'w', encoding='utf-8') as f:
                     f.write(quality_report)
-                    
+
         except Exception as e:
             logger.warning(f"生成质量分析失败: {e}")
 
@@ -596,29 +596,29 @@ class TrainingMetricsCallback(BaseCallback):
         logger.info("=" * 80)
         logger.info("训练完成 - 最终统计")
         logger.info("-" * 80)
-        
+
         try:
             if hasattr(self.model, 'ep_info_buffer') and len(self.model.ep_info_buffer) > 0:
                 all_episodes = list(self.model.ep_info_buffer)
                 all_rewards = [ep['r'] for ep in all_episodes]
                 all_lengths = [ep['l'] for ep in all_episodes]
-                
+
                 logger.info(f"总回合数: {len(all_episodes)}")
                 logger.info(f"平均奖励: {np.mean(all_rewards):.4f}")
                 logger.info(f"最佳奖励: {np.max(all_rewards):.4f}")
                 logger.info(f"最差奖励: {np.min(all_rewards):.4f}")
                 logger.info(f"奖励标准差: {np.std(all_rewards):.4f}")
-                
+
             if self.portfolio_values:
                 logger.info(f"最终组合价值: {self.portfolio_values[-1]:,.0f}")
                 logger.info(f"最佳组合价值: {self.best_portfolio_value:,.0f}")
-                
+
             if self.drawdowns:
                 logger.info(f"最大回撤: {self.worst_drawdown:.2%}")
-                
+
         except Exception as e:
             logger.warning(f"输出最终统计失败: {e}")
-            
+
         logger.info("=" * 80)
 
 
@@ -813,7 +813,7 @@ class RLTrainer:
 
         # 策略参数
         net_arch = model_config.get('net_arch', [256, 256])
-        
+
         # 如果使用自定义策略
         if model_config.get('use_custom_policy', False):
             env_config = self.config['environment']
