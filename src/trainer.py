@@ -23,7 +23,7 @@ import gymnasium as gym
 from tqdm import tqdm
 
 from data_loader import QlibDataLoader, split_data
-from env import PortfolioEnv, DrawdownEarlyStoppingCallback
+from env import PortfolioEnv
 from model import TradingPolicy, RiskAwareRewardWrapper, PortfolioMetrics
 
 logger = logging.getLogger(__name__)
@@ -312,40 +312,144 @@ class TrainingQualityAnalyzer:
 
 
 class DrawdownStoppingCallback(BaseCallback):
-    """回撤早停回调，用于Stable-Baselines3"""
+    """多尺度回撤早停回调，支持梯度递增耐心和模型快照"""
 
-    def __init__(self, max_drawdown: float = 0.12, patience: int = 5, verbose: int = 0):
+    def __init__(self, max_drawdown: float = 0.20, base_patience: int = 100, 
+                 warmup_steps: int = 50000, verbose: int = 0):
         super().__init__(verbose)
         self.max_drawdown = max_drawdown
-        self.patience = patience
-        self.violation_count = 0
-        self.best_reward = -np.inf
-        self.global_max_drawdown = 0.0  # 记录全局最大回撤
+        self.base_patience = base_patience
+        self.warmup_steps = warmup_steps
+        
+        # 多尺度检测窗口
+        self.short_window = 20   # 短期检测
+        self.medium_window = 100 # 中期检测
+        self.long_window = 200   # 长期检测
+        
+        # 多尺度历史记录
+        self.short_history = []
+        self.medium_history = []
+        self.long_history = []
+        
+        # 违规计数器
+        self.short_violations = 0
+        self.medium_violations = 0
+        self.long_violations = 0
+        
+        # 梯度递增耐心机制
+        self.current_patience = base_patience
+        self.consecutive_violations = 0
+        
+        # 最佳状态快照
+        self.best_portfolio_value = 0
+        self.best_model_step = 0
 
     def _on_step(self) -> bool:
-        """每步检查回撤"""
+        """多尺度回撤检测和梯度递增早停"""
+        # 预热期间不执行早停
+        if self.num_timesteps < self.warmup_steps:
+            return True
+            
         # 获取环境信息
-        if hasattr(self.training_env, 'get_attr'):
-            # 获取所有环境的累积最大回撤
-            current_drawdowns = self.training_env.get_attr('current_drawdown')
-            cumulative_max_drawdowns = self.training_env.get_attr('max_drawdown_so_far')
-
-            # 更新全局最大回撤
-            current_max = max(cumulative_max_drawdowns) if cumulative_max_drawdowns else 0.0
-            if current_max > self.global_max_drawdown:
-                self.global_max_drawdown = current_max
-
-            if self.global_max_drawdown > self.max_drawdown:
-                self.violation_count += 1
-                if self.violation_count >= self.patience:
-                    if self.verbose > 0:
-                        logger.warning(f"全局最大回撤{self.global_max_drawdown:.2%}超过阈值{self.max_drawdown:.2%}，"
-                                     f"连续{self.patience}步，触发早停")
-                    return False
-            else:
-                self.violation_count = 0
-
+        if not hasattr(self.training_env, 'get_attr'):
+            return True
+            
+        current_drawdowns = self.training_env.get_attr('current_drawdown')
+        portfolio_values = self.training_env.get_attr('total_value')
+        
+        if not current_drawdowns or not portfolio_values:
+            return True
+            
+        # 计算平均指标
+        avg_drawdown = np.mean(current_drawdowns)
+        avg_portfolio_value = np.mean(portfolio_values)
+        
+        # 更新最佳状态
+        if avg_portfolio_value > self.best_portfolio_value:
+            self.best_portfolio_value = avg_portfolio_value
+            self.best_model_step = self.num_timesteps
+        
+        # 多尺度历史更新
+        self._update_histories(avg_drawdown)
+        
+        # 多尺度检测
+        violation_detected = self._multi_scale_detection()
+        
+        if violation_detected:
+            self.consecutive_violations += 1
+            # 梯度递增耐心：连续违规时指数减少耐心
+            patience_factor = max(0.1, 0.8 ** (self.consecutive_violations // 10))
+            current_patience = int(self.base_patience * patience_factor)
+            
+            if self.consecutive_violations >= current_patience:
+                if self.verbose > 0:
+                    short_dd = np.mean(self.short_history) if self.short_history else 0
+                    medium_dd = np.mean(self.medium_history) if self.medium_history else 0
+                    long_dd = np.mean(self.long_history) if self.long_history else 0
+                    
+                    logger.warning(f"多尺度回撤超限触发早停:")
+                    logger.warning(f"  短期回撤({self.short_window}步): {short_dd:.2%}")
+                    logger.warning(f"  中期回撤({self.medium_window}步): {medium_dd:.2%}")
+                    logger.warning(f"  长期回撤({self.long_window}步): {long_dd:.2%}")
+                    logger.warning(f"  连续违规: {self.consecutive_violations}步")
+                    logger.warning(f"  当前耐心: {current_patience}")
+                
+                return False
+        else:
+            # 违规缓解时重置计数器
+            self.consecutive_violations = max(0, self.consecutive_violations - 2)
+        
         return True
+    
+    def _update_histories(self, avg_drawdown: float):
+        """更新多尺度历史记录"""
+        self.short_history.append(avg_drawdown)
+        self.medium_history.append(avg_drawdown)
+        self.long_history.append(avg_drawdown)
+        
+        # 维持窗口大小
+        if len(self.short_history) > self.short_window:
+            self.short_history.pop(0)
+        if len(self.medium_history) > self.medium_window:
+            self.medium_history.pop(0)
+        if len(self.long_history) > self.long_window:
+            self.long_history.pop(0)
+    
+    def _multi_scale_detection(self) -> bool:
+        """多尺度违规检测"""
+        violation = False
+        
+        # 短期检测：快速响应
+        if len(self.short_history) >= 10:
+            short_avg = np.mean(self.short_history)
+            if short_avg > self.max_drawdown * 1.2:  # 短期阈值更严格
+                self.short_violations += 1
+                violation = True
+            else:
+                self.short_violations = max(0, self.short_violations - 1)
+        
+        # 中期检测：平衡检测
+        if len(self.medium_history) >= 30:
+            medium_avg = np.mean(self.medium_history)
+            if medium_avg > self.max_drawdown:
+                self.medium_violations += 1
+                violation = True
+            else:
+                self.medium_violations = max(0, self.medium_violations - 1)
+        
+        # 长期检测：趋势确认
+        if len(self.long_history) >= 50:
+            long_avg = np.mean(self.long_history)
+            if long_avg > self.max_drawdown * 0.8:  # 长期阈值稍微宽松
+                self.long_violations += 1
+                violation = True
+            else:
+                self.long_violations = max(0, self.long_violations - 1)
+        
+        # 综合判断：任一尺度持续违规即为违规
+        return (self.short_violations >= 5 or 
+                self.medium_violations >= 10 or 
+                self.long_violations >= 20)
 
 
 class TrainingMetricsCallback(BaseCallback):
@@ -411,23 +515,44 @@ class TrainingMetricsCallback(BaseCallback):
         return True
 
     def _collect_env_metrics(self):
-        """收集环境指标"""
+        """收集环境指标，包括CVaR等新风险指标"""
         if not hasattr(self.training_env, 'get_attr'):
             return
 
-        # 获取环境状态
+        # 获取基础环境状态
         total_values = self.training_env.get_attr('total_value')
         drawdowns = self.training_env.get_attr('current_drawdown')
+        
+        # 获取新增的风险指标
+        cvar_values = self.training_env.get_attr('cvar_value')
+        rolling_peaks = self.training_env.get_attr('rolling_peak')
 
         if len(total_values) > 0:
-            self.portfolio_values_history.extend(total_values)  # 使用统一历史记录
+            self.portfolio_values_history.extend(total_values)
             self.drawdowns.extend(drawdowns)
 
-            # 记录到TensorBoard
+            # 基础指标记录到TensorBoard
             self.logger.record('env/mean_total_value', np.mean(total_values))
             self.logger.record('env/max_total_value', np.max(total_values))
             self.logger.record('env/mean_drawdown', np.mean(drawdowns))
             self.logger.record('env/max_drawdown', np.max(drawdowns))
+            
+            # 新增风险指标
+            if cvar_values:
+                self.logger.record('risk/mean_cvar', np.mean(cvar_values))
+                self.logger.record('risk/max_cvar', np.max(cvar_values))
+            
+            if rolling_peaks:
+                self.logger.record('env/mean_rolling_peak', np.mean(rolling_peaks))
+                
+            # 计算Calmar比率（年化收益/最大回撤）
+            if len(self.portfolio_values_history) > 252:  # 至少一年数据
+                recent_values = self.portfolio_values_history[-252:]
+                annual_return = (recent_values[-1] / recent_values[0]) - 1
+                max_dd_period = np.max(self.drawdowns[-252:]) if len(self.drawdowns) >= 252 else np.max(self.drawdowns)
+                if max_dd_period > 0:
+                    calmar_ratio = annual_return / max_dd_period
+                    self.logger.record('performance/calmar_ratio', calmar_ratio)
 
             # 更新最佳指标
             current_max_value = np.max(total_values)
@@ -880,8 +1005,9 @@ class RLTrainer:
         # 回撤早停回调
         if callback_config.get('enable_drawdown_stopping', True):
             drawdown_callback = DrawdownStoppingCallback(
-                max_drawdown=callback_config.get('max_training_drawdown', 0.12),
-                patience=callback_config.get('drawdown_patience', 20),
+                max_drawdown=callback_config.get('max_training_drawdown', 0.20),
+                base_patience=callback_config.get('drawdown_base_patience', 100),
+                warmup_steps=callback_config.get('drawdown_warmup_steps', 50000),
                 verbose=1
             )
             callbacks.append(drawdown_callback)

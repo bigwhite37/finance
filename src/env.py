@@ -250,10 +250,18 @@ class PortfolioEnv(gym.Env):
         self.value_history = deque([self.initial_cash], maxlen=252)  # 保留一年的历史
         self.return_history = deque(maxlen=252)
         self.drawdown_history = deque(maxlen=252)
-        self.max_value = self.initial_cash
+        
+        # 滚动峰值回撤计算
+        self.peak_window = deque([self.initial_cash], maxlen=252)  # 一年峰值窗口
+        self.rolling_peak = self.initial_cash
         self.current_drawdown = 0.0
-        self.max_drawdown_so_far = 0.0  # 添加全局最大回撤跟踪
-        self.steps_taken = 0  # 添加步数跟踪
+        self.max_drawdown_so_far = 0.0
+        
+        # CVaR风险指标
+        self.cvar_alpha = 0.05  # 5%分位
+        self.cvar_value = 0.0
+        
+        self.steps_taken = 0
 
         # 重置交易记录
         self.trade_history = []
@@ -329,14 +337,26 @@ class PortfolioEnv(gym.Env):
         return np.array(prices)
 
     def _rebalance_portfolio(self, target_weights: np.ndarray, prices: np.ndarray) -> float:
-        """调仓到目标权重"""
+        """调仓到目标权重，应用动态头寸缩放"""
         # 计算当前持仓价值
         current_holdings_value = np.sum(self.holdings * prices)
         total_value = self.cash + current_holdings_value
 
+        # Drawdown-Modulated Position Sizing - 根据回撤动态缩放头寸
+        drawdown_scale = self._calculate_position_scale()
+        scaled_target_weights = target_weights * drawdown_scale
+        
+        # 重新归一化权重确保和为1
+        weight_sum = np.sum(scaled_target_weights)
+        if weight_sum > 0:
+            scaled_target_weights = scaled_target_weights / weight_sum
+        else:
+            # 如果所有权重都被缩放为0，保持现金
+            scaled_target_weights = np.zeros_like(target_weights)
+
         # 计算目标持仓
-        target_values = target_weights * total_value
-        target_shares = target_values / prices
+        target_values = scaled_target_weights * total_value
+        target_shares = target_values / prices + 1e-10  # 避免除零
 
         # 计算交易量和成本
         trade_volumes = np.abs(target_shares - self.holdings)
@@ -345,11 +365,38 @@ class PortfolioEnv(gym.Env):
 
         # 更新持仓
         self.holdings = target_shares
-        self.weights = target_weights
+        self.weights = scaled_target_weights  # 记录实际使用的权重
         self.cash = total_value - np.sum(target_values) - trade_cost
         self.transaction_costs += trade_cost
 
         return trade_cost
+
+    def _calculate_position_scale(self) -> float:
+        """
+        计算基于回撤的头寸缩放因子
+        根据fix.md建议：scale = max(0.0, 1 - current_drawdown / max_drawdown_threshold)
+        """
+        if self.max_drawdown_threshold <= 0:
+            return 1.0
+            
+        # 基础缩放：回撤越接近阈值，头寸越小
+        base_scale = max(0.0, 1.0 - self.current_drawdown / self.max_drawdown_threshold)
+        
+        # CVaR调整：如果CVaR风险高，进一步缩放
+        cvar_adjustment = 1.0
+        if self.cvar_value > 0.02:  # CVaR超过2%时开始缩放
+            cvar_adjustment = max(0.5, 1.0 - (self.cvar_value - 0.02) * 10)
+        
+        # 波动率调整：高波动时更保守
+        volatility = self._get_current_volatility()
+        vol_adjustment = 1.0
+        if volatility > 0.25:  # 年化波动率超过25%时缩放
+            vol_adjustment = max(0.7, 1.0 - (volatility - 0.25) * 2)
+        
+        # 综合缩放因子
+        final_scale = base_scale * cvar_adjustment * vol_adjustment
+        
+        return max(0.1, final_scale)  # 最小保持10%的头寸
 
     def _update_portfolio_value(self, prices: np.ndarray):
         """更新组合价值"""
@@ -364,21 +411,41 @@ class PortfolioEnv(gym.Env):
             return_rate = (self.total_value / self.value_history[-2]) - 1
             self.return_history.append(return_rate)
 
-        # 更新最大价值和回撤
-        if self.total_value > self.max_value:
-            self.max_value = self.total_value
-
-        self.current_drawdown = (self.max_value - self.total_value) / self.max_value
+        # 滚动峰值回撤计算 - 避免早期随机高点影响
+        self.peak_window.append(self.total_value)
+        self.rolling_peak = max(self.peak_window)
+        
+        # 使用滚动峰值计算回撤
+        if self.rolling_peak > 0:
+            self.current_drawdown = max(0, (self.rolling_peak - self.total_value) / self.rolling_peak)
+        else:
+            self.current_drawdown = 0.0
+            
         self.drawdown_history.append(self.current_drawdown)
-
+        
         # 更新全局最大回撤
         if self.current_drawdown > self.max_drawdown_so_far:
             self.max_drawdown_so_far = self.current_drawdown
+            
+        # 计算CVaR风险指标
+        self._update_cvar()
+
+    def _update_cvar(self):
+        """更新CVaR风险指标"""
+        if len(self.return_history) >= 50:  # 至少50个样本才计算CVaR
+            returns = np.array(self.return_history)
+            # 计算5%分位的平均损失
+            sorted_returns = np.sort(returns)
+            n_tail = max(1, int(len(returns) * self.cvar_alpha))
+            tail_returns = sorted_returns[:n_tail]
+            self.cvar_value = -np.mean(tail_returns) if len(tail_returns) > 0 else 0.0
+        else:
+            self.cvar_value = 0.0
 
     def _calculate_reward(self, old_weights: np.ndarray, new_weights: np.ndarray, trade_cost: float) -> float:
         """
-        计算奖励函数
-        考虑收益率、回撤惩罚、交易成本
+        改进的奖励函数：CVaR-回撤双目标优化
+        结合风险收益平衡和动态系数调整
         """
         # 基础收益率奖励
         if len(self.return_history) > 0:
@@ -386,25 +453,45 @@ class PortfolioEnv(gym.Env):
         else:
             portfolio_return = 0.0
 
-        # 回撤惩罚
-        drawdown_penalty = 0.0
-        if self.current_drawdown > 0.05:  # 5%以上回撤开始惩罚
-            drawdown_penalty = self.reward_penalty * (self.current_drawdown - 0.05)
-
+        # 计算动态波动率（用于调整风险系数）
+        volatility = self._get_current_volatility()
+        
+        # 动态拉格朗日系数 - 根据波动率调整风险惩罚强度
+        lambda_dd = 2.0 + 3.0 * max(0, volatility - 0.02)  # 波动率超过2%时加大回撤惩罚
+        lambda_cvar = 1.0 + 2.0 * max(0, volatility - 0.015)  # 适应CVaR惩罚
+        
+        # 回撤惩罚 - 使用动态系数
+        drawdown_penalty = lambda_dd * self.current_drawdown
+        
+        # CVaR惩罚 - 关注尾部风险
+        cvar_penalty = lambda_cvar * self.cvar_value
+        
         # 交易成本惩罚
-        cost_penalty = trade_cost / self.total_value
-
-        # 波动率惩罚（可选）
-        volatility_penalty = 0.0
-        if len(self.return_history) >= 10:
-            recent_returns = list(self.return_history)[-10:]
-            volatility = np.std(recent_returns)
-            volatility_penalty = 0.1 * volatility  # 适度惩罚高波动
-
-        # 综合奖励
-        reward = portfolio_return - drawdown_penalty - cost_penalty - volatility_penalty
-
+        cost_penalty = trade_cost / self.total_value if self.total_value > 0 else 0
+        
+        # 波动率惩罚 - 轻微惩罚过度波动
+        volatility_penalty = 0.5 * max(0, volatility - 0.03)  # 超过3%年化波动才惩罚
+        
+        # 综合奖励 - 风险收益平衡
+        reward = (portfolio_return - drawdown_penalty - cvar_penalty 
+                 - cost_penalty - volatility_penalty)
+        
         return reward
+
+    def _get_current_volatility(self) -> float:
+        """计算当前30日年化波动率"""
+        if len(self.return_history) >= 30:
+            recent_returns = np.array(list(self.return_history)[-30:])
+            daily_vol = np.std(recent_returns)
+            annualized_vol = daily_vol * np.sqrt(252)  # 年化
+            return annualized_vol
+        elif len(self.return_history) >= 10:
+            recent_returns = np.array(list(self.return_history)[-10:])
+            daily_vol = np.std(recent_returns)
+            annualized_vol = daily_vol * np.sqrt(252)
+            return annualized_vol
+        else:
+            return 0.0
 
     def _get_observation(self) -> np.ndarray:
         """获取当前观察状态"""
@@ -567,73 +654,3 @@ class PortfolioEnv(gym.Env):
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
         else:
             plt.show()
-
-
-class DrawdownEarlyStoppingCallback:
-    """回撤早停回调"""
-
-    def __init__(self, max_drawdown: float = 0.15, patience: int = 10):
-        self.max_drawdown = max_drawdown
-        self.patience = patience
-        self.violation_count = 0
-
-    def __call__(self, env: PortfolioEnv) -> bool:
-        """检查是否需要早停"""
-        if env.current_drawdown > self.max_drawdown:
-            self.violation_count += 1
-            if self.violation_count >= self.patience:
-                logger.warning(f"回撤超过阈值{self.max_drawdown:.2%}，连续{self.patience}步，触发早停")
-                return True
-        else:
-            self.violation_count = 0
-
-        return False
-
-
-if __name__ == "__main__":
-    # 测试环境
-    print("测试PortfolioEnv环境...")
-
-    # 创建模拟数据
-    dates = pd.date_range("2020-01-01", "2020-12-31", freq="D")
-    stocks = ["000001.SZ", "000002.SZ", "600000.SH"]
-
-    data_list = []
-    for date in dates:
-        for stock in stocks:
-            price = 100 + np.random.randn() * 10
-            data_list.append({
-                "datetime": date,
-                "instrument": stock,
-                "$close": price,
-                "$open": price * (1 + np.random.randn() * 0.01),
-                "$high": price * (1 + abs(np.random.randn()) * 0.02),
-                "$low": price * (1 - abs(np.random.randn()) * 0.02),
-                "$volume": np.random.randint(1000, 10000)
-            })
-
-    df = pd.DataFrame(data_list)
-    df = df.set_index(["datetime", "instrument"])
-
-    # 创建环境
-    env = PortfolioEnv(df, initial_cash=100000, lookback_window=10)
-
-    # 测试环境
-    obs, info = env.reset()
-    print(f"观察空间维度: {obs.shape}")
-    print(f"动作空间: {env.action_space}")
-
-    # 运行几步
-    for i in range(5):
-        action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(action)
-        print(f"Step {i}: reward={reward:.4f}, total_value={info['total_value']:.2f}")
-
-        if terminated:
-            break
-
-    # 获取性能统计
-    performance = env.get_portfolio_performance()
-    print("\n组合性能:")
-    for key, value in performance.items():
-        print(f"{key}: {value}")
