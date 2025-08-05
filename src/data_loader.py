@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 import logging
+from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,10 @@ class QlibDataLoader:
             )
 
             logger.info(f"加载数据成功: {data.shape}, 时间范围: {start_time} - {end_time}")
+            
+            # 进行数据质量检查
+            self._validate_loaded_data(data, instruments, fields)
+            
             return data
 
         except Exception as e:
@@ -289,6 +294,68 @@ class QlibDataLoader:
 
         return features
 
+    def _validate_loaded_data(self, data: pd.DataFrame, instruments: list, fields: list):
+        """验证加载的数据质量"""
+        if data.empty:
+            raise RuntimeError("加载的数据为空")
+        
+        # 检查数据形状
+        expected_columns = len(fields)
+        actual_columns = len(data.columns)
+        if actual_columns != expected_columns:
+            logger.warning(f"数据列数不匹配: 期望 {expected_columns}, 实际 {actual_columns}")
+        
+        # 检查缺失值
+        missing_stats = data.isnull().sum()
+        total_missing = missing_stats.sum()
+        
+        if total_missing > 0:
+            total_points = len(data)
+            missing_ratio = total_missing / (total_points * len(data.columns))
+            
+            logger.warning(f"数据加载时发现缺失值:")
+            logger.warning(f"总缺失点数: {total_missing} / {total_points * len(data.columns)} ({missing_ratio:.2%})")
+            
+            # 按列统计缺失情况
+            for col in data.columns:
+                if missing_stats[col] > 0:
+                    col_missing_ratio = missing_stats[col] / total_points
+                    logger.warning(f"列 {col} 缺失: {missing_stats[col]} ({col_missing_ratio:.2%})")
+            
+            # 根据缺失比例决定处理策略
+            if missing_ratio > 0.2:  # 缺失超过20%
+                raise RuntimeError(
+                    f"数据缺失过多 ({missing_ratio:.2%})，无法继续处理。\n"
+                    f"建议检查：\n"
+                    f"1. 数据源是否正常\n"
+                    f"2. 股票代码是否正确\n"
+                    f"3. 时间范围是否合理\n"
+                    f"缺失统计: {dict(missing_stats[missing_stats > 0])}"
+                )
+            elif missing_ratio > 0.1:  # 缺失10%-20%
+                logger.error(
+                    f"数据缺失较多 ({missing_ratio:.2%})，将在环境中进行处理，但建议检查数据质量。"
+                )
+            else:
+                logger.info(f"数据存在少量缺失 ({missing_ratio:.2%})，将在环境中进行处理")
+        else:
+            logger.info("数据加载完整，无缺失值")
+        
+        # 检查数据范围合理性
+        for col in data.columns:
+            if '$' in col and ('price' in col or 'close' in col or 'open' in col or 'high' in col or 'low' in col):
+                # 价格类数据应该大于0
+                negative_prices = (data[col] <= 0).sum()
+                if negative_prices > 0:
+                    logger.warning(f"发现 {negative_prices} 个非正价格在列 {col}")
+            elif '$volume' in col:
+                # 成交量应该非负
+                negative_volume = (data[col] < 0).sum()
+                if negative_volume > 0:
+                    logger.warning(f"发现 {negative_volume} 个负成交量在列 {col}")
+        
+        logger.info("数据质量检查完成")
+
     def get_calendar(self, start_time: str, end_time: str, freq: str = "day") -> list:
         """
         获取交易日历
@@ -315,7 +382,8 @@ class QlibDataLoader:
 def split_data(data: pd.DataFrame,
                train_start: str, train_end: str,
                valid_start: str, valid_end: str,
-               test_start: str, test_end: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+               test_start: str, test_end: str,
+               apply_scaling: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     分割数据为训练集、验证集、测试集
 
@@ -327,6 +395,7 @@ def split_data(data: pd.DataFrame,
         valid_end: 验证集结束时间
         test_start: 测试集开始时间
         test_end: 测试集结束时间
+        apply_scaling: 是否应用标准化（防止数据泄漏）
 
     Returns:
         训练集、验证集、测试集
@@ -355,6 +424,47 @@ def split_data(data: pd.DataFrame,
             logger.warning(f"验证集为空，时间范围: {valid_start} - {valid_end}")
         if test_data.empty:
             logger.warning(f"测试集为空，时间范围: {test_start} - {test_end}")
+        
+        # 应用标准化处理（防止数据泄漏）
+        if apply_scaling and not train_data.empty:
+            logger.info("应用标准化处理以防止数据泄漏...")
+            
+            # 为每个数据集单独fit scaler
+            scalers = {}
+            scaled_datasets = {}
+            
+            for name, dataset in [('train', train_data), ('valid', valid_data), ('test', test_data)]:
+                if dataset.empty:
+                    scaled_datasets[name] = dataset
+                    continue
+                
+                # 为当前数据集创建scaler
+                scaler = StandardScaler()
+                
+                # 只对数值型列进行标准化
+                numeric_columns = dataset.select_dtypes(include=[np.number]).columns
+                if len(numeric_columns) == 0:
+                    logger.warning(f"{name}数据集没有数值型列，跳过标准化")
+                    scaled_datasets[name] = dataset
+                    continue
+                
+                # 复制数据避免修改原始数据
+                scaled_data = dataset.copy()
+                
+                # fit并transform当前数据集
+                scaled_values = scaler.fit_transform(dataset[numeric_columns])
+                scaled_data[numeric_columns] = scaled_values
+                
+                scalers[name] = scaler
+                scaled_datasets[name] = scaled_data
+                
+                logger.info(f"{name}数据集标准化完成 - 特征数: {len(numeric_columns)}")
+            
+            train_data = scaled_datasets['train']
+            valid_data = scaled_datasets['valid'] 
+            test_data = scaled_datasets['test']
+            
+            logger.info("所有数据集标准化处理完成")
             
         return train_data, valid_data, test_data
 
