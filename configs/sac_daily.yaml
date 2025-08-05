@@ -12,14 +12,14 @@ data:
   stock_limit: 50          # 增加股票数量以提高多样性
   # 可选：自定义股票池（如果指定则优先使用，否则使用market参数）
   custom_stocks: ["sh600919", "sh601288", "sh600036"]
-  start_time: "2020-01-01"
-  end_time: "2023-12-31"
-  train_start: "2020-01-01"
-  train_end: "2022-12-31"
-  valid_start: "2023-01-01"
-  valid_end: "2023-06-30"
-  test_start: "2023-07-01"
-  test_end: "2023-12-31"
+  start_time: "2019-01-01"
+  end_time: "2024-07-30"
+  train_start: "2019-01-01"
+  train_end: "2021-06-30"
+  valid_start: "2021-07-01"
+  valid_end: "2022-06-30"
+  test_start: "2022-07-01"
+  test_end: "2024-07-30"
   freq: "day"
   fields:
     - "$close"

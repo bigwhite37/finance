@@ -101,7 +101,7 @@ class QlibDataLoader:
                     stock_list = stock_list[:limit]
                 logger.info(f"使用自定义股票池，获取到{len(stock_list)}只股票")
                 return stock_list
-            
+
             # 从qlib数据文件中读取股票池
             if market == "all":
                 instruments_file = os.path.join(self.data_root, "cn_data", "instruments", "all.txt")
@@ -167,10 +167,10 @@ class QlibDataLoader:
             )
 
             logger.info(f"加载数据成功: {data.shape}, 时间范围: {start_time} - {end_time}")
-            
+
             # 进行数据质量检查
             self._validate_loaded_data(data, instruments, fields)
-            
+
             return data
 
         except Exception as e:
@@ -318,7 +318,7 @@ class QlibDataLoader:
         # 按股票检查缺失值（正确的检测方式）
         total_missing = 0
         missing_instruments = []
-        
+
         if isinstance(data.index, pd.MultiIndex) and data.index.names[0] == 'instrument':
             # qlib的多索引格式：(instrument, datetime)
             for instrument in instruments:
@@ -326,15 +326,15 @@ class QlibDataLoader:
                     instrument_data = data.xs(instrument, level=0)
                     missing_stats = instrument_data.isnull().sum()
                     instrument_missing = missing_stats.sum()
-                    
+
                     if instrument_missing > 0:
                         total_missing += instrument_missing
                         missing_instruments.append(instrument)
-                        
+
                         # 找出缺失的日期范围
                         missing_mask = instrument_data.isnull().any(axis=1)
                         missing_dates = instrument_data[missing_mask].index
-                        
+
                         if len(missing_dates) > 0:
                             date_ranges = self._get_date_ranges(missing_dates)
                             logger.warning(f"股票 {instrument} 数据缺失:")
@@ -343,7 +343,7 @@ class QlibDataLoader:
                             logger.warning(f"  缺失特征: {list(missing_stats[missing_stats > 0].index)}")
                     else:
                         logger.debug(f"股票 {instrument} 数据完整")
-                        
+
                 except KeyError:
                     logger.error(f"股票 {instrument} 在数据中不存在")
                     raise RuntimeError(f"股票 {instrument} 数据缺失")
@@ -351,20 +351,20 @@ class QlibDataLoader:
             # 简单索引格式的缺失值检测
             missing_stats = data.isnull().sum()
             total_missing = missing_stats.sum()
-            
+
             if total_missing > 0:
                 logger.warning(f"数据存在缺失值: {dict(missing_stats[missing_stats > 0])}")
-        
+
         # 总体评估
         if total_missing > 0:
             total_expected_points = len(instruments) * len(data.index.get_level_values(1).unique()) * len(fields)
             missing_ratio = total_missing / total_expected_points
-            
+
             logger.info(f"数据质量评估:")
             logger.info(f"  总股票数: {len(instruments)}")
             logger.info(f"  缺失股票数: {len(missing_instruments)}")
             logger.info(f"  总缺失率: {missing_ratio:.2%}")
-            
+
             # 根据缺失比例决定处理策略
             if missing_ratio > 0.1:  # 缺失超过10%
                 raise RuntimeError(
@@ -393,7 +393,7 @@ class QlibDataLoader:
                     logger.warning(f"发现 {negative_volume} 个负成交量在列 {col}")
 
         logger.info("数据质量检查完成")
-    
+
     def _get_date_ranges(self, dates):
         """将日期列表转换为范围描述"""
         if len(dates) == 0:
@@ -406,7 +406,7 @@ class QlibDataLoader:
             ranges = []
             start_date = sorted_dates[0]
             end_date = sorted_dates[0]
-            
+
             for i in range(1, len(sorted_dates)):
                 if (sorted_dates[i] - end_date).days <= 2:  # 允许周末间隔
                     end_date = sorted_dates[i]
@@ -417,13 +417,13 @@ class QlibDataLoader:
                         ranges.append(f"{start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}")
                     start_date = sorted_dates[i]
                     end_date = sorted_dates[i]
-            
+
             # 添加最后一个范围
             if start_date == end_date:
                 ranges.append(start_date.strftime('%Y-%m-%d'))
             else:
                 ranges.append(f"{start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}")
-            
+
             return ranges
 
     def get_calendar(self, start_time: str, end_time: str, freq: str = "day") -> list:
@@ -475,7 +475,7 @@ def split_data(data: pd.DataFrame,
         if isinstance(data.index, pd.MultiIndex):
             # Qlib返回的索引是(instrument, datetime)，需要用第二级索引过滤时间
             datetime_level = data.index.get_level_values(1)  # 第二级是datetime
-            
+
             train_data = data.loc[(datetime_level >= train_start) & (datetime_level <= train_end)]
             valid_data = data.loc[(datetime_level >= valid_start) & (datetime_level <= valid_end)]
             test_data = data.loc[(datetime_level >= test_start) & (datetime_level <= test_end)]
@@ -486,47 +486,50 @@ def split_data(data: pd.DataFrame,
             test_data = data.loc[test_start:test_end]
 
         logger.info(f"数据分割完成 - 训练集: {train_data.shape}, 验证集: {valid_data.shape}, 测试集: {test_data.shape}")
-        
+
         # 检查数据是否为空
         if train_data.empty:
             logger.warning(f"训练集为空，时间范围: {train_start} - {train_end}")
+            raise ValueError("训练集为空")
         if valid_data.empty:
             logger.warning(f"验证集为空，时间范围: {valid_start} - {valid_end}")
+            raise ValueError("验证集为空")
         if test_data.empty:
             logger.warning(f"测试集为空，时间范围: {test_start} - {test_end}")
-        
+            raise ValueError("测试集为空")
+
         # 应用标准化处理（防止数据泄漏）
         if apply_scaling and not train_data.empty:
             logger.info("应用标准化处理以防止数据泄漏...")
-            
+
             # 为每个数据集单独fit scaler
             scalers = {}
             scaled_datasets = {}
-            
+
             for name, dataset in [('train', train_data), ('valid', valid_data), ('test', test_data)]:
                 if dataset.empty:
                     scaled_datasets[name] = dataset
                     continue
-                
+
                 # 为当前数据集创建scaler
                 scaler = StandardScaler()
-                
+
                 # 只对特定数值型列进行标准化，排除价格和成交量等不应标准化的列
                 numeric_columns = dataset.select_dtypes(include=[np.number]).columns
-                
+
                 # 排除价格相关列（不应该标准化为负数）
                 exclude_patterns = ['$close', '$open', '$high', '$low', '$volume', '$factor']
-                scalable_columns = [col for col in numeric_columns 
+                scalable_columns = [col for col in numeric_columns
                                   if not any(pattern in col for pattern in exclude_patterns)]
-                
+
                 if len(scalable_columns) == 0:
                     logger.info(f"{name}数据集没有需要标准化的列（价格/成交量列已排除），跳过标准化")
                     scaled_datasets[name] = dataset
                     continue
-                
+
                 # 复制数据避免修改原始数据
                 scaled_data = dataset.copy()
-                
+
                 # 只对可标准化的列进行fit并transform
                 if len(scalable_columns) > 0:
                     scaled_values = scaler.fit_transform(dataset[scalable_columns])
@@ -534,18 +537,18 @@ def split_data(data: pd.DataFrame,
                     logger.info(f"{name}数据集标准化列: {scalable_columns}")
                 else:
                     logger.info(f"{name}数据集无需标准化的列")
-                
+
                 scalers[name] = scaler
                 scaled_datasets[name] = scaled_data
-                
+
                 logger.info(f"{name}数据集标准化完成 - 标准化特征数: {len(scalable_columns)}, 保留原值特征数: {len(numeric_columns) - len(scalable_columns)}")
-            
+
             train_data = scaled_datasets['train']
-            valid_data = scaled_datasets['valid'] 
+            valid_data = scaled_datasets['valid']
             test_data = scaled_datasets['test']
-            
+
             logger.info("所有数据集标准化处理完成")
-            
+
         return train_data, valid_data, test_data
 
     except Exception as e:

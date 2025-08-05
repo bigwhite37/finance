@@ -505,31 +505,31 @@ class PortfolioEnv(gym.Env):
         # 计算动态波动率
         volatility = self._get_current_volatility()
 
-        # 重新校准的惩罚系数 - 与收益同尺度
-        lambda_dd = 0.5 + 1.0 * max(0, volatility - 0.02)  # 大幅降低回撤惩罚
-        lambda_cvar = 0.3 + 0.5 * max(0, volatility - 0.015)  # 降低CVaR惩罚
+        # 重新设计惩罚系数 - 大幅降低惩罚强度
+        lambda_dd = 0.1 + 0.2 * max(0, volatility - 0.03)  # 回撤惩罚降低5倍
+        lambda_cvar = 0.05 + 0.1 * max(0, volatility - 0.02)  # CVaR惩罚降低6倍
 
-        # 回撤惩罚（百分点尺度）
+        # 回撤惩罚（轻微化）
         drawdown_penalty = lambda_dd * (self.current_drawdown * 100)
 
-        # CVaR惩罚（百分点尺度）
+        # CVaR惩罚（轻微化）
         cvar_penalty = lambda_cvar * (self.cvar_value * 100)
 
-        # 交易成本惩罚（百分点尺度）
-        cost_penalty = (trade_cost / self.total_value * 100) if self.total_value > 0 else 0
+        # 交易成本惩罚（降低影响）
+        cost_penalty = (trade_cost / self.total_value * 50) if self.total_value > 0 else 0  # 降低一半
 
-        # 波动率惩罚（轻微，百分点尺度）
-        volatility_penalty = 2.0 * max(0, volatility - 0.05)  # 只有极高波动才惩罚
+        # 波动率惩罚（几乎取消）
+        volatility_penalty = 0.5 * max(0, volatility - 0.1)  # 只有极端高波动才惩罚
 
-        # 添加基础奖励避免持续负值
-        base_reward = 0.1  # 每步基础奖励，鼓励持续交易
+        # 大幅提高基础奖励
+        base_reward = 2.0  # 提高20倍，确保正向激励
 
         # 综合奖励
         reward = (base_reward + portfolio_return - drawdown_penalty
                  - cvar_penalty - cost_penalty - volatility_penalty)
 
-        # 奖励裁剪，避免极端值
-        reward = np.clip(reward, -10.0, 10.0)
+        # 放宽奖励裁剪范围，允许更大的正奖励
+        reward = np.clip(reward, -15.0, 15.0)
 
         return reward
 
