@@ -139,6 +139,19 @@ shared_buffer:
 trainer:
   diversity_threshold: 0.25  # 多样性阈值
   training_schedule:
-    expert_steps: 1000     # 专家训练步数
-    router_steps: 500      # 路由器训练步数
-    buffer_update_freq: 100 # 经验池更新频率
+    router:
+      freq: 10
+      lr_range: [1e-4, 1e-3]
+      steps: 500
+    experts:
+      freq: 5
+      lr_range: [3e-4, 3e-3]
+      steps: 1000
+    population:
+      freq: 20
+      mutation_rate: 0.1
+    buffer_update:
+      freq: 1
+    evaluation:
+      freq: 50
+      episodes: 10

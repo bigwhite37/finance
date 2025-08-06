@@ -249,16 +249,26 @@ class TradingEnvironment(gym.Env):
     def _load_market_data(self):
         """加载市场数据"""
         try:
-            # 加载基础行情数据
+            # 使用稳健的数据加载器
+            from utils.data_utils import load_robust_stock_data
+            
             fields = ["$open", "$high", "$low", "$close", "$volume", "$change", "$factor"]
 
-            self.market_data = self.data_loader.load_data(
+            self.market_data, valid_instruments = load_robust_stock_data(
                 instruments=self.instruments,
                 start_time=self.start_date,
                 end_time=self.end_date,
                 freq="day",
-                fields=fields
+                fields=fields,
+                max_missing_ratio=0.1
             )
+            
+            # 更新股票列表为有效股票
+            original_count = len(self.instruments)
+            self.instruments = valid_instruments
+            
+            if len(self.instruments) != original_count:
+                logger.info(f"股票池从 {original_count} 只调整为 {len(self.instruments)} 只")
 
             # 处理数据格式
             if isinstance(self.market_data.index, pd.MultiIndex):
@@ -376,7 +386,7 @@ class TradingEnvironment(gym.Env):
 
         logger.info(f"观测空间定义完成: {self.observation_space.shape}")
 
-    def reset(self, seed: Optional[int] = None) -> np.ndarray:
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> tuple:
         """重置环境"""
         super().reset(seed=seed)
 
@@ -405,9 +415,16 @@ class TradingEnvironment(gym.Env):
         # 重置风险管理器
         self.risk_manager = RiskManager()
 
-        return self._get_observation()
+        observation = self._get_observation()
+        info = {
+            'current_step': self.current_step,
+            'current_date_idx': self.current_date_idx,
+            'portfolio_value': self.portfolio_value
+        }
+        
+        return observation, info
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """执行一步交易"""
         # 确保动作在有效范围内
         action = np.clip(action, -1.0, 1.0)
@@ -432,13 +449,14 @@ class TradingEnvironment(gym.Env):
                     # 如果是第一天，跳过交易
                     self.current_step += 1
                     self.current_date_idx += 1
-                    return self._get_observation(), 0.0, self._is_done(), {}
+                    done = self._is_done()
+                    return self._get_observation(), 0.0, done, False, {}
 
         except Exception as e:
             logger.error(f"获取价格数据失败: {e}")
             self.current_step += 1
             self.current_date_idx += 1
-            return self._get_observation(), 0.0, True, {'error': str(e)}
+            return self._get_observation(), 0.0, True, False, {'error': str(e)}
 
         # 计算目标仓位
         portfolio_value_before = self._calculate_portfolio_value(current_prices)
@@ -476,7 +494,7 @@ class TradingEnvironment(gym.Env):
         # 构造信息字典
         info = self._get_info_dict(current_prices, returns, transaction_cost, reward)
 
-        return self._get_observation(), reward, done, info
+        return self._get_observation(), reward, done, False, info
 
     def _get_current_prices(self, date: pd.Timestamp) -> np.ndarray:
         """获取当前日期的价格数据"""
@@ -484,6 +502,7 @@ class TradingEnvironment(gym.Env):
 
         for i, instrument in enumerate(self.instruments):
             try:
+                # 数据索引格式为 (datetime, instrument)，在swaplevel()后
                 if (date, instrument) in self.market_data.index:
                     price = self.market_data.loc[(date, instrument), '$close']
                     if pd.isna(price) or price <= 0:
@@ -505,12 +524,24 @@ class TradingEnvironment(gym.Env):
         try:
             # 获取该股票的所有历史数据
             stock_data = self.market_data.xs(instrument, level=1)
-            # 获取当前日期之前的数据
+            # 获取当前日期之前的数据（包括当前日期）
             valid_data = stock_data[stock_data.index <= current_date]
+            
             if not valid_data.empty:
-                last_price = valid_data['$close'].iloc[-1]
-                if pd.notna(last_price) and last_price > 0:
-                    return last_price
+                # 从后往前查找最近的有效价格
+                for i in range(len(valid_data) - 1, -1, -1):
+                    price = valid_data['$close'].iloc[i]
+                    if pd.notna(price) and price > 0:
+                        return float(price)
+                
+                # 如果当前日期之前都没有有效价格，向后查找
+                future_data = stock_data[stock_data.index > current_date]
+                if not future_data.empty:
+                    for i in range(len(future_data)):
+                        price = future_data['$close'].iloc[i]
+                        if pd.notna(price) and price > 0:
+                            logger.debug(f"使用股票 {instrument} 在 {current_date} 后的价格: {price}")
+                            return float(price)
 
             # 如果还是没有有效价格，抛出错误
             raise RuntimeError(f"无法获取股票 {instrument} 在 {current_date} 的任何有效价格数据")
