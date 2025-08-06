@@ -1,0 +1,143 @@
+{
+  "data": {
+    "data_root": "/Users/shuzhenyi/.qlib/qlib_data",
+    "provider_uri": {
+      "1min": "/Users/shuzhenyi/.qlib/qlib_data/cn_data_1min",
+      "day": "/Users/shuzhenyi/.qlib/qlib_data/cn_data"
+    },
+    "market": "csi300",
+    "stock_limit": 50,
+    "custom_stocks": [
+      "sh600919",
+      "sh601288",
+      "sh600036"
+    ],
+    "start_time": "2020-01-01",
+    "end_time": "2023-12-31",
+    "train_start": "2020-01-01",
+    "train_end": "2022-12-31",
+    "valid_start": "2023-01-01",
+    "valid_end": "2023-06-30",
+    "test_start": "2023-07-01",
+    "test_end": "2023-12-31",
+    "freq": "day",
+    "fields": [
+      "$close",
+      "$open",
+      "$high",
+      "$low",
+      "$volume",
+      "$change",
+      "$factor"
+    ]
+  },
+  "environment": {
+    "initial_cash": 1000000,
+    "lookback_window": 30,
+    "transaction_cost": 0.001,
+    "max_drawdown_threshold": 0.2,
+    "reward_penalty": 6.0,
+    "features": [
+      "$close",
+      "$open",
+      "$high",
+      "$low",
+      "$volume",
+      "$change",
+      "$factor"
+    ],
+    "rebalance_freq": "daily",
+    "max_steps": 240
+  },
+  "model": {
+    "algorithm": "PPO",
+    "learning_rate": 0.0003,
+    "batch_size": 256,
+    "gamma": 0.99,
+    "n_steps": 2048,
+    "n_epochs": 10,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "use_custom_policy": false,
+    "net_arch": [
+      256,
+      256
+    ]
+  },
+  "training": {
+    "total_timesteps": 500000,
+    "n_envs": 4,
+    "seed": 42,
+    "log_interval": 10
+  },
+  "callbacks": {
+    "enable_eval": true,
+    "eval_freq": 10000,
+    "n_eval_episodes": 3,
+    "enable_checkpoint": true,
+    "save_freq": 50000,
+    "enable_drawdown_stopping": true,
+    "max_training_drawdown": 0.2,
+    "drawdown_base_patience": 100,
+    "drawdown_warmup_steps": 50000,
+    "enable_tensorboard": true,
+    "enable_training_metrics": true,
+    "metrics_log_interval": 1000,
+    "metrics_eval_interval": 5000
+  },
+  "evaluation": {
+    "n_episodes": 5
+  },
+  "log_level": "INFO",
+  "risk_control": {
+    "max_position_ratio": 0.15,
+    "stop_loss_ratio": 0.08,
+    "take_profit_ratio": 0.15,
+    "volatility_limit": 0.03
+  },
+  "feature_engineering": {
+    "enable_technical_indicators": true,
+    "indicators": [
+      "MA_5",
+      "MA_10",
+      "MA_20",
+      "RSI_14",
+      "MACD",
+      "BOLL"
+    ],
+    "enable_factor_processing": true,
+    "normalization": "zscore",
+    "handle_missing": "ffill"
+  },
+  "experts": {
+    "n_experts": 4,
+    "skill_dim": 10,
+    "buffer_size": 1000000,
+    "learning_rate": 0.0003,
+    "mi_reward_weight": 0.5
+  },
+  "meta_router": {
+    "kl_lambda": 0.1,
+    "n_steps": 1024,
+    "batch_size": 64,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "ent_coef": 0.01,
+    "learning_rate": 0.0003
+  },
+  "shared_buffer": {
+    "capacity": 2000000,
+    "sequence_length": 32,
+    "compress_data": true
+  },
+  "trainer": {
+    "diversity_threshold": 0.25,
+    "training_schedule": {
+      "expert_steps": 1000,
+      "router_steps": 500,
+      "buffer_update_freq": 100
+    }
+  }
+}

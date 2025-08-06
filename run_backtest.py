@@ -419,7 +419,7 @@ def main():
         logger.info("收到中断信号，正在退出...")
         return 0
 
-    except Exception as e:
+    except (RuntimeError, ValueError, ImportError, FileNotFoundError) as e:
         logger.error(f"回测执行失败: {e}", exc_info=True)
         return 1
 

@@ -1,0 +1,123 @@
+# 分层RL量化交易系统默认配置
+# 基于O3设计文档和Claude实现方案
+
+# 环境配置
+environment:
+  market: "csi300"              # 股票池: all, csi300, csi500
+  start_date: "2020-01-01"      # 训练开始日期
+  end_date: "2023-12-31"        # 训练结束日期
+  initial_capital: 1000000      # 初始资金 (100万)
+  lookback_window: 60           # 观测窗口 (60个交易日)
+  max_stocks: 50                # 最大股票数量
+  normalize_observations: true  # 是否归一化观测
+  random_start: true            # 是否随机选择训练起始点
+
+# 专家策略配置
+experts:
+  n_experts: 5                  # 专家数量
+  skill_dim: 10                 # 技能向量维度
+  buffer_size: 1000000          # 经验池大小 (1M)
+  learning_rate: 0.0003         # 学习率 (3e-4)
+  mi_reward_weight: 0.5         # 互信息奖励权重 (β参数)
+  gamma: 0.99                   # 折扣因子
+  tau: 0.005                    # 软更新系数
+
+# 元路由器配置  
+meta_router:
+  kl_lambda: 0.1                # KL散度权重 (λ参数)
+  n_steps: 1024                 # 每次更新步数
+  batch_size: 64                # 批次大小
+  gamma: 0.99                   # 折扣因子
+  gae_lambda: 0.95              # GAE lambda
+  ent_coef: 0.01                # 熵系数 (保持探索性)
+  learning_rate: 0.0003         # 学习率
+  clip_range: 0.2               # PPO裁剪范围
+
+# 共享经验池配置
+shared_buffer:
+  capacity: 2000000             # 容量 (2M)
+  sequence_length: 32           # 序列长度
+  compress_data: true           # 是否压缩数据
+  vtrace_c_bar: 1.0            # V-Trace参数
+  vtrace_rho_bar: 1.0          # V-Trace参数
+
+# 训练器配置
+trainer:
+  diversity_threshold: 0.25     # 多样性阈值 (MAPD)
+  
+  # 多频率训练调度
+  training_schedule:
+    # 路由器更新频率 (低频)
+    router:
+      freq: 10                  # 每10步更新一次
+      lr_range: [0.0001, 0.001] # 学习率范围
+      steps: 10000              # 每次更新步数
+    
+    # 专家更新频率 (中频)  
+    experts:
+      freq: 5                   # 每5步更新一次
+      lr_range: [0.0003, 0.003] # 学习率范围
+      steps: 5000               # 每次更新步数
+    
+    # 种群进化频率 (最低频)
+    population:
+      freq: 20                  # 每20步进化一次
+      mutation_rate: 0.1        # 变异率
+    
+    # 缓冲区更新频率 (高频)
+    buffer_update:
+      freq: 1                   # 每步都更新
+    
+    # 评估频率
+    evaluation:
+      freq: 50                  # 每50步评估一次
+      episodes: 10              # 评估回合数
+
+# 风险管理配置
+risk_management:
+  max_position_pct: 0.1         # 单股最大仓位 (10%)
+  max_drawdown_pct: 0.15        # 最大回撤限制 (15%)
+  var_confidence: 0.95          # VaR置信度
+  lookback_days: 30             # 风险计算回望天数
+
+# 市场微观结构配置
+market_microstructure:
+  commission_rate: 0.0003       # 佣金费率 (双边3bp)
+  min_commission: 5.0           # 最小佣金
+  slippage_model: "linear"      # 滑点模型: linear, sqrt
+  impact_coefficient: 0.01      # 市场冲击系数
+
+# 训练配置
+training:
+  total_steps: 100000           # 总训练步数
+  checkpoint_freq: 10000        # 检查点保存频率
+  eval_freq: 1000               # 评估频率
+  log_freq: 100                 # 日志输出频率
+
+# TimesNet编码器配置 (可选，用于高级特征提取)
+timesnet_encoder:
+  enabled: false                # 是否启用
+  input_dim: 100                # 输入维度
+  d_model: 64                   # 模型维度
+  n_heads: 4                    # 注意力头数
+  n_layers: 2                   # 层数
+  lora_r: 8                     # LoRA秩
+  dropout: 0.1                  # Dropout率
+
+# 设备配置
+device:
+  use_cuda: true                # 是否使用CUDA
+  device_id: 0                  # GPU设备ID
+
+# 日志配置
+logging:
+  level: "INFO"                 # 日志级别
+  save_logs: true               # 是否保存日志文件
+  log_dir: "./logs"             # 日志目录
+
+# 输出配置
+output:
+  save_models: true             # 是否保存模型
+  save_results: true            # 是否保存结果
+  save_plots: true              # 是否保存图表
+  output_dir: "./outputs"       # 输出目录

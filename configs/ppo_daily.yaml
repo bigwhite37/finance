@@ -113,3 +113,32 @@ feature_engineering:
   enable_factor_processing: true
   normalization: "zscore"  # 标准化方法
   handle_missing: "ffill"  # 缺失值处理
+
+# 分层RL配置
+experts:
+  n_experts: 4              # 专家数量
+  skill_dim: 10             # 技能向量维度
+  buffer_size: 1000000      # 每个专家的经验池大小
+  learning_rate: 0.0003     # 专家学习率
+  mi_reward_weight: 0.5     # DIAYN互信息奖励权重
+
+meta_router:
+  kl_lambda: 0.1           # KL散度多样性奖励权重
+  n_steps: 1024            # PPO步数
+  batch_size: 64           # 批大小
+  gamma: 0.99              # 折扣因子
+  gae_lambda: 0.95         # GAE lambda
+  ent_coef: 0.01           # 熵系数
+  learning_rate: 0.0003    # 元路由器学习率
+
+shared_buffer:
+  capacity: 2000000        # 共享经验池容量
+  sequence_length: 32      # 序列长度
+  compress_data: true      # 数据压缩
+
+trainer:
+  diversity_threshold: 0.25  # 多样性阈值
+  training_schedule:
+    expert_steps: 1000     # 专家训练步数
+    router_steps: 500      # 路由器训练步数
+    buffer_update_freq: 100 # 经验池更新频率

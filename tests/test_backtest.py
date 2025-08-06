@@ -138,7 +138,9 @@ def plot_results(results):
     try:
         plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
-    except:
+    except (ImportError, KeyError) as e:
+        # matplotlib配置失败是非关键错误，记录但继续执行
+        print(f"matplotlib配置失败: {e}")
         pass
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))

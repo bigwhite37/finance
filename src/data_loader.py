@@ -74,7 +74,7 @@ class QlibDataLoader:
             )
             self.is_initialized = True
             logger.info(f"Qlib初始化成功，数据源: {provider_uri}")
-        except Exception as e:
+        except (ImportError, FileNotFoundError, PermissionError, ValueError) as e:
             logger.error(f"Qlib初始化失败: {e}")
             raise RuntimeError(f"Qlib初始化失败: {e}")
 
@@ -128,7 +128,7 @@ class QlibDataLoader:
             logger.info(f"从{market}市场获取到{len(stock_list)}只股票")
             return stock_list
 
-        except Exception as e:
+        except (FileNotFoundError, PermissionError, UnicodeDecodeError, ValueError) as e:
             logger.error(f"获取股票列表失败: {e}")
             raise RuntimeError(f"获取股票列表失败: {e}")
 
@@ -173,7 +173,7 @@ class QlibDataLoader:
 
             return data
 
-        except Exception as e:
+        except (ValueError, KeyError, pd.errors.EmptyDataError, ImportError) as e:
             logger.error(f"加载数据失败: {e}")
             raise RuntimeError(f"加载数据失败: {e}")
 
@@ -258,7 +258,7 @@ class QlibDataLoader:
             logger.info("Dataset创建成功")
             return dataset
 
-        except Exception as e:
+        except (ValueError, KeyError, ImportError, TypeError) as e:
             logger.error(f"创建Dataset失败: {e}")
             raise RuntimeError(f"创建Dataset失败: {e}")
 
@@ -444,7 +444,7 @@ class QlibDataLoader:
         try:
             calendar = D.calendar(start_time=start_time, end_time=end_time, freq=freq)
             return calendar.tolist()
-        except Exception as e:
+        except (ValueError, KeyError, ImportError) as e:
             logger.error(f"获取交易日历失败: {e}")
             raise RuntimeError(f"获取交易日历失败: {e}")
 
@@ -551,7 +551,7 @@ def split_data(data: pd.DataFrame,
 
         return train_data, valid_data, test_data
 
-    except Exception as e:
+    except (ValueError, KeyError, pd.errors.EmptyDataError, IndexError) as e:
         logger.error(f"数据分割失败: {e}")
         raise RuntimeError(f"数据分割失败: {e}")
 
@@ -581,5 +581,5 @@ if __name__ == "__main__":
         calendar = loader.get_calendar("2023-01-01", "2023-12-31")
         print(f"2023年交易日数量: {len(calendar)}")
 
-    except Exception as e:
+    except (RuntimeError, ValueError, ImportError) as e:
         print(f"示例运行失败: {e}")

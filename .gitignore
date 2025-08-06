@@ -208,5 +208,4 @@ __marimo__/
 
 logs/
 tensorboard/
-models/
 results/
