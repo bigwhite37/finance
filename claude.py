@@ -17,6 +17,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial
 import multiprocessing as mp
+import random
 warnings.filterwarnings('ignore')
 
 
@@ -267,13 +268,19 @@ class RiskSensitiveTrendStrategy:
             print(f"成功获取{len(self.stock_pool)}只股票")
         else:  # auto模式
             print("使用自动模式，基于qlib数据构建全市场股票池...")
-            self.stock_pool = self._get_universe_stocks_with_filters()
+            max_stocks = getattr(self, 'max_stocks', None)
+            self.stock_pool = self._get_universe_stocks_with_filters(max_stocks)
 
         return self.stock_pool
 
-    def _get_universe_stocks_with_filters(self):
+    def _get_universe_stocks_with_filters(self, max_stocks=None):
         """
         获取全市场股票池并应用质量过滤（减少生存者偏差）
+
+        Parameters:
+        -----------
+        max_stocks : int, optional
+            最大股票数量限制，None表示不限制
         """
         try:
             print("构建全市场股票池，应用流动性和基本面过滤...")
@@ -302,7 +309,7 @@ class RiskSensitiveTrendStrategy:
                     for batch in batches
                 }
 
-                # 处理完成的批次
+                # 处理完成的批次，支持提前中断
                 batch_count = 0
                 for future in as_completed(future_to_batch):
                     batch_count += 1
@@ -311,19 +318,45 @@ class RiskSensitiveTrendStrategy:
                     try:
                         batch_filtered = future.result()
                         if batch_filtered:
-                            filtered_stocks.extend(batch_filtered)
+                            # 检查是否需要提前中断
+                            if max_stocks is not None and len(filtered_stocks) + len(batch_filtered) > max_stocks:
+                                # 只添加需要的数量
+                                remaining = max_stocks - len(filtered_stocks)
+                                if remaining > 0:
+                                    filtered_stocks.extend(batch_filtered[:remaining])
+                                print(f"批次进度: {batch_count}/{len(batches)}, 已筛选: {len(filtered_stocks)} (已达到max_stocks={max_stocks}，提前停止)")
+                                # 取消剩余任务
+                                for f in future_to_batch:
+                                    if not f.done():
+                                        f.cancel()
+                                break
+                            else:
+                                filtered_stocks.extend(batch_filtered)
 
                         print(f"批次进度: {batch_count}/{len(batches)}, 已筛选: {len(filtered_stocks)}")
                     except Exception as e:
                         print(f"处理批次时出错: {e}")
 
             print(f"从{len(candidate_pool)}个候选股票中筛选出{len(filtered_stocks)}只合格股票")
+
+            # 随机化筛选结果，避免偏差
+            if filtered_stocks:
+                random.shuffle(filtered_stocks)
+                print("已随机打乱股票顺序，避免筛选偏差")
+
+            # 注意：数量限制现在在并发处理中已经控制，这里无需额外处理
+
             return filtered_stocks
 
         except Exception as e:
             print(f"构建股票池失败: {e}")
             # 降级到原有方法
-            return self.get_all_available_stocks()
+            all_stocks = self.get_all_available_stocks()
+            if max_stocks is not None and len(all_stocks) > max_stocks:
+                random.shuffle(all_stocks)
+                all_stocks = all_stocks[:max_stocks]
+                print(f"降级方法：随机选择{max_stocks}只股票")
+            return all_stocks
 
     def _process_stock_batch(self, batch, start_date_qlib, end_date_qlib):
         """
@@ -1958,6 +1991,8 @@ def parse_args():
                        help='指数代码，当pool-mode=index时使用 (默认: 000300沪深300)')
     parser.add_argument('--stocks', nargs='*',
                        help='自定义股票代码列表(6位格式)，当pool-mode=custom时使用，如: 000001 600000 300750')
+    parser.add_argument('--max-stocks', type=int, default=200,
+                       help='auto模式下的最大股票数量，设置为0表示不限制 (默认: 200)')
 
     # 性能选项
     parser.add_argument('--no-concurrent', action='store_true',
@@ -1990,7 +2025,14 @@ def main():
         index_code=args.index_code
     )
 
-    # auto模式将处理所有符合条件的股票（不做数量限制）
+    # 设置股票数量限制（如果是auto模式且指定了max_stocks）
+    if args.pool_mode == 'auto':
+        if args.max_stocks > 0:
+            strategy.max_stocks = args.max_stocks
+            print(f"设置股票池最大数量限制: {args.max_stocks}")
+        else:
+            strategy.max_stocks = None
+            print("不限制股票池数量")
 
     # 运行策略
     use_concurrent = not args.no_concurrent
