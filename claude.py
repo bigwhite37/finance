@@ -14,6 +14,9 @@ import qlib
 from qlib.data import D
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 warnings.filterwarnings('ignore')
 
 
@@ -91,6 +94,8 @@ class RiskSensitiveTrendStrategy:
                 return 'SH' + c
             elif c[0] in ('0', '3'):
                 return 'SZ' + c
+            elif c[0] in ('4', '8'):
+                return 'BJ' + c
         return c
 
     def _convert_date_format(self, date_str: str) -> str:
@@ -117,8 +122,7 @@ class RiskSensitiveTrendStrategy:
             end_time=end_date_qlib,
             as_list=True,
         )
-        # 去掉 'SH'/'SZ' 前缀 → 6位代码
-        return [c[2:] if c.startswith(("SH", "SZ")) else c for c in codes]
+        return [c[2:] if c.startswith(("SH", "SZ", "BJ")) else c for c in codes]
 
     def _fetch_sh_index_df(self):
         """
@@ -219,7 +223,7 @@ class RiskSensitiveTrendStrategy:
         # 兜底：返回原始代码
         return stock_code
 
-    def get_all_available_stocks(self, max_stocks=200):
+    def get_all_available_stocks(self):
         """
         从qlib数据中获取所有在指定日期范围内有数据的股票
         """
@@ -227,7 +231,7 @@ class RiskSensitiveTrendStrategy:
         print("正在从 Qlib instruments 中读取全市场股票列表（按时间窗口过滤）...")
         codes = self._list_all_qlib_instruments_in_range()
         print(f"全市场在 {self._convert_date_format(self.start_date)} ~ {self._convert_date_format(self.end_date)} 范围内可交易的股票数: {len(codes)}")
-        return codes[:max_stocks]
+        return codes
 
     def get_stock_pool(self, index_code=None):
         """
@@ -263,19 +267,13 @@ class RiskSensitiveTrendStrategy:
             print(f"成功获取{len(self.stock_pool)}只股票")
         else:  # auto模式
             print("使用自动模式，基于qlib数据构建全市场股票池...")
-            max_stocks = getattr(self, 'max_stocks', 200)
-            self.stock_pool = self._get_universe_stocks_with_filters(max_stocks)
+            self.stock_pool = self._get_universe_stocks_with_filters()
 
         return self.stock_pool
 
-    def _get_universe_stocks_with_filters(self, max_stocks=200):
+    def _get_universe_stocks_with_filters(self):
         """
         获取全市场股票池并应用质量过滤（减少生存者偏差）
-
-        Parameters:
-        -----------
-        max_stocks : int
-            最大股票数量
         """
         try:
             print("构建全市场股票池，应用流动性和基本面过滤...")
@@ -289,51 +287,82 @@ class RiskSensitiveTrendStrategy:
             start_date_qlib = self._convert_date_format(self.start_date)
             end_date_qlib = self._convert_date_format(self.end_date)
 
-            # 分批处理以提高效率
+            # 使用并发处理批量筛选
             batch_size = 20
-            for i in range(0, len(candidate_pool), batch_size):
-                if len(filtered_stocks) >= max_stocks:
-                    break
+            batches = [candidate_pool[i:i+batch_size] for i in range(0, len(candidate_pool), batch_size)]
 
-                batch = candidate_pool[i:i+batch_size]
-                batch_codes = [self._normalize_instrument(code) for code in batch]
+            # 确定并发数
+            max_workers = max(1, int(mp.cpu_count() * 0.5))  # 使用50%CPU核心，避免过载
+            print(f"股票池筛选使用{max_workers}个并发进程处理{len(batches)}个批次")
 
-                try:
-                    # 批量获取数据
-                    batch_data = D.features(
-                        instruments=batch_codes,
-                        fields=['$close', '$volume'],
-                        start_time=start_date_qlib,
-                        end_time=end_date_qlib,
-                        freq='day',
-                        disk_cache=0
-                    )
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有批次任务
+                future_to_batch = {
+                    executor.submit(self._process_stock_batch, batch, start_date_qlib, end_date_qlib): batch
+                    for batch in batches
+                }
 
-                    if batch_data is not None and not batch_data.empty:
-                        # 检查每只股票的数据质量
-                        for j, code in enumerate(batch):
-                            qlib_code = batch_codes[j]
-                            if qlib_code in batch_data.index.get_level_values(0):
-                                stock_data = batch_data.xs(qlib_code, level=0)
+                # 处理完成的批次
+                batch_count = 0
+                for future in as_completed(future_to_batch):
+                    batch_count += 1
+                    batch = future_to_batch[future]
 
-                                # 应用基本过滤条件
-                                if self._apply_stock_filters(stock_data, code):
-                                    filtered_stocks.append(code)
+                    try:
+                        batch_filtered = future.result()
+                        if batch_filtered:
+                            filtered_stocks.extend(batch_filtered)
 
-                except Exception as e:
-                    print(f"处理股票 {code} 时出错: {e}")
-                    continue
-
-                if i % 100 == 0:
-                    print(f"处理进度: {i}/{len(candidate_pool)}, 已筛选: {len(filtered_stocks)}")
+                        print(f"批次进度: {batch_count}/{len(batches)}, 已筛选: {len(filtered_stocks)}")
+                    except Exception as e:
+                        print(f"处理批次时出错: {e}")
 
             print(f"从{len(candidate_pool)}个候选股票中筛选出{len(filtered_stocks)}只合格股票")
-            return filtered_stocks[:max_stocks]
+            return filtered_stocks
 
         except Exception as e:
             print(f"构建股票池失败: {e}")
             # 降级到原有方法
-            return self.get_all_available_stocks(max_stocks)
+            return self.get_all_available_stocks()
+
+    def _process_stock_batch(self, batch, start_date_qlib, end_date_qlib):
+        """
+        并发处理单个股票批次的筛选（用于股票池构建）
+
+        Parameters:
+        -----------
+        batch : list
+            股票代码批次
+        start_date_qlib : str
+            开始日期（qlib格式）
+        end_date_qlib : str
+            结束日期（qlib格式）
+        """
+        batch_filtered = []
+        batch_codes = [self._normalize_instrument(code) for code in batch]
+
+        # 批量获取数据
+        batch_data = D.features(
+            instruments=batch_codes,
+            fields=['$close', '$volume'],
+            start_time=start_date_qlib,
+            end_time=end_date_qlib,
+            freq='day',
+            disk_cache=0
+        )
+
+        if batch_data is not None and not batch_data.empty:
+            # 检查每只股票的数据质量
+            for j, code in enumerate(batch):
+                qlib_code = batch_codes[j]
+                if qlib_code in batch_data.index.get_level_values(0):
+                    stock_data = batch_data.xs(qlib_code, level=0)
+
+                    # 应用基本过滤条件
+                    if self._apply_stock_filters(stock_data, code):
+                        batch_filtered.append(code)
+
+        return batch_filtered
 
     def _apply_stock_filters(self, stock_data, stock_code):
         """
@@ -502,8 +531,8 @@ class RiskSensitiveTrendStrategy:
             start_date_qlib = self._convert_date_format(self.start_date)
             end_date_qlib = self._convert_date_format(self.end_date)
 
-            # 使用qlib获取历史数据
-            fields = ['$open', '$high', '$low', '$close', '$volume']
+            # 为了只打印原始（未复权）价格，需要同时取出 $factor 用于还原
+            fields = ['$open', '$high', '$low', '$close', '$volume', '$factor']
 
             df = D.features(
                 instruments=[qlib_code],
@@ -524,8 +553,19 @@ class RiskSensitiveTrendStrategy:
                 # 确保数据类型正确
                 df = df.astype(float)
 
+                # === 仅输出原始（未复权）价格：raw = adjusted / factor ===
+                if all(col in df.columns for col in ['open', 'high', 'low', 'close', 'factor']):
+                    df['open']  = df['open']  / df['factor']
+                    df['high']  = df['high']  / df['factor']
+                    df['low']   = df['low']   / df['factor']
+                    df['close'] = df['close'] / df['factor']
+                    # 保持只输出原始价格，避免混淆，去掉 factor 与 volume 等非必要列
+                    # 若后续指标需要，可在相应函数中另行取数
+                    df = df[['open', 'high', 'low', 'close']]
+                else:
+                    print(f"警告：{stock_code} 缺少 factor 列，无法还原未复权价格，将按当前列原样返回")
+
                 stock_name = self.get_stock_name(stock_code)
-                print(f"成功获取{stock_code} ({stock_name})数据，共{len(df)}条记录")
                 return df
             else:
                 stock_name = self.get_stock_name(stock_code)
@@ -536,6 +576,91 @@ class RiskSensitiveTrendStrategy:
             stock_name = self.get_stock_name(stock_code)
             print(f"获取{stock_code} ({stock_name})数据失败: {e}")
             return None
+
+    def _process_single_stock(self, stock_code):
+        """
+        处理单只股票的数据获取和指标计算（用于并发处理）
+        """
+        try:
+            stock_name = self.get_stock_name(stock_code)
+            df = self.fetch_stock_data(stock_code)
+
+            if df is not None and len(df) > 5:
+                # 计算技术指标
+                df = self.calculate_ma_signals(df)
+                df = self.calculate_rsi(df)
+                df = self.calculate_atr(df)
+                df = self.calculate_volatility(df)
+                df = self.calculate_max_drawdown(df)
+                df = self.calculate_bollinger_bands(df)
+
+                # 计算风险指标
+                risk_score = self.calculate_risk_metrics(df, stock_code)
+
+                # 返回结果
+                if risk_score is not None and risk_score < 85:
+                    return stock_code, df, risk_score, True
+                else:
+                    return stock_code, None, risk_score, False
+            else:
+                return stock_code, None, None, False
+
+        except Exception as e:
+            stock_name = self.get_stock_name(stock_code)
+            print(f"处理{stock_code} ({stock_name})时出错: {e}")
+            return stock_code, None, None, False
+
+    def fetch_stocks_data_concurrent(self, max_workers=None):
+        """
+        并发获取所有股票数据并计算指标
+        Parameters:
+        -----------
+        max_workers : int, optional
+            最大并发数，默认为CPU核心数的75%
+        """
+        if max_workers is None:
+            max_workers = max(1, int(mp.cpu_count() * 0.75))
+
+        cpu_count = mp.cpu_count()
+        print(f"正在并发获取股票历史数据并计算风险指标...")
+        print(f"系统信息: CPU核心数={cpu_count}, 使用并发线程数={max_workers}")
+
+        successful_count = 0
+        total_count = len(self.stock_pool)
+        completed_count = 0
+
+        # 使用ThreadPoolExecutor处理I/O密集型任务（Qlib数据获取主要是I/O操作）
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_stock = {
+                executor.submit(self._process_single_stock, stock): stock
+                for stock in self.stock_pool
+            }
+
+            # 处理完成的任务
+            for future in as_completed(future_to_stock):
+                completed_count += 1
+                original_stock = future_to_stock[future]
+
+                try:
+                    stock_code, df, risk_score, is_valid = future.result()
+                    stock_name = self.get_stock_name(stock_code)
+
+                    # 显示进度，包含风险评分信息
+                    risk_info = f"风险评分={risk_score:.1f}" if risk_score is not None else "数据不足"
+                    status = "✓通过" if is_valid else "✗过滤"
+                    print(f"进度: {completed_count}/{total_count} - {stock_code} ({stock_name}) - {risk_info} - {status}")
+
+                    if is_valid and df is not None:
+                        self.price_data[stock_code] = df
+                        successful_count += 1
+
+                except Exception as e:
+                    stock_name = self.get_stock_name(original_stock)
+                    print(f"进度: {completed_count}/{total_count} - {original_stock} ({stock_name}) - 处理失败: {e}")
+
+        efficiency = (successful_count / total_count * 100) if total_count > 0 else 0
+        print(f"并发处理完成：成功获取{successful_count}/{total_count}只股票数据 (筛选通过率={efficiency:.1f}%)")
 
     def calculate_atr(self, df, period=14):
         """
@@ -1171,8 +1296,17 @@ class RiskSensitiveTrendStrategy:
             print(f"获取市场数据失败: {e}，返回中性市场状态")
             return 'NEUTRAL'
 
-    def run_strategy(self):
-        """运行完整策略（风险优化版）"""
+    def run_strategy(self, use_concurrent=True, max_workers=None):
+        """
+        运行完整策略（风险优化版）
+
+        Parameters:
+        -----------
+        use_concurrent : bool, default True
+            是否使用并发处理加速数据获取
+        max_workers : int, optional
+            最大并发数，默认为CPU核心数的75%
+        """
         print("开始运行风险敏感型策略...")
 
         # 1. 检查市场状态
@@ -1184,28 +1318,32 @@ class RiskSensitiveTrendStrategy:
             self.get_stock_pool()
 
         # 3. 获取所有股票数据并计算指标
-        print("正在获取股票历史数据并计算风险指标...")
-        for i, stock in enumerate(self.stock_pool):
-            stock_name = self.get_stock_name(stock)
-            print(f"进度: {i+1}/{len(self.stock_pool)} - {stock} ({stock_name})")
-            df = self.fetch_stock_data(stock)
-            if df is not None and len(df) > 5:  # 进一步降低数据量要求
-                # 计算技术指标
-                df = self.calculate_ma_signals(df)
-                df = self.calculate_rsi(df)
-                df = self.calculate_atr(df)
-                df = self.calculate_volatility(df)
-                df = self.calculate_max_drawdown(df)
-                df = self.calculate_bollinger_bands(df)
+        if use_concurrent:
+            self.fetch_stocks_data_concurrent(max_workers)
+        else:
+            # 原始顺序处理方式
+            print("正在获取股票历史数据并计算风险指标...")
+            for i, stock in enumerate(self.stock_pool):
+                stock_name = self.get_stock_name(stock)
+                print(f"进度: {i+1}/{len(self.stock_pool)} - {stock} ({stock_name})")
+                df = self.fetch_stock_data(stock)
+                if df is not None and len(df) > 5:
+                    # 计算技术指标
+                    df = self.calculate_ma_signals(df)
+                    df = self.calculate_rsi(df)
+                    df = self.calculate_atr(df)
+                    df = self.calculate_volatility(df)
+                    df = self.calculate_max_drawdown(df)
+                    df = self.calculate_bollinger_bands(df)
 
-                # 计算风险指标（使用调整后的阈值）
-                risk_score = self.calculate_risk_metrics(df, stock)
+                    # 计算风险指标（使用调整后的阈值）
+                    risk_score = self.calculate_risk_metrics(df, stock)
 
-                # 调整风险过滤阈值（更宽松）
-                if risk_score is not None and risk_score < 85:  # 放宽风险评分阈值
-                    self.price_data[stock] = df
+                    # 调整风险过滤阈值（更宽松）
+                    if risk_score is not None and risk_score < 85:
+                        self.price_data[stock] = df
 
-        print(f"成功获取{len(self.price_data)}只股票数据（已过滤高风险）")
+            print(f"成功获取{len(self.price_data)}只股票数据（已过滤高风险）")
 
         # 4. 计算风险调整后的相对强度
         self.calculate_relative_strength()
@@ -1820,8 +1958,12 @@ def parse_args():
                        help='指数代码，当pool-mode=index时使用 (默认: 000300沪深300)')
     parser.add_argument('--stocks', nargs='*',
                        help='自定义股票代码列表(6位格式)，当pool-mode=custom时使用，如: 000001 600000 300750')
-    parser.add_argument('--max-stocks', type=int, default=200,
-                       help='auto模式下的最大股票数量 (默认: 200)')
+
+    # 性能选项
+    parser.add_argument('--no-concurrent', action='store_true',
+                       help='禁用并发处理，使用顺序处理(默认使用并发)')
+    parser.add_argument('--max-workers', type=int, default=None,
+                       help='最大并发线程数(默认为CPU核心数的75%%)')
 
     # 输出选项
     parser.add_argument('--no-dashboard', action='store_true',
@@ -1848,12 +1990,14 @@ def main():
         index_code=args.index_code
     )
 
-    # 如果是auto模式，设置最大股票数
-    if args.pool_mode == 'auto':
-        strategy.max_stocks = args.max_stocks
+    # auto模式将处理所有符合条件的股票（不做数量限制）
 
     # 运行策略
-    selected_stocks, position_sizes = strategy.run_strategy()
+    use_concurrent = not args.no_concurrent
+    selected_stocks, position_sizes = strategy.run_strategy(
+        use_concurrent=use_concurrent,
+        max_workers=args.max_workers
+    )
 
     if selected_stocks:
         # 显示选中股票（含股票名称）

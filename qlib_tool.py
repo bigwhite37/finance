@@ -127,11 +127,20 @@ def print_stock_details_for_day(stock_code: str, date: str, qlib_dir: str = "~/.
         print("请检查股票代码和日期是否正确。")
         return
 
-    # 规范列名：去掉 `$` 前缀，并把 amount 重命名为 turnover，便于阅读
+    # 规范列名：去掉 `$` 前缀，并把 amount 重命名为 turnover，随后计算未复权价格（raw = adjusted / factor）
     data = data.copy()
     data.columns = [c.replace('$', '') for c in data.columns]
     if 'amount' in data.columns:
         data = data.rename(columns={'amount': 'turnover'})
+    if all(col in data.columns for col in ['open', 'high', 'low', 'close', 'factor']):
+        data['open']  = data['open']  / data['factor']
+        data['high']  = data['high']  / data['factor']
+        data['low']   = data['low']   / data['factor']
+        data['close'] = data['close'] / data['factor']
+        # 只保留原始（未复权）价格列用于展示
+        data = data[['open', 'high', 'low', 'close']]
+    else:
+        print("警告：缺少计算未复权价格所需的列（open/high/low/close/factor），将按现有列原样打印。")
 
     # --- 步骤 4: 检查数据并打印 ---
     if data.empty:
@@ -151,10 +160,7 @@ def print_stock_details_for_day(stock_code: str, date: str, qlib_dir: str = "~/.
         print(display_details.to_string())
 
         print("\n\033[1m--- 字段含义说明 ---\033[0m")
-        print("open, high, low, close:  经过\033[32m前复权\033[0m处理的价格（Qlib 表达式 $open/$close 等）。")
-        print("volume:                 调整后的成交量（$volume）。")
-        print("turnover:               成交额（$amount）。")
-        print("factor:                 复权因子（$factor）。")
+        print("open, high, low, close:  \033[35m未复权\033[0m价格（依据 Qlib 规范：raw = adjusted / factor）。")
 
 
 # 支持“多个股票 + 时间段”的详细行情获取并打印
@@ -207,6 +213,10 @@ def print_stocks_details_for_range(
             candidate_fields.append('$amount')
         if '$volume' not in candidate_fields:
             candidate_fields.append('$volume')
+    # Always ensure fields required for raw (unadjusted) prices are present
+    for f in ['$open', '$high', '$low', '$close', '$factor']:
+        if f not in candidate_fields:
+            candidate_fields.append(f)
 
     # If user didn't pass any (e.g., shell expanded all $vars), fall back to DEFAULT_FIELDS
     if not candidate_fields:
@@ -242,11 +252,24 @@ def print_stocks_details_for_range(
         print("未获取到任何数据；请确认时间区间内有交易日，且代码在本地数据集中可用。")
         return
 
-    # 规范列名，并计算派生列
+    # 规范列名，并计算未复权价格（raw = adjusted / factor）
     df = df.copy()
     df.columns = [c.replace('$', '') for c in df.columns]
     if 'amount' in df.columns:
         df = df.rename(columns={'amount': 'turnover'})
+
+    # Compute raw OHLC if possible
+    if all(col in df.columns for col in ['open', 'high', 'low', 'close', 'factor']):
+        df['open']  = df['open']  / df['factor']
+        df['high']  = df['high']  / df['factor']
+        df['low']   = df['low']   / df['factor']
+        df['close'] = df['close'] / df['factor']
+        # 只保留原始（未复权）价格列用于展示
+        df = df[['open', 'high', 'low', 'close']]
+    else:
+        print("警告：缺少计算未复权价格所需的列（open/high/low/close/factor），将按现有列原样打印。")
+
+    # （如果用户显式要求 vwap，这里不再展示；但保留计算逻辑可按需恢复）
     if want_vwap and ('turnover' in df.columns and 'volume' in df.columns):
         df = _compute_vwap_if_possible(df)
 
@@ -294,10 +317,7 @@ def print_stocks_details_for_range(
         print(disp.to_string())
 
     print("\n\033[1m--- 字段含义说明 ---\033[0m")
-    print("open, high, low, close:  经过\033[32m前复权\033[0m处理的价格（Qlib 表达式 $open/$close 等）。")
-    print("volume:                 调整后的成交量（$volume）。")
-    print("turnover:               成交额（$amount）。")
-    print("factor:                 复权因子（$factor）。")
+    print("open, high, low, close:  \033[35m未复权\033[0m价格（依据 Qlib 规范：raw = adjusted / factor，即 open = $open / $factor 等）。")
 
 
 def main():
