@@ -99,96 +99,135 @@ class RiskSensitiveTrendStrategy:
             return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
         return date_str
 
-    def get_stock_name(self, stock_code: str) -> str:
-        """使用akshare获取股票名称"""
+    def _to_yyyymmdd(self, date_str: str) -> str:
+        s = str(date_str).strip()
+        if len(s) == 8 and s.isdigit():
+            return s
+        return s.replace("-", "")
+
+    def _list_all_qlib_instruments_in_range(self) -> list[str]:
+        """按时间窗获取全市场可交易股票（用 Qlib 官方接口过滤，不再手工枚举）"""
+        assert self._qlib_initialized
+        start_date_qlib = self._convert_date_format(self.start_date)
+        end_date_qlib = self._convert_date_format(self.end_date)
+        instruments_cfg = D.instruments(market="all")
+        codes = D.list_instruments(
+            instruments=instruments_cfg,
+            start_time=start_date_qlib,
+            end_time=end_date_qlib,
+            as_list=True,
+        )
+        # 去掉 'SH'/'SZ' 前缀 → 6位代码
+        return [c[2:] if c.startswith(("SH", "SZ")) else c for c in codes]
+
+    def _fetch_sh_index_df(self):
+        """
+        获取上证指数（sh000001）日线数据：Qlib 优先，缺失则回退 AkShare。
+        返回包含至少 ['close'] 列的 DataFrame（索引为日期）。
+        """
+        # --- Qlib 尝试 ---
+        start_q = self._convert_date_format(self.start_date)
+        end_q = self._convert_date_format(self.end_date)
+        qlib_code = "SH000001"
         try:
-            stock_info = ak.stock_individual_info_em(symbol=stock_code)
-            return stock_info.loc[stock_info['item'] == '股票简称', 'value'].iloc[0]
-        except:
-            return stock_code
+            df = D.features(
+                instruments=[qlib_code],
+                fields=["$open", "$high", "$low", "$close", "$volume"],
+                start_time=start_q,
+                end_time=end_q,
+                freq="day",
+                disk_cache=0,
+            )
+        except Exception:
+            df = None
+
+        if df is not None and not df.empty:
+            df = df.xs(qlib_code, level=0)
+            df.columns = [c.replace("$", "") for c in df.columns]
+            df = df.astype(float)
+            df.index.name = "date"
+            return df
+
+        # --- AkShare 回退 ---
+        start_em = self._to_yyyymmdd(self.start_date)
+        end_em = self._to_yyyymmdd(self.end_date)
+        idx = ak.stock_zh_index_daily_em(symbol="sh000001", start_date=start_em, end_date=end_em)
+        if idx is None or idx.empty:
+            return None
+        if "date" in idx.columns:
+            idx = idx.set_index("date")
+        keep = [c for c in ["open", "high", "low", "close", "volume"] if c in idx.columns]
+        return idx[keep]
+
+    def get_stock_name(self, stock_code: str) -> str:
+        """使用akshare获取股票名称（兼容 SH/SZ/BJ 前缀与北证）"""
+        code = str(stock_code).strip().upper()
+        # 提取用于 AkShare 的纯 6 位代码
+        numeric = code[2:] if len(code) > 6 and code[:2] in ("SH", "SZ", "BJ") else code
+
+        # 1) 首选：东财个股信息接口（包含“股票简称/证券简称”）
+        try:
+            info = ak.stock_individual_info_em(symbol=numeric)
+            if info is not None and not info.empty and {"item", "value"}.issubset(set(info.columns)):
+                row = info.loc[info["item"].isin(["股票简称", "证券简称"])]
+                if not row.empty:
+                    name_val = str(row["value"].iloc[0]).strip()
+                    if name_val:
+                        return name_val
+        except Exception:
+            pass
+
+        # 2) 回退：若是北交所代码，使用北证代码-简称映射
+        try:
+            if code.startswith("BJ"):
+                bj_df = ak.stock_info_bj_name_code()
+                if bj_df is not None and not bj_df.empty:
+                    # 兼容不同版本的列名
+                    cols = {c: c for c in bj_df.columns}
+                    code_col = "证券代码" if "证券代码" in cols else ("代码" if "代码" in cols else list(cols)[0])
+                    name_col = "证券简称" if "证券简称" in cols else ("名称" if "名称" in cols else list(cols)[1])
+                    hit = bj_df[bj_df[code_col].astype(str).str.endswith(numeric)]
+                    if not hit.empty:
+                        return str(hit.iloc[0][name_col]).strip()
+        except Exception:
+            pass
+
+        # 3) 最后回退：全 A 股代码-简称映射（包含北证）
+        try:
+            all_df = ak.stock_info_a_code_name()
+            if all_df is not None and not all_df.empty:
+                cols = {c: c for c in all_df.columns}
+                # 常见列名兼容
+                code_candidates = [c for c in ["证券代码", "代码", "code", "股票代码"] if c in cols] or [list(cols)[0]]
+                name_candidates = [c for c in ["证券简称", "名称", "name"] if c in cols] or [list(cols)[1]]
+                code_col = code_candidates[0]
+                name_col = name_candidates[0]
+
+                # 去掉可能的交易所前缀后匹配
+                series_code = all_df[code_col].astype(str).str.upper()
+                series_code = (
+                    series_code.str.replace("^SH", "", regex=True)
+                               .str.replace("^SZ", "", regex=True)
+                               .str.replace("^BJ", "", regex=True)
+                )
+                hit = all_df[series_code == numeric]
+                if not hit.empty:
+                    return str(hit.iloc[0][name_col]).strip()
+        except Exception:
+            pass
+
+        # 兜底：返回原始代码
+        return stock_code
 
     def get_all_available_stocks(self, max_stocks=200):
         """
         从qlib数据中获取所有在指定日期范围内有数据的股票
-
-        Parameters:
-        -----------
-        max_stocks : int
-            最大股票数量
         """
-        assert self._qlib_initialized # 确保qlib已初始化
-
-        try:
-            print("正在从qlib数据中检测可用股票...")
-
-            # 生成常见的股票代码进行测试
-            potential_stocks = []
-
-            # 先测试一些已知存在的股票代码
-            common_stocks = [
-                'SH600000', 'SH600036', 'SH600519', 'SH601318', 'SH601398',
-                'SZ000001', 'SZ000002', 'SZ000858', 'SZ002415', 'SZ300059'
-            ]
-            potential_stocks.extend(common_stocks)
-
-            # 然后生成更多候选代码
-            # 上交所主要股票范围
-            for i in range(600000, 602000, 50):
-                potential_stocks.append(f"SH{i:06d}")
-
-            # 深交所主板
-            for i in range(1, 500, 10):
-                potential_stocks.append(f"SZ{i:06d}")
-
-            # 深交所中小板
-            for i in range(2000, 2500, 25):
-                potential_stocks.append(f"SZ{i:06d}")
-
-            # 创业板
-            for i in range(300000, 300500, 50):
-                potential_stocks.append(f"SZ{i:06d}")
-
-            # 去重
-            potential_stocks = list(set(potential_stocks))
-
-            print(f"测试{len(potential_stocks)}个候选股票...")
-            available_stocks = []
-
-            # 转换日期格式
-            start_date_qlib = self._convert_date_format(self.start_date)
-            end_date_qlib = self._convert_date_format(self.end_date)
-
-            for i, stock_code in enumerate(potential_stocks):
-                if len(available_stocks) >= max_stocks:
-                    break
-
-                if i % 50 == 0:
-                    print(f"进度: {i}/{len(potential_stocks)}, 已找到: {len(available_stocks)}")
-
-                try:
-                    df = D.features(
-                        instruments=[stock_code],
-                        fields=['$close'],
-                        start_time=start_date_qlib,
-                        end_time=end_date_qlib,
-                        freq='day',
-                        disk_cache=0
-                    )
-
-                    if df is not None and not df.empty and len(df) >= 5:
-                        # 转换为6位代码格式
-                        six_digit_code = stock_code[2:] if stock_code.startswith(('SH', 'SZ')) else stock_code
-                        available_stocks.append(six_digit_code)
-
-                except Exception:
-                    continue
-
-            print(f"成功找到{len(available_stocks)}只有效股票")
-            return available_stocks[:max_stocks]
-
-        except Exception as e:
-            print(f"获取可用股票失败: {e}")
-            raise RuntimeError("获取可用股票失败")
+        assert self._qlib_initialized
+        print("正在从 Qlib instruments 中读取全市场股票列表（按时间窗口过滤）...")
+        codes = self._list_all_qlib_instruments_in_range()
+        print(f"全市场在 {self._convert_date_format(self.start_date)} ~ {self._convert_date_format(self.end_date)} 范围内可交易的股票数: {len(codes)}")
+        return codes[:max_stocks]
 
     def get_stock_pool(self, index_code=None):
         """
@@ -241,42 +280,9 @@ class RiskSensitiveTrendStrategy:
         try:
             print("构建全市场股票池，应用流动性和基本面过滤...")
 
-            # 使用更高效的批量方式获取股票池
-            # 先用已知的活跃股票作为基础池
-            base_pool = [
-                # 主要指数成分股核心池
-                '000001', '000002', '000858', '000651', '002415', '300059',
-                '600000', '600036', '600519', '601318', '601398', '600887',
-                '000063', '002027', '300142', '300498', '600050', '600900',
-                '000333', '000568', '002304', '300760', '601668', '688981'
-            ]
-
-            # 添加更多活跃股票（按行业分布）
-            additional_active = []
-            for prefix in ['000', '002', '300', '600', '601', '603']:
-                if prefix in ['000', '002', '300']:  # 深市
-                    if prefix == '000':
-                        for i in range(1, 100, 5):  # 主板
-                            additional_active.append(f"{i:06d}")
-                    elif prefix == '002':
-                        for i in range(2000, 2100, 3):  # 中小板
-                            additional_active.append(f"{i:06d}")
-                    elif prefix == '300':
-                        for i in range(300000, 300100, 3):  # 创业板
-                            additional_active.append(f"{i:06d}")
-                else:  # 沪市
-                    if prefix == '600':
-                        for i in range(600000, 600100, 3):
-                            additional_active.append(f"{i:06d}")
-                    elif prefix == '601':
-                        for i in range(601000, 601050, 2):
-                            additional_active.append(f"{i:06d}")
-                    elif prefix == '603':
-                        for i in range(603000, 603050, 2):
-                            additional_active.append(f"{i:06d}")
-
-            # 合并候选池
-            candidate_pool = list(set(base_pool + additional_active))
+            # 候选池：直接使用 Qlib 在时间窗口内的全市场股票
+            candidate_pool = self._list_all_qlib_instruments_in_range()
+            print(f"候选股票数量（来自 Qlib instruments）：{len(candidate_pool)}")
 
             # 批量过滤：检查数据可用性和基本质量
             filtered_stocks = []
@@ -315,6 +321,7 @@ class RiskSensitiveTrendStrategy:
                                     filtered_stocks.append(code)
 
                 except Exception as e:
+                    print(f"处理股票 {code} 时出错: {e}")
                     continue
 
                 if i % 100 == 0:
@@ -1068,12 +1075,17 @@ class RiskSensitiveTrendStrategy:
             )
 
             if market_df is None or market_df.empty:
-                print("无法获取上证指数数据，返回中性市场状态")
-                return 'NEUTRAL'
-
-            # 提取数据并规范列名
-            market_df = market_df.xs('SH000001', level=0)
-            market_df.columns = [col.replace('$', '') for col in market_df.columns]
+                # 回退到本地 Qlib 失败时，使用 AkShare 获取指数数据
+                market_df = self._fetch_sh_index_df()
+                assert market_df is not None and not market_df.empty, "上证指数数据获取失败（Qlib 与 AkShare 均未返回数据）"
+            else:
+                # Qlib 返回的是 MultiIndex(index=[instrument, date])，只取 SH000001 这一条
+                if isinstance(market_df.index, pd.MultiIndex):
+                    market_df = market_df.xs('SH000001', level=0)
+                    market_df.columns = [col.replace('$', '') for col in market_df.columns]
+                else:
+                    # 某些环境下可能直接返回单指数的普通索引，这里也统一去掉列名前缀
+                    market_df.columns = [col.replace('$', '') for col in market_df.columns]
 
             if len(market_df) < 60:
                 return 'NEUTRAL'
