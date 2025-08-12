@@ -2339,15 +2339,15 @@ def parse_args():
                        help='结束日期，格式YYYYMMDD (默认: 今天)')
     parser.add_argument('--qlib-dir', default='~/.qlib/qlib_data/cn_data',
                        help='qlib数据目录路径 (默认: ~/.qlib/qlib_data/cn_data)')
-                       
+
     # 交易引擎专用参数
-    parser.add_argument('--capital', type=float, default=1000000, 
+    parser.add_argument('--capital', type=float, default=1000000,
                        help='总资本金额（交易模式）(默认: 100万)')
-    parser.add_argument('--max-positions', type=int, default=5, 
+    parser.add_argument('--max-positions', type=int, default=5,
                        help='最大持仓数量（交易模式）(默认: 5只)')
-    parser.add_argument('--trade-date', default=None, 
+    parser.add_argument('--trade-date', default=None,
                        help='交易日期 (YYYYMMDD)，默认为今天')
-    parser.add_argument('--current-holdings', default=None, 
+    parser.add_argument('--current-holdings', default=None,
                        help='当前持仓JSON文件路径（交易模式）')
 
     # 股票池配置
@@ -2385,7 +2385,7 @@ def main():
         print(f"总资本: ¥{args.capital:,.0f}")
         print(f"最大持仓: {args.max_positions}只")
         print(f"交易日期: {args.trade_date if args.trade_date else '今天'}")
-        
+
         # 读取当前持仓
         current_holdings = {}
         if args.current_holdings and os.path.exists(args.current_holdings):
@@ -2393,7 +2393,7 @@ def main():
             with open(args.current_holdings, 'r', encoding='utf-8') as f:
                 current_holdings = json.load(f)
                 print(f"已读取持仓文件: {args.current_holdings}")
-        
+
         # 运行交易引擎
         daily_plan, strategy = run_daily_trading_engine(
             start_date=args.start_date,
@@ -2403,24 +2403,24 @@ def main():
             max_positions=args.max_positions,
             current_holdings=current_holdings
         )
-        
+
         print(f"\n=== 交易引擎完成 ===")
         print(f"交易计划文件: {daily_plan['csv_path']}")
         print(f"风险利用率: {daily_plan['summary']['risk_utilization']:.1f}%")
         print(f"总投入资金: ¥{daily_plan['summary']['total_value']:,.0f}")
-        
+
         # 生成执行提示
         print(f"\n=== 执行提示 ===")
         print("1. 收盘后: 已生成明日交易计划CSV文件")
         print("2. 盘前9:20-9:30: 核对前收与涨跌停价")
         print("3. 盘中: 按计划执行，注意风控触发")
         print("4. 收盘后: 记录实际成交，更新持仓文件")
-        
+
         return daily_plan
     else:
         # 策略分析模式
         print(f"\n=== 策略分析模式 ===")
-        
+
         # 处理自定义股票列表
         custom_stocks = args.stocks if args.pool_mode == 'custom' else None
 
@@ -2527,27 +2527,27 @@ def main():
 
 class DailyTradingPlan:
     """每日交易计划生成器 - 实盘信号&风控引擎"""
-    
+
     def __init__(self, strategy_instance):
         self.strategy = strategy_instance
         self.trade_date = datetime.now().strftime('%Y%m%d')
         self.max_position_pct = 0.05  # 单笔交易不超过ADV20的5%
-        
+
     def set_random_seed(self, trade_date=None):
         """基于交易日期设置固定随机种子，确保结果可复现"""
         if trade_date:
             self.trade_date = trade_date
-        
+
         # 将交易日期转换为数字种子
         seed = int(self.trade_date) % 2147483647  # 限制在int32范围内
         random.seed(seed)
         np.random.seed(seed)
         print(f"已设置随机种子: {seed} (基于交易日期: {self.trade_date})")
-        
+
     def calculate_precise_position_size(self, stock_code, capital, current_holdings=None):
         """
         精确的风险法仓位计算 - 基于ATR止损和risk_per_trade
-        
+
         Parameters:
         -----------
         stock_code : str
@@ -2559,47 +2559,47 @@ class DailyTradingPlan:
         """
         if stock_code not in self.strategy.price_data:
             return None
-            
+
         df = self.strategy.price_data[stock_code]
         current_price = df['close'].iloc[-1]
         atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else current_price * 0.02
-        
+
         # 计算ATR止损价
         stop_loss_price = current_price - (atr * self.strategy.atr_multiplier)
-        
+
         # 风险金额 = 总资本 × 每笔风险比例
         risk_amount = capital * self.strategy.risk_per_trade
-        
+
         # 止损距离
         stop_distance = current_price - stop_loss_price
-        
+
         if stop_distance <= 0:
             return None
-            
+
         # 理论股数 = 风险金额 / 止损距离
         theoretical_shares = risk_amount / stop_distance
-        
+
         # 调整为100股的整数倍（A股最小交易单位）
         shares = int(theoretical_shares // 100) * 100
-        
+
         if shares <= 0:
             return None
-            
+
         # 计算实际投入金额
         position_value = shares * current_price
-        
+
         # ADV流动性约束检查
         if self._check_adv_constraint(stock_code, shares, current_price):
             shares = self._adjust_for_adv_constraint(stock_code, current_price)
             position_value = shares * current_price
-            
+
         # 考虑交易成本
         total_cost = self.strategy._calculate_transaction_costs(position_value, is_buy=True)
-        
+
         # 实际风险占用
         actual_risk = shares * stop_distance
         risk_utilization = actual_risk / risk_amount if risk_amount > 0 else 0
-        
+
         return {
             'shares': shares,
             'position_value': position_value,
@@ -2611,53 +2611,53 @@ class DailyTradingPlan:
             'transaction_cost': total_cost['total_cost'],
             'cost_rate': total_cost['cost_rate']
         }
-        
+
     def _check_adv_constraint(self, stock_code, shares, price):
         """检查是否违反ADV流动性约束"""
         if stock_code not in self.strategy.price_data:
             return False
-            
+
         df = self.strategy.price_data[stock_code]
-        
+
         # 计算过去20日平均成交额（单位：元）
         if 'amount' in df.columns and len(df) >= 20:
             amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
             trade_value = shares * price
-            
+
             # 检查是否超过ADV20的5%
             if trade_value > amount_20d * self.max_position_pct:
                 return True
-                
+
         return False
-        
+
     def _adjust_for_adv_constraint(self, stock_code, price):
         """根据ADV约束调整仓位"""
         df = self.strategy.price_data[stock_code]
-        
+
         if 'amount' in df.columns and len(df) >= 20:
             amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
             max_trade_value = amount_20d * self.max_position_pct
             max_shares = int(max_trade_value / price // 100) * 100  # 调整为100股整数倍
             return max(100, max_shares)  # 至少100股
-            
+
         return 100  # 默认最小单位
-        
+
     def check_price_limit_risk(self, stock_code, target_price, is_buy=True):
         """检查涨跌停风险"""
         if stock_code not in self.strategy.price_data:
             return "数据不足"
-            
+
         df = self.strategy.price_data[stock_code]
         yesterday_close = df['close'].iloc[-1]  # 最新收盘价作为昨收
-        
+
         # 判断股票类型
         is_st = self.strategy._is_st_stock(stock_code)
-        
+
         # 获取涨跌停价格
         upper_limit, lower_limit = self.strategy._get_price_limits(
             yesterday_close, stock_code, is_st
         )
-        
+
         if is_buy:
             if target_price >= upper_limit * 0.995:  # 接近涨停
                 return "涨停风险"
@@ -2665,20 +2665,20 @@ class DailyTradingPlan:
                 return "接近涨停"
         else:
             if target_price <= lower_limit * 1.005:  # 接近跌停
-                return "跌停风险"  
+                return "跌停风险"
             elif target_price <= lower_limit * 1.02:  # 接近跌停
                 return "接近跌停"
-                
+
         return "正常"
-        
+
     def generate_buy_signals(self, capital=1000000, max_positions=5):
         """生成买入信号清单"""
         buy_list = []
-        
+
         if not hasattr(self.strategy, 'rs_scores') or self.strategy.rs_scores.empty:
             print("未找到相对强度评分数据，请先运行策略")
             return buy_list
-            
+
         # 选择候选股票
         candidates = []
         for _, row in self.strategy.rs_scores.head(20).iterrows():
@@ -2686,41 +2686,41 @@ class DailyTradingPlan:
             if stock in self.strategy.price_data:
                 df = self.strategy.price_data[stock]
                 metrics = self.strategy.risk_metrics.get(stock, {})
-                
+
                 # 技术条件过滤
-                if (len(df) > 0 and 
+                if (len(df) > 0 and
                     'trend_signal' in df.columns and
                     df['trend_signal'].iloc[-1] == 1 and  # 趋势向上
                     'RSI' in df.columns and
                     25 < df['RSI'].iloc[-1] < 75 and      # RSI合理区间
                     metrics.get('volatility', 1) < self.strategy.volatility_threshold):
                     candidates.append(stock)
-                    
+
         # 相关性过滤
         if len(candidates) > 1:
             candidates = self.strategy._filter_by_correlation(candidates)
-            
+
         # 生成买入计划
         for stock in candidates[:max_positions]:
             position_info = self.calculate_precise_position_size(stock, capital)
             if position_info is None:
                 continue
-                
+
             df = self.strategy.price_data[stock]
             current_price = df['close'].iloc[-1]
-            
+
             # 建议执行价格（开盘价或VWAP）
             entry_hint = "开盘价"  # 简化为开盘价，实际可加入VWAP逻辑
-            
+
             # 检查涨跌停风险
             limit_risk = self.check_price_limit_risk(stock, current_price, is_buy=True)
-            
+
             # 流动性风险标记
             adv_risk = "流动性风险" if self._check_adv_constraint(
                 stock, position_info['shares'], current_price) else ""
-                
+
             notes = [risk for risk in [limit_risk, adv_risk] if risk and risk != "正常"]
-            
+
             buy_list.append({
                 'date': self.trade_date,
                 'code': stock,
@@ -2735,44 +2735,44 @@ class DailyTradingPlan:
                 'risk_used': position_info['risk_amount'],
                 'notes': '; '.join(notes) if notes else '正常'
             })
-            
+
         return buy_list
-        
+
     def generate_watchlist(self, threshold_ratio=0.8):
         """生成观察清单 - 接近信号阈值但未通过筛选的股票"""
         watchlist = []
-        
+
         if not hasattr(self.strategy, 'rs_scores') or self.strategy.rs_scores.empty:
             return watchlist
-            
+
         # 找到买入信号的阈值
         buy_candidates = set()
         for _, row in self.strategy.rs_scores.head(10).iterrows():
             stock = row['stock_code']
             if stock in self.strategy.price_data:
                 df = self.strategy.price_data[stock]
-                if ('trend_signal' in df.columns and 
+                if ('trend_signal' in df.columns and
                     df['trend_signal'].iloc[-1] == 1):
                     buy_candidates.add(stock)
-                    
+
         min_buy_score = min([self.strategy.rs_scores[
-            self.strategy.rs_scores['stock_code']==stock]['rs_score'].iloc[0] 
+            self.strategy.rs_scores['stock_code']==stock]['rs_score'].iloc[0]
             for stock in buy_candidates]) if buy_candidates else 0
-            
+
         watch_threshold = min_buy_score * threshold_ratio
-        
+
         # 寻找接近阈值的股票
         for _, row in self.strategy.rs_scores.iterrows():
             stock = row['stock_code']
             rs_score = row['rs_score']
-            
-            if (stock not in buy_candidates and 
+
+            if (stock not in buy_candidates and
                 stock in self.strategy.price_data and
                 rs_score >= watch_threshold):
-                
+
                 df = self.strategy.price_data[stock]
                 current_price = df['close'].iloc[-1]
-                
+
                 # 分析接近突破的原因
                 reasons = []
                 if 'trend_signal' in df.columns:
@@ -2780,18 +2780,18 @@ class DailyTradingPlan:
                         reasons.append("趋势中性")
                     elif df['trend_signal'].iloc[-1] == -1:
                         reasons.append("趋势向下")
-                        
+
                 if 'RSI' in df.columns:
                     rsi = df['RSI'].iloc[-1]
                     if rsi >= 75:
                         reasons.append("RSI超买")
                     elif rsi <= 25:
                         reasons.append("RSI超卖")
-                        
+
                 metrics = self.strategy.risk_metrics.get(stock, {})
                 if metrics.get('volatility', 0) > self.strategy.volatility_threshold:
                     reasons.append("波动率过高")
-                    
+
                 watchlist.append({
                     'date': self.trade_date,
                     'code': stock,
@@ -2801,55 +2801,55 @@ class DailyTradingPlan:
                     'watch_reason': '; '.join(reasons) if reasons else '接近信号阈值',
                     'distance_to_signal': min_buy_score - rs_score
                 })
-                
+
         return sorted(watchlist, key=lambda x: x['rs_score'], reverse=True)[:10]
-        
+
     def generate_risk_control_signals(self, current_holdings):
         """生成风控信号 - 减仓/清仓清单"""
         reduce_list = []
-        
+
         for stock, shares in current_holdings.items():
             if stock not in self.strategy.price_data:
                 continue
-                
+
             df = self.strategy.price_data[stock]
             current_price = df['close'].iloc[-1]
             position_value = shares * current_price
-            
+
             risk_flags = []
-            
+
             # ATR止损检查
             if 'ATR' in df.columns and len(df) > 1:
                 atr = df['ATR'].iloc[-1]
                 stop_loss = current_price - (atr * self.strategy.atr_multiplier)
-                
+
                 # 假设持仓成本为前20日均价（简化处理）
                 avg_cost = df['close'].iloc[-20:].mean() if len(df) >= 20 else current_price
-                
+
                 if current_price <= stop_loss:
                     risk_flags.append("ATR止损触发")
-                    
+
             # 最大回撤检查
             metrics = self.strategy.risk_metrics.get(stock, {})
             if metrics.get('max_drawdown_60d', 0) > self.strategy.max_drawdown_threshold:
                 risk_flags.append("最大回撤超限")
-                
+
             # 波动率检查
             if metrics.get('volatility', 0) > self.strategy.volatility_threshold:
                 risk_flags.append("波动率超阈值")
-                
+
             # 趋势反转检查
             if 'trend_signal' in df.columns and df['trend_signal'].iloc[-1] == -1:
                 risk_flags.append("趋势反转向下")
-                
+
             if risk_flags:
                 # 计算建议减仓比例
                 reduce_ratio = 1.0  # 默认全部清仓
                 if "波动率超阈值" in risk_flags and len(risk_flags) == 1:
                     reduce_ratio = 0.5  # 波动率问题只减一半
-                    
+
                 reduce_shares = int(shares * reduce_ratio // 100) * 100
-                
+
                 reduce_list.append({
                     'date': self.trade_date,
                     'code': stock,
@@ -2862,24 +2862,24 @@ class DailyTradingPlan:
                     'position_value': position_value,
                     'notes': f"风险等级: {'高' if len(risk_flags) > 2 else '中' if len(risk_flags) > 1 else '低'}"
                 })
-                
+
         return reduce_list
-        
+
     def export_daily_plan_csv(self, buy_signals, add_signals, reduce_signals, watchlist, filepath=None):
         """导出标准化交易计划CSV文件"""
         if filepath is None:
             filepath = f"daily_trading_plan_{self.trade_date}.csv"
-            
+
         all_plans = []
-        
+
         # 买入信号
         for signal in buy_signals:
             all_plans.append(signal)
-            
+
         # 加仓信号（这里简化为空，实际可根据持仓添加）
         for signal in add_signals:
             all_plans.append(signal)
-            
+
         # 减仓信号
         for signal in reduce_signals:
             plan = {
@@ -2897,76 +2897,76 @@ class DailyTradingPlan:
                 'notes': signal['notes']
             }
             all_plans.append(plan)
-            
+
         # 转换为DataFrame并保存
         if all_plans:
             df = pd.DataFrame(all_plans)
             df.to_csv(filepath, index=False, encoding='utf-8-sig')
             print(f"交易计划已导出到: {filepath}")
-            
+
         # 同时导出观察清单
         if watchlist:
             watch_filepath = f"watchlist_{self.trade_date}.csv"
             watch_df = pd.DataFrame(watchlist)
             watch_df.to_csv(watch_filepath, index=False, encoding='utf-8-sig')
             print(f"观察清单已导出到: {watch_filepath}")
-            
+
         return filepath
-        
+
     def generate_complete_daily_plan(self, capital=1000000, current_holdings=None, max_positions=5):
         """生成完整的每日交易计划"""
         print(f"\n=== 生成 {self.trade_date} 交易计划 ===")
-        
+
         # 设置随机种子确保可复现
         self.set_random_seed(self.trade_date)
-        
+
         current_holdings = current_holdings or {}
-        
+
         # 1. 买入信号
         print("正在生成买入信号...")
         buy_signals = self.generate_buy_signals(capital, max_positions)
         print(f"生成 {len(buy_signals)} 个买入信号")
-        
+
         # 2. 加仓信号（简化实现，实际需要基于持仓分析）
         add_signals = []  # 这里可以根据需要添加加仓逻辑
-        
+
         # 3. 减仓/清仓信号
         print("正在生成风控信号...")
         reduce_signals = self.generate_risk_control_signals(current_holdings)
         print(f"生成 {len(reduce_signals)} 个风控信号")
-        
+
         # 4. 观察清单
         print("正在生成观察清单...")
         watchlist = self.generate_watchlist()
         print(f"生成 {len(watchlist)} 只观察股票")
-        
+
         # 5. 导出CSV文件
         csv_path = self.export_daily_plan_csv(
             buy_signals, add_signals, reduce_signals, watchlist
         )
-        
+
         # 6. 打印计划摘要
         print(f"\n=== 交易计划摘要 ===")
         print(f"买入信号: {len(buy_signals)} 只")
-        print(f"减仓信号: {len(reduce_signals)} 只") 
+        print(f"减仓信号: {len(reduce_signals)} 只")
         print(f"观察清单: {len(watchlist)} 只")
-        
+
         total_risk = sum([signal['risk_used'] for signal in buy_signals])
         total_value = sum([signal['plan_shares'] * signal.get('entry_price', 0) for signal in buy_signals])
-        
+
         print(f"计划投入资金: ¥{total_value:,.0f}")
         print(f"风险占用: ¥{total_risk:,.0f} ({total_risk/capital*100:.1f}%)")
-        
+
         if buy_signals:
             print(f"\n买入清单:")
             for signal in buy_signals:
                 print(f"  {signal['code']} - {signal['name']}: {signal['plan_shares']}股 (风险: ¥{signal['risk_used']:,.0f}) [{signal['notes']}]")
-                
+
         if reduce_signals:
             print(f"\n风控清单:")
             for signal in reduce_signals:
                 print(f"  {signal['code']} - {signal['name']}: {signal['plan_action']} {signal.get('reduce_shares', 0)}股 [{signal['signal']}]")
-        
+
         return {
             'buy_signals': buy_signals,
             'add_signals': add_signals,
@@ -2982,150 +2982,35 @@ class DailyTradingPlan:
         }
 
 
-def run_daily_trading_engine(start_date='20230101', end_date=None, max_stocks=200, 
+def run_daily_trading_engine(start_date='20230101', end_date=None, max_stocks=200,
                            capital=1000000, max_positions=5, current_holdings=None):
     """运行每日交易引擎 - 一键生成交易计划"""
     print("=== 启动每日交易引擎 ===")
-    
+
     # 1. 初始化策略
     strategy = RiskSensitiveTrendStrategy(
-        start_date=start_date, 
+        start_date=start_date,
         end_date=end_date,
         stock_pool_mode='auto'
     )
     strategy.max_stocks = max_stocks
-    
+
     # 2. 运行策略获取数据
     print("正在运行策略分析...")
     selected_stocks, position_sizes = strategy.run_strategy(use_concurrent=True)
-    
+
     # 3. 初始化交易计划生成器
     trading_plan = DailyTradingPlan(strategy)
-    
+
     # 4. 生成完整交易计划
     daily_plan = trading_plan.generate_complete_daily_plan(
         capital=capital,
         current_holdings=current_holdings,
         max_positions=max_positions
     )
-    
+
     return daily_plan, strategy
 
 
 if __name__ == "__main__":
     main()
-
-"""
-=== 实盘交易引擎使用说明 ===
-
-基于fix.md的每日实盘操作playbook，claude.py现已升级为完整的信号&风控引擎。
-
-## 核心功能
-
-✅ **每日交易计划生成**: 自动生成4张表(买入/加仓/减仓/观察清单)
-✅ **固定随机种子**: 基于交易日期确保结果可复现  
-✅ **精确风险法仓位**: ATR止损 + risk_per_trade(2%) 的sizing
-✅ **ADV流动性约束**: 限制单笔不超过ADV20的5%
-✅ **涨跌停风险标记**: 主板±10%、ST±5%、科创±20%、北交所±30%
-✅ **标准化CSV导出**: 可直接导入券商交易模板
-✅ **持仓风控监控**: ATR止损/波动率/回撤触发检测
-
-## 使用方法
-
-### 1. 每日交易模式（推荐）
-```bash
-# 生成明日交易计划（100万资金，最多5只股票）
-python claude.py --mode trading --capital 1000000 --max-positions 5
-
-# 指定特定交易日期（确保可复现）
-python claude.py --mode trading --trade-date 20250812 --capital 2000000
-
-# 包含当前持仓的风控检查
-python claude.py --mode trading --current-holdings holdings.json
-```
-
-### 2. 策略分析模式（传统模式）
-```bash
-# 基础策略分析
-python claude.py --mode analysis
-
-# 指定时间范围和股票池
-python claude.py --mode analysis --start-date 20240101 --max-stocks 100
-```
-
-## 每日操作流程
-
-### 收盘后（15:00以后）
-```bash
-python claude.py --mode trading --trade-date $(date +%Y%m%d)
-```
-生成文件：
-- `daily_trading_plan_YYYYMMDD.csv` - 交易计划主表
-- `watchlist_YYYYMMDD.csv` - 观察清单
-
-### 盘前（9:20-9:30）
-1. 核对前收与涨跌停价格
-2. 检查CSV中的风险标记
-3. 设置限价单（避免追高）
-
-### 盘中执行
-- 按计划下单，注意ADV流动性限制
-- 监控风控触发（程序会标记风险股票）
-- T+1约束：当日买入次日才能卖出
-
-### 收盘后复盘
-- 记录实际成交价与滑点
-- 更新holdings.json持仓文件
-- 统计不可成交率
-
-## CSV文件格式
-
-交易计划文件包含以下字段：
-- date: 交易日期
-- code: 股票代码  
-- name: 股票名称
-- signal: 信号来源(相对强度评分)
-- plan_action: 操作类型(buy/add/reduce/exit)
-- plan_shares: 计划股数(100股整数倍)
-- plan_weight: 仓位权重(%)
-- entry_hint: 执行价格建议(开盘价/VWAP)
-- stop_loss: ATR止损价
-- atr: ATR值
-- risk_used: 风险占用金额
-- notes: 风险提示(涨停风险/流动性风险等)
-
-## 关键参数说明
-
-### 风险参数
-- `risk_per_trade = 0.02`: 每笔交易风险2%（可调至0.5%-1.5%起步）
-- `atr_multiplier = 2.0`: ATR止损倍数（波动大时用2.5-3.0）
-- `max_correlation = 0.7`: 相关性阈值（避免同风格挤仓）
-
-### 流动性参数  
-- `min_adv_20d = 2000万`: 20日平均成交额门槛
-- `max_position_pct = 0.05`: 单笔不超过ADV20的5%
-- `max_suspend_days_60d = 10`: 60日内最大停牌天数
-
-### A股制度参数
-- `t_plus_1 = True`: T+1交易制度（硬约束）
-- 价格限制：主板±10%、ST±5%、科创±20%、北交所±30%
-- `transaction_cost = 0.003`: 双边交易成本0.3%
-- `slippage_bps = 5`: 滑点5个基点
-
-## 示例持仓文件 (holdings.json)
-```json
-{
-    "000001": 1000,
-    "600000": 500, 
-    "300750": 800
-}
-```
-
-## 注意事项
-- 固定随机种子基于交易日期，确保同一天多次运行结果一致
-- 程序会自动标记涨跌停风险和流动性风险
-- CSV可直接导入券商交易模板或手动执行
-- 建议每周做走前检验，防止过拟合
-
-此引擎严格按照fix.md的playbook设计，将claude.py转化为生产级的实盘信号&风控系统。
-"""
