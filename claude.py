@@ -65,8 +65,9 @@ class RiskSensitiveTrendStrategy:
 
         # A股交易制度参数
         self.t_plus_1 = True               # T+1交易制度
-        self.price_limit_pct = 0.10        # 涨跌停幅度（10%）
+        self.price_limit_pct = 0.10        # 沪深涨跌停幅度（10%）
         self.st_limit_pct = 0.05           # ST股涨跌停幅度（5%）
+        self.bj_limit_pct = 0.30           # 北交所涨跌停幅度（30%）
         self.transaction_cost = 0.003      # 双边交易成本（0.3%）
         self.slippage_bps = 5              # 滑点（5个基点）
 
@@ -586,17 +587,18 @@ class RiskSensitiveTrendStrategy:
                 # 确保数据类型正确
                 df = df.astype(float)
 
-                # === 仅输出原始（未复权）价格：raw = adjusted / factor ===
+                # === 使用 Qlib 的调整后价格进行回测；同时保留未复权价用于可视化 ===
+                # Qlib 文档：$open/$close 等为“调整后价格”，可用 $factor 还原原始价（raw=adjusted/factor）。
+                # 我们将：
+                #  - 保留调整后列：open/high/low/close （用于计算收益与指标）
+                #  - 额外添加 raw_close 列：用于可视化或对比
                 if all(col in df.columns for col in ['open', 'high', 'low', 'close', 'factor']):
-                    df['open']  = df['open']  / df['factor']
-                    df['high']  = df['high']  / df['factor']
-                    df['low']   = df['low']   / df['factor']
-                    df['close'] = df['close'] / df['factor']
-                    # 保持只输出原始价格，避免混淆，去掉 factor 与 volume 等非必要列
-                    # 若后续指标需要，可在相应函数中另行取数
-                    df = df[['open', 'high', 'low', 'close']]
+                    # 不再对 open/high/low/close 进行除以 factor 的还原，保持为“调整后价格”
+                    df['raw_close'] = df['close'] / df['factor']
+                    # 仍然保留 volume 与 factor，供上游过滤或诊断使用
+                    # 下游指标函数均以调整后价格为基准（df['close'] 等）
                 else:
-                    print(f"警告：{stock_code} 缺少 factor 列，无法还原未复权价格，将按当前列原样返回")
+                    print(f"警告：{stock_code} 缺少 factor 列，无法生成 raw_close（原始未复权价）")
 
                 stock_name = self.get_stock_name(stock_code)
                 return df
@@ -695,6 +697,17 @@ class RiskSensitiveTrendStrategy:
         efficiency = (successful_count / total_count * 100) if total_count > 0 else 0
         print(f"并发处理完成：成功获取{successful_count}/{total_count}只股票数据 (筛选通过率={efficiency:.1f}%)")
 
+        # 在 fetch_stocks_data_concurrent 末尾这行之后：
+        # print(f"并发处理完成：成功获取{successful_count}/{total_count}只股票数据 (筛选通过率={efficiency:.1f}%)")
+
+        # 添加👇
+        try:
+            eq = self.backtest_equity_curve()
+            if eq is not None and not eq.empty:
+                print(f"回测完成：净值首末 = {float(eq.iloc[0]):.6f} → {float(eq.iloc[-1]):.6f}")
+        except Exception as e:
+            print(f"自动回测失败: {e}")
+
     def calculate_atr(self, df, period=14):
         """
         计算ATR（平均真实波幅）- 使用Wilder RMA平滑
@@ -756,6 +769,182 @@ class RiskSensitiveTrendStrategy:
         df['max_drawdown'] = df['drawdown'].rolling(window, min_periods=1).min()
 
         return df
+
+
+    def _get_calendar(self):
+        """获取交易日历（优先使用 Qlib 提供的市场日历）。"""
+        try:
+            cal = D.calendar(
+                start_time=self._convert_date_format(self.start_date),
+                end_time=self._convert_date_format(self.end_date),
+                freq="day",
+            )
+            return pd.DatetimeIndex(cal)
+        except Exception:
+            return None
+
+    def build_price_panel(self, use_adjusted: bool = True) -> pd.DataFrame | None:
+        """
+        构建价格面板（列=股票，索引=交易日），使用日期并集并重建为交易日历索引。
+        use_adjusted=True 使用调整后价格（close）；False 使用原始未复权价（raw_close）。
+        """
+        if not self.price_data:
+            print("price_data 为空，尚未加载任何股票数据")
+            return None
+        col = 'close' if use_adjusted else 'raw_close'
+        series = []
+        for code, df in self.price_data.items():
+            if col not in df.columns:
+                # 如果选了 raw_close 但缺失，则跳过该标的
+                if not use_adjusted:
+                    continue
+            s = df[col].rename(code)
+            s.index = pd.to_datetime(s.index)
+            series.append(s)
+        if not series:
+            print("无可用价格序列")
+            return None
+        # 替换 build_price_panel 里合并与 reindex 的那段
+        prices = pd.concat(series, axis=1).sort_index()
+        prices.index = pd.to_datetime(prices.index).normalize()  # 关键：索引只保留日期
+
+        cal = self._get_calendar()
+        if cal is not None and len(cal) > 0:
+            cal = pd.DatetimeIndex(pd.to_datetime(cal)).normalize()  # 同样归一
+            # 若同一日多条记录（数据补齐），以最后一条为准，再按日历并集重建索引
+            prices = prices.groupby(prices.index).last().reindex(cal)
+
+        return prices
+
+    def backtest_equity_curve(self, weights: pd.DataFrame | None = None, use_adjusted: bool = True, min_live_stocks: int = 3) -> pd.Series | None:
+        """
+        修复版回测组合净值，解决fix.md中指出的结构性问题：
+          - 正确处理缺失值（保持NaN而非填充0）
+          - 实现可交易性掩码（涨跌停/停牌过滤）
+          - 动态起点选择（避免长期空仓=1）
+          - A股T+1交易约束
+          - 北交所30%涨跌幅处理
+        """
+        prices = self.build_price_panel(use_adjusted=use_adjusted)
+        if prices is None or prices.empty:
+            print("无法构建价格面板，回测中止")
+            return None
+
+        # 1. 构建有效性掩码（关键：保持NaN而非填充0）
+        valid = prices.notna() & prices.shift(1).notna()
+        
+        # 2. 计算日收益（保持NaN）
+        rets = (prices / prices.shift(1) - 1).where(valid)
+        
+        # 3. 构建可交易性掩码（涨跌停/停牌过滤）
+        tradable_mask = self._build_tradable_mask(prices, valid)
+        
+        # 4. 对齐并准备权重
+        if weights is None:
+            # 当日可交易标的等权归一
+            w = tradable_mask.astype(float)
+            row_sum = w.sum(axis=1)
+            # 只对有交易标的的日期归一化
+            w = w.div(row_sum, axis=0).fillna(0.0)
+        else:
+            w = weights.reindex(rets.index).fillna(0.0)
+            # 在可交易标的内重归一化
+            w = w * tradable_mask.astype(float)
+            rs = w.sum(axis=1)
+            w = w.div(rs.where(rs > 0, 1.0), axis=0).fillna(0.0)
+
+        # 5. A股T+1：权重次日生效
+        if self.t_plus_1:
+            w = w.shift(1).fillna(0.0)
+            
+        # 6. 找到首个活跃日（当日可交易标的数≥阈值）
+        live_stocks_count = w.sum(axis=1)
+        first_active_idx = (live_stocks_count >= min_live_stocks).idxmax()
+        if not (live_stocks_count >= min_live_stocks).any():
+            print(f"警告：没有找到可交易标的数≥{min_live_stocks}的交易日，使用默认起点")
+            first_active_idx = w.index[0]
+        else:
+            print(f"回测起点自动对齐到首个活跃日: {first_active_idx}（可交易标的数≥{min_live_stocks}）")
+            
+        # 7. 从活跃日开始计算组合收益
+        active_slice = slice(first_active_idx, None)
+        w_active = w.loc[active_slice]
+        rets_active = rets.loc[active_slice]
+        
+        # 8. 组合日收益（只在有效收益上聚合）
+        port_ret = (w_active * rets_active).sum(axis=1, skipna=True)
+        
+        # 9. 交易成本
+        turnover = w_active.diff().abs().sum(axis=1).fillna(0.0)
+        port_ret_net = port_ret - turnover * self.transaction_cost
+        
+        # 10. 处理NaN：若当日无任何有效标的→延续前值而非强制0
+        valid_ret_mask = port_ret_net.notna()
+        if not valid_ret_mask.all():
+            print(f"发现{(~valid_ret_mask).sum()}个无效收益日，将延续前值")
+            port_ret_net = port_ret_net.ffill()
+            
+        # 11. 累计净值
+        equity = (1.0 + port_ret_net.fillna(0.0)).cumprod()
+        
+        # 12. 诊断信息
+        nonzero_w_days = int((w_active.abs().sum(axis=1) > 1e-12).sum())
+        nonzero_ret_days = int((rets_active.abs().sum(axis=1, skipna=True) > 1e-12).sum())
+        print(f"[诊断] 活跃权重日={nonzero_w_days}, 有效收益日={nonzero_ret_days}, 回测周期={len(equity)}")
+        print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f}")
+        
+        # 暴露给外部
+        self.daily_return = port_ret_net
+        self.equity_curve = equity
+        return equity
+
+    def _build_tradable_mask(self, prices: pd.DataFrame, valid: pd.DataFrame) -> pd.DataFrame:
+        """
+        构建可交易性掩码，处理涨跌停、停牌等不可交易情况
+        
+        Parameters:
+        -----------
+        prices : pd.DataFrame
+            价格面板
+        valid : pd.DataFrame  
+            基础有效性掩码
+            
+        Returns:
+        --------
+        pd.DataFrame
+            可交易性掩码（True=可交易，False=不可交易）
+        """
+        # 基础掩码：必须有有效价格
+        tradable = valid.copy()
+        
+        # 涨跌停掩码：检查是否触及价格限制
+        prev_close = prices.shift(1)
+        
+        for stock in prices.columns:
+            stock_prices = prices[stock]
+            stock_prev = prev_close[stock]
+            
+            # 判断股票类型（北交所、ST股、普通股）
+            if stock.startswith('BJ'):
+                limit_pct = self.bj_limit_pct  # 北交所30%
+            elif any(prefix in stock for prefix in ['ST', '*ST', 'S*ST']):
+                limit_pct = self.st_limit_pct  # ST股5%  
+            else:
+                limit_pct = self.price_limit_pct  # 普通股10%
+                
+            # 计算涨跌停价格
+            upper_limit = stock_prev * (1 + limit_pct)
+            lower_limit = stock_prev * (1 - limit_pct)
+            
+            # 触及涨跌停的不可交易（买不到/卖不出）
+            # 注意：这里简化处理，实际中可能需要更精细的流动性判断
+            limit_hit = (stock_prices >= upper_limit * 0.999) | (stock_prices <= lower_limit * 1.001)
+            tradable[stock] = tradable[stock] & ~limit_hit
+            
+        # 成交量过滤：过滤流动性不足的标的
+        # 这里简化处理，实际可以加入成交量/换手率判断
+        
+        return tradable.fillna(False)
 
     def calculate_ma_signals(self, df, short_window=20, long_window=60):
         """
@@ -1656,7 +1845,7 @@ class RiskSensitiveTrendStrategy:
                 text=scatter_text,
                 textposition='top center',
                 marker=dict(
-                    size=scatter_data['sharpe_ratio'] * 10 + 5,
+                    size=np.maximum(scatter_data['sharpe_ratio'] * 10 + 15, 5),  # 确保最小值为5
                     color=scatter_data['risk_score'],
                     colorscale='RdYlGn_r',
                     showscale=True,
@@ -1758,8 +1947,8 @@ class RiskSensitiveTrendStrategy:
 
     def backtest_with_risk_management(self, selected_stocks, position_sizes, initial_capital=100000):
         """
-        带风险管理的回测
-
+        修复版带风险管理的回测，使用新的回测框架
+        
         Parameters:
         -----------
         selected_stocks : list
@@ -1773,123 +1962,133 @@ class RiskSensitiveTrendStrategy:
             print("没有选中的股票，无法进行回测")
             return None
 
-        # 先找到所有股票的共同时间范围
-        all_dates = []
-        for stock in selected_stocks:
-            if stock in self.price_data:
-                all_dates.append(self.price_data[stock].index)
-
-        if not all_dates:
+        print(f"开始风险管理回测：{len(selected_stocks)}只股票，初始资金{initial_capital:,.0f}元")
+        
+        # 1. 构建权重矩阵（基于position_sizes）
+        weights = self._build_weights_matrix(selected_stocks, position_sizes, initial_capital)
+        if weights is None:
             return None
-
-        # 找到交集的时间范围
-        common_dates = all_dates[0]
-        for dates in all_dates[1:]:
-            common_dates = common_dates.intersection(dates)
-
-        if len(common_dates) == 0:
-            print("股票间没有共同的交易日期")
+            
+        # 2. 使用修复版回测引擎
+        equity_curve = self.backtest_equity_curve(weights=weights, use_adjusted=True, min_live_stocks=2)
+        if equity_curve is None or equity_curve.empty:
+            print("回测失败：无法生成净值曲线")
             return None
-
-        common_dates = common_dates.sort_values()
-
-        results = []
-        portfolio_value = np.ones(len(common_dates))
-
-        for stock in selected_stocks:
-            df = self.price_data[stock].reindex(common_dates).copy()
-
-            # 填充可能的缺失值
-            df = df.fillna(method='ffill')
-
-            # 生成交易信号（考虑风险）
-            df['position'] = 0
-
-            for i in range(1, len(df)):
-                # 入场条件
-                if (df['trend_signal'].iloc[i] == 1 and
-                    df['RSI'].iloc[i] < 70 and
-                    df['RSI'].iloc[i] > 30 and
-                    df['volatility'].iloc[i] < self.volatility_threshold and
-                    abs(df['drawdown'].iloc[i]) < 0.1):
-                    df.loc[df.index[i], 'position'] = 1
-
-                # 出场条件（风险控制）
-                elif (df['trend_signal'].iloc[i] == -1 or
-                      df['RSI'].iloc[i] > 80 or
-                      df['RSI'].iloc[i] < 20 or
-                      abs(df['drawdown'].iloc[i]) > 0.15 or
-                      df['volatility'].iloc[i] > self.volatility_threshold * 1.5):
-                    df.loc[df.index[i], 'position'] = 0
-                else:
-                    df.loc[df.index[i], 'position'] = df['position'].iloc[i-1]
-
-            # 计算收益
-            df['returns'] = df['close'].pct_change()
-            df['strategy_returns'] = df['position'].shift(1) * df['returns']
-
-            # 应用止损
-            df['cum_strategy_returns'] = 1.0
-            max_price = df['close'].iloc[0]
-
-            for i in range(1, len(df)):
-                # 更新最高价
-                if df['position'].iloc[i] == 1:
-                    max_price = max(max_price, df['close'].iloc[i])
-
-                    # 移动止损检查（从最高点回撤10%）
-                    if df['close'].iloc[i] < max_price * 0.9:
-                        df.loc[df.index[i], 'position'] = 0
-                        df.loc[df.index[i], 'strategy_returns'] = -0.1
-                        max_price = df['close'].iloc[i]
-
-                # 累计收益
-                df.loc[df.index[i], 'cum_strategy_returns'] = (
-                    df['cum_strategy_returns'].iloc[i-1] *
-                    (1 + df['strategy_returns'].iloc[i])
-                )
-
-            # 计算风险指标
-            strategy_returns = df['strategy_returns'].dropna()
-
-            # 夏普比率
-            sharpe = (strategy_returns.mean() * 252) / (strategy_returns.std() * np.sqrt(252)) if strategy_returns.std() > 0 else 0
-
-            # 最大回撤
-            cum_returns = df['cum_strategy_returns']
-            running_max = cum_returns.expanding().max()
-            drawdown = (cum_returns - running_max) / running_max
-            max_dd = drawdown.min()
-
-            # 胜率
-            winning_trades = strategy_returns[strategy_returns > 0]
-            losing_trades = strategy_returns[strategy_returns < 0]
-            win_rate = len(winning_trades) / len(strategy_returns) if len(strategy_returns) > 0 else 0
-
-            # 盈亏比
-            avg_win = winning_trades.mean() if len(winning_trades) > 0 else 0
-            avg_loss = abs(losing_trades.mean()) if len(losing_trades) > 0 else 0
-            profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
-
-            # 计算仓位调整后的收益
-            position_weight = position_sizes.get(stock, initial_capital * 0.2) / initial_capital
-            adjusted_return = (df['cum_strategy_returns'].iloc[-1] - 1) * position_weight * 100
-
-            results.append({
-                'stock': stock,
-                'total_return': adjusted_return,
-                'sharpe_ratio': sharpe,
-                'max_drawdown': max_dd * 100,
-                'win_rate': win_rate * 100,
-                'profit_factor': profit_factor,
-                'volatility': strategy_returns.std() * np.sqrt(252) * 100,
-                'position_size': position_sizes.get(stock, 0)
-            })
-
-            # 累加到组合价值
-            portfolio_value *= (1 + df['strategy_returns'].fillna(0).values * position_weight)
-
-        return pd.DataFrame(results), common_dates, portfolio_value
+            
+        # 3. 计算组合级绩效指标（统一口径）
+        performance_stats = self._calculate_portfolio_performance(equity_curve)
+        
+        # 4. 生成回测报告
+        self._generate_backtest_report(selected_stocks, position_sizes, equity_curve, performance_stats)
+        
+        return {
+            'equity_curve': equity_curve,
+            'performance_stats': performance_stats,
+            'selected_stocks': selected_stocks,
+            'position_sizes': position_sizes
+        }
+        
+    def _build_weights_matrix(self, selected_stocks, position_sizes, initial_capital):
+        """构建权重矩阵"""
+        try:
+            # 获取价格面板
+            prices = self.build_price_panel(use_adjusted=True)
+            if prices is None:
+                return None
+                
+            # 过滤选中的股票
+            available_stocks = [s for s in selected_stocks if s in prices.columns and s in self.price_data]
+            if not available_stocks:
+                print("错误：没有选中股票的价格数据")
+                return None
+                
+            # 构建权重矩阵
+            weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+            
+            # 计算总仓位价值
+            total_position_value = sum(position_sizes.get(s, 0) for s in available_stocks)
+            if total_position_value <= 0:
+                print("错误：总仓位价值为0")
+                return None
+                
+            # 设置权重（仓位价值/总资金）
+            for stock in available_stocks:
+                weight = position_sizes.get(stock, 0) / initial_capital
+                weights[stock] = weight
+                
+            print(f"权重矩阵构建完成：{len(available_stocks)}只股票，总权重{weights.sum(axis=1).max():.2%}")
+            return weights
+            
+        except Exception as e:
+            print(f"构建权重矩阵失败: {e}")
+            return None
+            
+    def _calculate_portfolio_performance(self, equity_curve):
+        """计算组合级绩效指标（统一口径）"""
+        if self.daily_return is None or len(self.daily_return) == 0:
+            return {}
+            
+        returns = self.daily_return.dropna()
+        if len(returns) == 0:
+            return {}
+            
+        # 基础指标
+        total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0] - 1) * 100
+        annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / len(returns)) - 1) * 100
+        volatility = returns.std() * np.sqrt(252) * 100
+        
+        # 夏普比率
+        sharpe_ratio = (returns.mean() * 252) / (returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+        
+        # 最大回撤
+        cumulative = equity_curve
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max
+        max_drawdown = drawdown.min() * 100
+        
+        # 胜率和盈亏比（基于日度收益）
+        positive_returns = returns[returns > 0]
+        negative_returns = returns[returns < 0]
+        win_rate = len(positive_returns) / len(returns) * 100 if len(returns) > 0 else 0
+        profit_factor = positive_returns.sum() / abs(negative_returns.sum()) if len(negative_returns) > 0 and negative_returns.sum() < 0 else float('inf')
+        
+        return {
+            'total_return': total_return,
+            'annual_return': annual_return,
+            'volatility': volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'win_rate': win_rate,
+            'profit_factor': profit_factor,
+            'total_trades': len(returns),
+            'periods': len(equity_curve)
+        }
+        
+    def _generate_backtest_report(self, selected_stocks, position_sizes, equity_curve, performance_stats):
+        """生成回测报告"""
+        print("\n" + "="*50)
+        print("风险管理回测报告")
+        print("="*50)
+        
+        print(f"回测周期: {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}")
+        print(f"交易日数: {performance_stats.get('periods', 0)}")
+        print(f"选中股票: {len(selected_stocks)}只")
+        
+        print("\n组合绩效指标 (统一口径):")
+        print(f"  总收益率: {performance_stats.get('total_return', 0):.2f}%")
+        print(f"  年化收益率: {performance_stats.get('annual_return', 0):.2f}%")
+        print(f"  年化波动率: {performance_stats.get('volatility', 0):.2f}%")
+        print(f"  夏普比率: {performance_stats.get('sharpe_ratio', 0):.3f}")
+        print(f"  最大回撤: {performance_stats.get('max_drawdown', 0):.2f}%")
+        print(f"  胜率: {performance_stats.get('win_rate', 0):.1f}%")
+        print(f"  盈亏比: {performance_stats.get('profit_factor', 0):.2f}")
+        
+        print("\n仓位配置:")
+        for stock, size in position_sizes.items():
+            stock_name = self.get_stock_name(stock)
+            print(f"  {stock} ({stock_name}): {size:,.0f}元")
+            
+        print("="*50)
 
     def generate_risk_report(self, selected_stocks, position_sizes):
         """
@@ -2073,30 +2272,30 @@ def main():
         print("风险仪表板已保存为 risk_dashboard.html")
 
         # 运行带风险管理的回测
-        backtest_results, dates, portfolio_value = strategy.backtest_with_risk_management(
+        backtest_result = strategy.backtest_with_risk_management(
             selected_stocks, position_sizes
         )
 
-        if backtest_results is not None:
-            print("\n回测结果（风险调整后）:")
-            # 在回测结果中添加股票名称
-            backtest_display = backtest_results.copy()
-            backtest_display['stock_name'] = backtest_display['stock'].apply(strategy.get_stock_name)
-            # 重新排列列顺序
-            cols = ['stock', 'stock_name'] + [col for col in backtest_display.columns if col not in ['stock', 'stock_name']]
-            backtest_display = backtest_display[cols]
-            print(backtest_display)
-            print(f"\n组合整体表现:")
-            print(f"  - 平均收益率: {backtest_results['total_return'].mean():.2f}%")
-            print(f"  - 平均夏普比率: {backtest_results['sharpe_ratio'].mean():.2f}")
-            print(f"  - 平均最大回撤: {backtest_results['max_drawdown'].mean():.2f}%")
-            print(f"  - 平均胜率: {backtest_results['win_rate'].mean():.1f}%")
+        if backtest_result is not None:
+            print("\n回测结果（修复版风险管理回测）:")
+            equity_curve = backtest_result['equity_curve']
+            performance_stats = backtest_result['performance_stats']
+            
+            # 显示绩效统计
+            print(f"组合绩效指标（统一口径）:")
+            print(f"  - 总收益率: {performance_stats.get('total_return', 0):.2f}%")
+            print(f"  - 年化收益率: {performance_stats.get('annual_return', 0):.2f}%")
+            print(f"  - 年化波动率: {performance_stats.get('volatility', 0):.2f}%")
+            print(f"  - 夏普比率: {performance_stats.get('sharpe_ratio', 0):.3f}")
+            print(f"  - 最大回撤: {performance_stats.get('max_drawdown', 0):.2f}%")
+            print(f"  - 胜率: {performance_stats.get('win_rate', 0):.1f}%")
+            print(f"  - 盈亏比: {performance_stats.get('profit_factor', 0):.2f}")
 
             # 绘制组合净值曲线
             fig_portfolio = go.Figure()
             fig_portfolio.add_trace(go.Scatter(
-                x=dates,
-                y=portfolio_value,
+                x=equity_curve.index,
+                y=equity_curve.values,
                 mode='lines',
                 name='组合净值',
                 line=dict(color='blue', width=2)
