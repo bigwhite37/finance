@@ -71,6 +71,15 @@ class RiskSensitiveTrendStrategy:
         self.transaction_cost = 0.003      # 双边交易成本（0.3%）
         self.slippage_bps = 5              # 滑点（5个基点）
 
+        # ST股票缓存
+        self._st_stocks_cache = {}
+        self._st_cache_date = None
+        self._st_api_failed = False  # 标记API是否已失败，避免重复尝试
+        
+        # 流动性过滤参数
+        self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
+        self.max_suspend_days_60d = 10     # 60日内最大停牌天数
+        
         # 初始化qlib
         self._init_qlib()
 
@@ -225,6 +234,95 @@ class RiskSensitiveTrendStrategy:
         # 兜底：返回原始代码
         return stock_code
 
+    def _fetch_st_stocks_list(self) -> set:
+        """
+        获取当前ST/风险警示股票名单
+        使用AkShare API而非字符串判断，增强错误处理
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # 检查缓存
+        if self._st_cache_date == today and self._st_stocks_cache:
+            return self._st_stocks_cache
+            
+        # 如果API已标记为失败，直接返回空集合避免重复尝试
+        if self._st_api_failed:
+            return set()
+            
+        st_stocks = set()
+        
+        # 方法1：尝试获取风险警示板块股票（静默失败避免过多错误信息）
+        try:
+            import time
+            time.sleep(0.1)  # 简单的API限流
+            risk_warning_stocks = ak.stock_board_concept_cons_em(symbol="风险警示")
+            if risk_warning_stocks is not None and not risk_warning_stocks.empty and '代码' in risk_warning_stocks.columns:
+                codes = risk_warning_stocks['代码'].astype(str).str.zfill(6)
+                if len(codes) > 0:
+                    st_stocks.update(codes.tolist())
+                    print(f"通过风险警示板块获取到{len(codes)}只ST股票")
+        except Exception as e:
+            # 静默处理，避免过多错误日志
+            pass
+            
+        # 方法2：通过股票名称匹配ST（更鲁棒的实现）
+        try:
+            import time
+            time.sleep(0.1)  # 简单的API限流
+            all_stocks = ak.stock_info_a_code_name()
+            if all_stocks is not None and not all_stocks.empty and '名称' in all_stocks.columns and '代码' in all_stocks.columns:
+                # 查找名称包含ST的股票
+                name_col = all_stocks['名称']
+                st_mask = name_col.str.contains('ST|\\*ST|S\\*ST', na=False, regex=True)
+                if st_mask.any():
+                    st_names = all_stocks[st_mask]
+                    codes = st_names['代码'].astype(str).str.zfill(6)
+                    if len(codes) > 0:
+                        new_st_count = len(codes)
+                        st_stocks.update(codes.tolist())
+                        print(f"通过名称匹配新增{new_st_count}只ST股票")
+        except Exception as e:
+            # 静默处理，避免过多错误日志
+            pass
+            
+        # 如果两种方法都失败，标记API失败避免重复尝试
+        if len(st_stocks) == 0:
+            self._st_api_failed = True
+            print("ST股票API获取失败，后续将使用保守策略（不区分ST股票）")
+        else:
+            print(f"成功识别{len(st_stocks)}只ST/风险警示股票")
+            
+        # 更新缓存
+        self._st_stocks_cache = st_stocks
+        self._st_cache_date = today
+            
+        return st_stocks
+        
+    def _is_st_stock(self, stock_code: str) -> bool:
+        """
+        判断是否为ST股票（带后备机制）
+        
+        Parameters:
+        -----------
+        stock_code : str
+            股票代码（6位数字格式）
+        """
+        # 规范化代码为6位数字
+        numeric_code = stock_code
+        if len(stock_code) > 6:
+            numeric_code = stock_code[2:] if stock_code[:2] in ('SH', 'SZ', 'BJ') else stock_code
+        numeric_code = str(numeric_code).zfill(6)
+        
+        # 首先尝试API方法
+        st_stocks = self._fetch_st_stocks_list()
+        if len(st_stocks) > 0:
+            return numeric_code in st_stocks
+        
+        # 如果API失败，返回False（保守处理）
+        # 在交易约束层面，将ST股票当作普通股票处理，虽然不够精确，
+        # 但避免了API调用失败导致的程序中断
+        return False
+
     def get_all_available_stocks(self):
         """
         从qlib数据中获取所有在指定日期范围内有数据的股票
@@ -375,10 +473,10 @@ class RiskSensitiveTrendStrategy:
         batch_filtered = []
         batch_codes = [self._normalize_instrument(code) for code in batch]
 
-        # 批量获取数据
+        # 批量获取数据（增加成交额字段用于流动性过滤）
         batch_data = D.features(
             instruments=batch_codes,
-            fields=['$close', '$volume'],
+            fields=['$close', '$volume', '$amount'],  # 添加成交额
             start_time=start_date_qlib,
             end_time=end_date_qlib,
             freq='day',
@@ -414,10 +512,26 @@ class RiskSensitiveTrendStrategy:
             if len(stock_data) < 10:  # 降低数据量要求
                 return False
 
-            # 去除停牌股票（连续多日无成交）
+            # 增强流动性过滤
             if 'volume' in stock_data.columns:
+                # 1. 基础流动性：最近5天有成交
                 recent_volume = stock_data['volume'].iloc[-5:].sum()
                 if recent_volume <= 0:  # 最近5天无成交
+                    return False
+                    
+                # 2. 停牌天数过滤：60日内停牌天数不超过阈值
+                volume_60d = stock_data['volume'].iloc[-60:] if len(stock_data) >= 60 else stock_data['volume']
+                suspend_days = (volume_60d <= 0).sum()
+                if suspend_days > self.max_suspend_days_60d:
+                    return False
+                    
+            # 3. 日均成交额过滤：ADV20要求
+            if 'amount' in stock_data.columns and len(stock_data) >= 20:
+                # amount是成交额，单位通常是万元，需要转换为元
+                amount_20d = stock_data['amount'].iloc[-20:]
+                # 假设amount单位是万元，转换为元进行比较
+                avg_amount = amount_20d.mean() * 10000  # 万元转元
+                if avg_amount < self.min_adv_20d:
                     return False
 
             # 去除价格异常股票
@@ -428,8 +542,8 @@ class RiskSensitiveTrendStrategy:
                 if recent_prices.iloc[-1] < 1:  # 股价过低
                     return False
 
-            # 去除ST股票（简单规则）
-            if stock_code.startswith(('ST', '*ST', 'S*ST')):
+            # 去除ST股票（使用API识别）
+            if self._is_st_stock(stock_code):
                 return False
 
             return True
@@ -437,18 +551,32 @@ class RiskSensitiveTrendStrategy:
         except Exception:
             return False
 
-    def _get_price_limits(self, yesterday_close, is_st=False):
+    def _get_price_limits(self, yesterday_close, stock_code=None, is_st=None):
         """
-        计算涨跌停价格限制
+        计算涨跌停价格限制（增强版：自动识别股票类型）
 
         Parameters:
         -----------
         yesterday_close : float
             昨日收盘价
-        is_st : bool
-            是否为ST股票
+        stock_code : str, optional
+            股票代码，用于自动判断类型
+        is_st : bool, optional
+            是否为ST股票，如果提供则直接使用
         """
-        limit_pct = self.st_limit_pct if is_st else self.price_limit_pct
+        if is_st is None and stock_code is not None:
+            is_st = self._is_st_stock(stock_code)
+            
+        # 判断股票类型并设置限价幅度
+        if stock_code and stock_code.startswith('BJ'):
+            limit_pct = self.bj_limit_pct  # 北交所30%
+        elif is_st:
+            limit_pct = self.st_limit_pct  # ST股5%
+        elif stock_code and any(prefix in stock_code for prefix in ['68']):  # 科创板
+            limit_pct = 0.20  # 科创板20%
+        else:
+            limit_pct = self.price_limit_pct  # 普通股10%
+            
         upper_limit = yesterday_close * (1 + limit_pct)
         lower_limit = yesterday_close * (1 - limit_pct)
         return upper_limit, lower_limit
@@ -470,7 +598,7 @@ class RiskSensitiveTrendStrategy:
         is_buy : bool
             是否为买单
         """
-        upper_limit, lower_limit = self._get_price_limits(yesterday_close, is_st)
+        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=None, is_st=is_st)
 
         # 检查价格是否触及涨跌停
         if is_buy:
@@ -528,7 +656,7 @@ class RiskSensitiveTrendStrategy:
         theoretical_stop = current_price - (atr * self.atr_multiplier)
 
         # 考虑跌停限制
-        upper_limit, lower_limit = self._get_price_limits(yesterday_close, is_st)
+        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=None, is_st=is_st)
 
         # 如果理论止损低于跌停价，实际止损就是跌停价
         if theoretical_stop < lower_limit:
@@ -925,9 +1053,13 @@ class RiskSensitiveTrendStrategy:
             stock_prev = prev_close[stock]
             
             # 判断股票类型（北交所、ST股、普通股）
+            # 提取股票代码（去掉SH/SZ前缀）
+            stock_code = stock.replace('SH', '').replace('SZ', '') if len(stock) > 6 else stock
+            is_st = self._is_st_stock(stock_code)
+            
             if stock.startswith('BJ'):
                 limit_pct = self.bj_limit_pct  # 北交所30%
-            elif any(prefix in stock for prefix in ['ST', '*ST', 'S*ST']):
+            elif is_st:
                 limit_pct = self.st_limit_pct  # ST股5%  
             else:
                 limit_pct = self.price_limit_pct  # 普通股10%
@@ -1093,10 +1225,13 @@ class RiskSensitiveTrendStrategy:
         if 'returns' in df.columns and len(df[:eval_point+1]) > 10:
             rolling_returns = df['returns'].iloc[:eval_point+1].dropna()
             if len(rolling_returns) > 0:
-                # 使用滚动窗口计算夏普比率
+                # 使用滚动窗口计算夏普比率（统一口径：超额收益）
                 window_returns = rolling_returns.iloc[-min(available_length, len(rolling_returns)):]
                 if len(window_returns) > 5 and window_returns.std() > 0:
-                    sharpe_ratio = (window_returns.mean() * 252) / (window_returns.std() * np.sqrt(252))
+                    # 统一使用2.5%无风险利率
+                    daily_rf_rate = 0.025 / 252
+                    excess_returns = window_returns - daily_rf_rate
+                    sharpe_ratio = (excess_returns.mean() * 252) / (window_returns.std() * np.sqrt(252))
                 else:
                     sharpe_ratio = 0
             else:
@@ -1652,7 +1787,7 @@ class RiskSensitiveTrendStrategy:
                 trailing_stop = df['close'].iloc[-20:].max() * 0.92 if len(df) >= 20 else current_price * 0.92
 
                 # 涨跌停限制
-                upper_limit, lower_limit = self._get_price_limits(yesterday_close, is_st)
+                upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=None, is_st=is_st)
 
                 # 取最合理的止损位（不一定是最高的）
                 # 优先级：支撑位 > ATR止损 > 移动止损，但不能低于跌停价
@@ -2024,7 +2159,15 @@ class RiskSensitiveTrendStrategy:
             return None
             
     def _calculate_portfolio_performance(self, equity_curve):
-        """计算组合级绩效指标（统一口径）"""
+        """
+        计算组合级绩效指标（统一口径）
+        
+        统一计算标准：
+        - 夏普比率：日频超额均值 × √252 / 日频波动率（fix.md推荐）
+        - 年化收益：几何年化（按净值序列复合）
+        - 无风险利率：2.5%（当前中国1年期国债收益率）
+        - 统一使用同一价格口径（复权价格）
+        """
         if self.daily_return is None or len(self.daily_return) == 0:
             return {}
             
@@ -2034,11 +2177,21 @@ class RiskSensitiveTrendStrategy:
             
         # 基础指标
         total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0] - 1) * 100
-        annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / len(returns)) - 1) * 100
+        # 使用几何年化（复合收益）
+        periods = len(returns)
+        annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / periods) - 1) * 100
         volatility = returns.std() * np.sqrt(252) * 100
         
-        # 夏普比率
-        sharpe_ratio = (returns.mean() * 252) / (returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+        # 夏普比率（统一口径：日频超额均值 × √252 / 日频波动率）
+        # 假设无风险利率为2.5%（当前中国1年期国债收益率）
+        risk_free_rate = 0.025
+        daily_rf_rate = risk_free_rate / 252
+        excess_returns = returns - daily_rf_rate
+        
+        if returns.std() > 0:
+            sharpe_ratio = (excess_returns.mean() * 252) / (returns.std() * np.sqrt(252))
+        else:
+            sharpe_ratio = 0
         
         # 最大回撤
         cumulative = equity_curve
