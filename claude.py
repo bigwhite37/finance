@@ -63,6 +63,11 @@ class RiskSensitiveTrendStrategy:
         self.risk_per_trade = 0.02         # 每笔交易风险2%
         self.max_correlation = 0.7         # 最大相关性阈值
 
+        # 回撤门控参数（基于指数）
+        self.drawdown_lookback = 252            # 回撤观测窗口（默认1年，单位：交易日）
+        self.drawdown_risk_off_scale = 0.0      # 风险关闭时的仓位缩放（0=清仓，可设为0.3等）
+        self._risk_regime_df = None             # 预计算的风险门控表：drawdown / risk_on
+
         # A股交易制度参数
         self.t_plus_1 = True               # T+1交易制度
         self.price_limit_pct = 0.10        # 沪深涨跌停幅度（10%）
@@ -173,6 +178,111 @@ class RiskSensitiveTrendStrategy:
             idx = idx.set_index("date")
         keep = [c for c in ["open", "high", "low", "close", "volume"] if c in idx.columns]
         return idx[keep]
+
+    def _build_risk_regime(self):
+        """
+        基于上证指数构建回撤门控：
+        - 以收盘价的历史峰值计算回撤序列
+        - 当回撤不超过阈值（例如15%）→ risk_on=True，否则 False
+        """
+        try:
+            idx = self._fetch_sh_index_df()
+            if idx is None or idx.empty or 'close' not in idx.columns:
+                # 若无法获取指数数据，则默认全程 risk_on
+                self._risk_regime_df = pd.DataFrame({'risk_on': []})
+                return
+
+            close = idx['close'].astype(float).dropna()
+            # 可选：仅在观测窗口内做局部峰值；默认用全局峰值
+            rolling_peak = close.cummax()
+            dd = (close / rolling_peak) - 1.0
+            df = pd.DataFrame({'drawdown': dd})
+            df['risk_on'] = df['drawdown'].ge(-float(self.max_drawdown_threshold))
+            self._risk_regime_df = df
+        except Exception:
+            # 兜底：任何异常均视为不启用门控
+            self._risk_regime_df = pd.DataFrame({'risk_on': []})
+
+    def is_risk_on(self, date_str: str) -> bool:
+        """
+        查询某交易日是否处于 risk-on 状态；若无该日（节假日），向前寻找最近一个交易日。
+        输入日期可为 'YYYYMMDD' 或 'YYYY-MM-DD'。
+        """
+        if self._risk_regime_df is None:
+            self._build_risk_regime()
+        if self._risk_regime_df is None or self._risk_regime_df.empty:
+            return True
+
+        s = str(date_str).replace('-', '')
+        if len(s) >= 8:
+            ts = pd.to_datetime(f"{s[:4]}-{s[4:6]}-{s[6:8]}")
+        else:
+            ts = pd.to_datetime(date_str)
+
+        idx = self._risk_regime_df.index
+        if ts in idx:
+            return bool(self._risk_regime_df.loc[ts, 'risk_on'])
+
+        # 找到不超过 ts 的最近日期
+        pos = idx.searchsorted(ts, side='right') - 1
+        if pos >= 0:
+            return bool(self._risk_regime_df.iloc[pos]['risk_on'])
+        # 若在最左侧之前，视为 risk_on（保守）
+        return True
+
+    def scale_weights_by_drawdown(self, weights):
+        """
+        对按“日期索引”的权重序列/权重矩阵执行回撤门控缩放：
+        - 当 risk_on=True → 权重不变
+        - 当 risk_on=False → 权重乘以 drawdown_risk_off_scale
+
+        参数
+        ----
+        weights : pandas.Series 或 pandas.DataFrame
+            index 为日期（DatetimeIndex 或能被 to_datetime 解析）。
+        返回
+        ----
+        与输入同类型的对象，按日缩放后的权重。
+        """
+        if weights is None:
+            return None
+        if self._risk_regime_df is None:
+            self._build_risk_regime()
+        if self._risk_regime_df is None or self._risk_regime_df.empty:
+            return weights
+
+        # 统一日期索引
+        w = weights.copy()
+        if not isinstance(w.index, pd.DatetimeIndex):
+            w.index = pd.to_datetime(w.index)
+
+        gate = self._risk_regime_df['risk_on'].astype(int)
+        gate = gate.reindex(w.index).fillna(method='ffill').fillna(1).astype(int)
+        # 1 → 保持；0 → 乘以 off_scale
+        scale = gate + (1 - gate) * float(self.drawdown_risk_off_scale)
+        if isinstance(w, pd.Series):
+            return w.mul(scale)
+        else:
+            return w.mul(scale, axis=0)
+
+    def analyze_portfolio_drawdown(self, daily_returns: pd.Series) -> dict:
+        """
+        对组合日收益率进行回撤分析，返回与 Qlib 报告口径一致的核心指标。
+        返回字段：
+        - max_drawdown: float，最大回撤（负数）
+        - nav_end: float，期末净值
+        """
+        if daily_returns is None or len(daily_returns) == 0:
+            return {'max_drawdown': 0.0, 'nav_end': 1.0}
+        ret = pd.Series(daily_returns).astype(float).fillna(0.0)
+        # 允许索引不是日期；不强制转换
+        nav = (1.0 + ret).cumprod()
+        peak = nav.cummax()
+        drawdown = nav / peak - 1.0
+        return {
+            'max_drawdown': float(drawdown.min()),
+            'nav_end': float(nav.iloc[-1])
+        }
 
     def get_stock_name(self, stock_code: str) -> str:
         """使用akshare获取股票名称（兼容 SH/SZ/BJ 前缀与北证）"""
@@ -2103,6 +2213,9 @@ class RiskSensitiveTrendStrategy:
         weights = self._build_weights_matrix(selected_stocks, position_sizes, initial_capital)
         if weights is None:
             return None
+
+        # 基于指数回撤进行仓位门控缩放（risk_on 保持，risk_off 乘以 drawdown_risk_off_scale）
+        weights = self.scale_weights_by_drawdown(weights)
 
         # 2. 使用修复版回测引擎
         equity_curve = self.backtest_equity_curve(weights=weights, use_adjusted=True, min_live_stocks=2)
