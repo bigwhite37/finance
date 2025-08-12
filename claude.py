@@ -75,11 +75,11 @@ class RiskSensitiveTrendStrategy:
         self._st_stocks_cache = {}
         self._st_cache_date = None
         self._st_api_failed = False  # 标记API是否已失败，避免重复尝试
-        
+
         # 流动性过滤参数
         self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
         self.max_suspend_days_60d = 10     # 60日内最大停牌天数
-        
+
         # 初始化qlib
         self._init_qlib()
 
@@ -240,17 +240,17 @@ class RiskSensitiveTrendStrategy:
         使用AkShare API而非字符串判断，增强错误处理
         """
         today = datetime.now().strftime('%Y-%m-%d')
-        
+
         # 检查缓存
         if self._st_cache_date == today and self._st_stocks_cache:
             return self._st_stocks_cache
-            
+
         # 如果API已标记为失败，直接返回空集合避免重复尝试
         if self._st_api_failed:
             return set()
-            
+
         st_stocks = set()
-        
+
         # 方法1：尝试获取风险警示板块股票（静默失败避免过多错误信息）
         try:
             import time
@@ -264,7 +264,7 @@ class RiskSensitiveTrendStrategy:
         except Exception as e:
             # 静默处理，避免过多错误日志
             pass
-            
+
         # 方法2：通过股票名称匹配ST（更鲁棒的实现）
         try:
             import time
@@ -284,24 +284,24 @@ class RiskSensitiveTrendStrategy:
         except Exception as e:
             # 静默处理，避免过多错误日志
             pass
-            
+
         # 如果两种方法都失败，标记API失败避免重复尝试
         if len(st_stocks) == 0:
             self._st_api_failed = True
             print("ST股票API获取失败，后续将使用保守策略（不区分ST股票）")
         else:
             print(f"成功识别{len(st_stocks)}只ST/风险警示股票")
-            
+
         # 更新缓存
         self._st_stocks_cache = st_stocks
         self._st_cache_date = today
-            
+
         return st_stocks
-        
+
     def _is_st_stock(self, stock_code: str) -> bool:
         """
         判断是否为ST股票（带后备机制）
-        
+
         Parameters:
         -----------
         stock_code : str
@@ -312,12 +312,12 @@ class RiskSensitiveTrendStrategy:
         if len(stock_code) > 6:
             numeric_code = stock_code[2:] if stock_code[:2] in ('SH', 'SZ', 'BJ') else stock_code
         numeric_code = str(numeric_code).zfill(6)
-        
+
         # 首先尝试API方法
         st_stocks = self._fetch_st_stocks_list()
         if len(st_stocks) > 0:
             return numeric_code in st_stocks
-        
+
         # 如果API失败，返回False（保守处理）
         # 在交易约束层面，将ST股票当作普通股票处理，虽然不够精确，
         # 但避免了API调用失败导致的程序中断
@@ -518,13 +518,13 @@ class RiskSensitiveTrendStrategy:
                 recent_volume = stock_data['volume'].iloc[-5:].sum()
                 if recent_volume <= 0:  # 最近5天无成交
                     return False
-                    
+
                 # 2. 停牌天数过滤：60日内停牌天数不超过阈值
                 volume_60d = stock_data['volume'].iloc[-60:] if len(stock_data) >= 60 else stock_data['volume']
                 suspend_days = (volume_60d <= 0).sum()
                 if suspend_days > self.max_suspend_days_60d:
                     return False
-                    
+
             # 3. 日均成交额过滤：ADV20要求
             if 'amount' in stock_data.columns and len(stock_data) >= 20:
                 # amount是成交额，单位通常是万元，需要转换为元
@@ -566,7 +566,7 @@ class RiskSensitiveTrendStrategy:
         """
         if is_st is None and stock_code is not None:
             is_st = self._is_st_stock(stock_code)
-            
+
         # 判断股票类型并设置限价幅度
         if stock_code and stock_code.startswith('BJ'):
             limit_pct = self.bj_limit_pct  # 北交所30%
@@ -576,7 +576,7 @@ class RiskSensitiveTrendStrategy:
             limit_pct = 0.20  # 科创板20%
         else:
             limit_pct = self.price_limit_pct  # 普通股10%
-            
+
         upper_limit = yesterday_close * (1 + limit_pct)
         lower_limit = yesterday_close * (1 - limit_pct)
         return upper_limit, lower_limit
@@ -960,13 +960,13 @@ class RiskSensitiveTrendStrategy:
 
         # 1. 构建有效性掩码（关键：保持NaN而非填充0）
         valid = prices.notna() & prices.shift(1).notna()
-        
+
         # 2. 计算日收益（保持NaN）
         rets = (prices / prices.shift(1) - 1).where(valid)
-        
+
         # 3. 构建可交易性掩码（涨跌停/停牌过滤）
         tradable_mask = self._build_tradable_mask(prices, valid)
-        
+
         # 4. 对齐并准备权重
         if weights is None:
             # 当日可交易标的等权归一
@@ -984,7 +984,7 @@ class RiskSensitiveTrendStrategy:
         # 5. A股T+1：权重次日生效
         if self.t_plus_1:
             w = w.shift(1).fillna(0.0)
-            
+
         # 6. 找到首个活跃日（当日可交易标的数≥阈值）
         live_stocks_count = w.sum(axis=1)
         first_active_idx = (live_stocks_count >= min_live_stocks).idxmax()
@@ -993,34 +993,34 @@ class RiskSensitiveTrendStrategy:
             first_active_idx = w.index[0]
         else:
             print(f"回测起点自动对齐到首个活跃日: {first_active_idx}（可交易标的数≥{min_live_stocks}）")
-            
+
         # 7. 从活跃日开始计算组合收益
         active_slice = slice(first_active_idx, None)
         w_active = w.loc[active_slice]
         rets_active = rets.loc[active_slice]
-        
+
         # 8. 组合日收益（只在有效收益上聚合）
         port_ret = (w_active * rets_active).sum(axis=1, skipna=True)
-        
+
         # 9. 交易成本
         turnover = w_active.diff().abs().sum(axis=1).fillna(0.0)
         port_ret_net = port_ret - turnover * self.transaction_cost
-        
+
         # 10. 处理NaN：若当日无任何有效标的→延续前值而非强制0
         valid_ret_mask = port_ret_net.notna()
         if not valid_ret_mask.all():
             print(f"发现{(~valid_ret_mask).sum()}个无效收益日，将延续前值")
             port_ret_net = port_ret_net.ffill()
-            
+
         # 11. 累计净值
         equity = (1.0 + port_ret_net.fillna(0.0)).cumprod()
-        
+
         # 12. 诊断信息
         nonzero_w_days = int((w_active.abs().sum(axis=1) > 1e-12).sum())
         nonzero_ret_days = int((rets_active.abs().sum(axis=1, skipna=True) > 1e-12).sum())
         print(f"[诊断] 活跃权重日={nonzero_w_days}, 有效收益日={nonzero_ret_days}, 回测周期={len(equity)}")
         print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f}")
-        
+
         # 暴露给外部
         self.daily_return = port_ret_net
         self.equity_curve = equity
@@ -1029,14 +1029,14 @@ class RiskSensitiveTrendStrategy:
     def _build_tradable_mask(self, prices: pd.DataFrame, valid: pd.DataFrame) -> pd.DataFrame:
         """
         构建可交易性掩码，处理涨跌停、停牌等不可交易情况
-        
+
         Parameters:
         -----------
         prices : pd.DataFrame
             价格面板
-        valid : pd.DataFrame  
+        valid : pd.DataFrame
             基础有效性掩码
-            
+
         Returns:
         --------
         pd.DataFrame
@@ -1044,38 +1044,38 @@ class RiskSensitiveTrendStrategy:
         """
         # 基础掩码：必须有有效价格
         tradable = valid.copy()
-        
+
         # 涨跌停掩码：检查是否触及价格限制
         prev_close = prices.shift(1)
-        
+
         for stock in prices.columns:
             stock_prices = prices[stock]
             stock_prev = prev_close[stock]
-            
+
             # 判断股票类型（北交所、ST股、普通股）
             # 提取股票代码（去掉SH/SZ前缀）
             stock_code = stock.replace('SH', '').replace('SZ', '') if len(stock) > 6 else stock
             is_st = self._is_st_stock(stock_code)
-            
+
             if stock.startswith('BJ'):
                 limit_pct = self.bj_limit_pct  # 北交所30%
             elif is_st:
-                limit_pct = self.st_limit_pct  # ST股5%  
+                limit_pct = self.st_limit_pct  # ST股5%
             else:
                 limit_pct = self.price_limit_pct  # 普通股10%
-                
+
             # 计算涨跌停价格
             upper_limit = stock_prev * (1 + limit_pct)
             lower_limit = stock_prev * (1 - limit_pct)
-            
+
             # 触及涨跌停的不可交易（买不到/卖不出）
             # 注意：这里简化处理，实际中可能需要更精细的流动性判断
             limit_hit = (stock_prices >= upper_limit * 0.999) | (stock_prices <= lower_limit * 1.001)
             tradable[stock] = tradable[stock] & ~limit_hit
-            
+
         # 成交量过滤：过滤流动性不足的标的
         # 这里简化处理，实际可以加入成交量/换手率判断
-        
+
         return tradable.fillna(False)
 
     def calculate_ma_signals(self, df, short_window=20, long_window=60):
@@ -2083,7 +2083,7 @@ class RiskSensitiveTrendStrategy:
     def backtest_with_risk_management(self, selected_stocks, position_sizes, initial_capital=100000):
         """
         修复版带风险管理的回测，使用新的回测框架
-        
+
         Parameters:
         -----------
         selected_stocks : list
@@ -2098,31 +2098,31 @@ class RiskSensitiveTrendStrategy:
             return None
 
         print(f"开始风险管理回测：{len(selected_stocks)}只股票，初始资金{initial_capital:,.0f}元")
-        
+
         # 1. 构建权重矩阵（基于position_sizes）
         weights = self._build_weights_matrix(selected_stocks, position_sizes, initial_capital)
         if weights is None:
             return None
-            
+
         # 2. 使用修复版回测引擎
         equity_curve = self.backtest_equity_curve(weights=weights, use_adjusted=True, min_live_stocks=2)
         if equity_curve is None or equity_curve.empty:
             print("回测失败：无法生成净值曲线")
             return None
-            
+
         # 3. 计算组合级绩效指标（统一口径）
         performance_stats = self._calculate_portfolio_performance(equity_curve)
-        
+
         # 4. 生成回测报告
         self._generate_backtest_report(selected_stocks, position_sizes, equity_curve, performance_stats)
-        
+
         return {
             'equity_curve': equity_curve,
             'performance_stats': performance_stats,
             'selected_stocks': selected_stocks,
             'position_sizes': position_sizes
         }
-        
+
     def _build_weights_matrix(self, selected_stocks, position_sizes, initial_capital):
         """构建权重矩阵"""
         try:
@@ -2130,38 +2130,38 @@ class RiskSensitiveTrendStrategy:
             prices = self.build_price_panel(use_adjusted=True)
             if prices is None:
                 return None
-                
+
             # 过滤选中的股票
             available_stocks = [s for s in selected_stocks if s in prices.columns and s in self.price_data]
             if not available_stocks:
                 print("错误：没有选中股票的价格数据")
                 return None
-                
+
             # 构建权重矩阵
             weights = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
-            
+
             # 计算总仓位价值
             total_position_value = sum(position_sizes.get(s, 0) for s in available_stocks)
             if total_position_value <= 0:
                 print("错误：总仓位价值为0")
                 return None
-                
+
             # 设置权重（仓位价值/总资金）
             for stock in available_stocks:
                 weight = position_sizes.get(stock, 0) / initial_capital
                 weights[stock] = weight
-                
+
             print(f"权重矩阵构建完成：{len(available_stocks)}只股票，总权重{weights.sum(axis=1).max():.2%}")
             return weights
-            
+
         except Exception as e:
             print(f"构建权重矩阵失败: {e}")
             return None
-            
+
     def _calculate_portfolio_performance(self, equity_curve):
         """
         计算组合级绩效指标（统一口径）
-        
+
         统一计算标准：
         - 夏普比率：日频超额均值 × √252 / 日频波动率（fix.md推荐）
         - 年化收益：几何年化（按净值序列复合）
@@ -2170,41 +2170,41 @@ class RiskSensitiveTrendStrategy:
         """
         if self.daily_return is None or len(self.daily_return) == 0:
             return {}
-            
+
         returns = self.daily_return.dropna()
         if len(returns) == 0:
             return {}
-            
+
         # 基础指标
         total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0] - 1) * 100
         # 使用几何年化（复合收益）
         periods = len(returns)
         annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / periods) - 1) * 100
         volatility = returns.std() * np.sqrt(252) * 100
-        
+
         # 夏普比率（统一口径：日频超额均值 × √252 / 日频波动率）
         # 假设无风险利率为2.5%（当前中国1年期国债收益率）
         risk_free_rate = 0.025
         daily_rf_rate = risk_free_rate / 252
         excess_returns = returns - daily_rf_rate
-        
+
         if returns.std() > 0:
             sharpe_ratio = (excess_returns.mean() * 252) / (returns.std() * np.sqrt(252))
         else:
             sharpe_ratio = 0
-        
+
         # 最大回撤
         cumulative = equity_curve
         running_max = cumulative.expanding().max()
         drawdown = (cumulative - running_max) / running_max
         max_drawdown = drawdown.min() * 100
-        
+
         # 胜率和盈亏比（基于日度收益）
         positive_returns = returns[returns > 0]
         negative_returns = returns[returns < 0]
         win_rate = len(positive_returns) / len(returns) * 100 if len(returns) > 0 else 0
         profit_factor = positive_returns.sum() / abs(negative_returns.sum()) if len(negative_returns) > 0 and negative_returns.sum() < 0 else float('inf')
-        
+
         return {
             'total_return': total_return,
             'annual_return': annual_return,
@@ -2216,17 +2216,17 @@ class RiskSensitiveTrendStrategy:
             'total_trades': len(returns),
             'periods': len(equity_curve)
         }
-        
+
     def _generate_backtest_report(self, selected_stocks, position_sizes, equity_curve, performance_stats):
         """生成回测报告"""
         print("\n" + "="*50)
         print("风险管理回测报告")
         print("="*50)
-        
+
         print(f"回测周期: {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}")
         print(f"交易日数: {performance_stats.get('periods', 0)}")
         print(f"选中股票: {len(selected_stocks)}只")
-        
+
         print("\n组合绩效指标 (统一口径):")
         print(f"  总收益率: {performance_stats.get('total_return', 0):.2f}%")
         print(f"  年化收益率: {performance_stats.get('annual_return', 0):.2f}%")
@@ -2235,12 +2235,12 @@ class RiskSensitiveTrendStrategy:
         print(f"  最大回撤: {performance_stats.get('max_drawdown', 0):.2f}%")
         print(f"  胜率: {performance_stats.get('win_rate', 0):.1f}%")
         print(f"  盈亏比: {performance_stats.get('profit_factor', 0):.2f}")
-        
+
         print("\n仓位配置:")
         for stock, size in position_sizes.items():
             stock_name = self.get_stock_name(stock)
             print(f"  {stock} ({stock_name}): {size:,.0f}元")
-            
+
         print("="*50)
 
     def generate_risk_report(self, selected_stocks, position_sizes):
@@ -2433,7 +2433,7 @@ def main():
             print("\n回测结果（修复版风险管理回测）:")
             equity_curve = backtest_result['equity_curve']
             performance_stats = backtest_result['performance_stats']
-            
+
             # 显示绩效统计
             print(f"组合绩效指标（统一口径）:")
             print(f"  - 总收益率: {performance_stats.get('total_return', 0):.2f}%")
