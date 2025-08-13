@@ -133,7 +133,7 @@ class RiskSensitiveTrendStrategy:
         try:
             with open(st_file_path, 'r', encoding='utf-8') as f:
                 st_data = json.load(f)
-            
+
             # 提取股票代码
             st_codes = {item['code'] for item in st_data}
             print(f"📋 从本地文件加载了 {len(st_codes)} 只ST股票")
@@ -141,9 +141,9 @@ class RiskSensitiveTrendStrategy:
             if st_codes:
                 sample_names = [item['name'] for item in st_data[:5]]  # 显示前5个
                 print(f"   示例ST股票: {', '.join(sample_names)}")
-            
+
             return st_codes
-            
+
         except FileNotFoundError:
             print(f"⚠️  本地ST股票文件 {st_file_path} 未找到，将不进行ST股票过滤")
             return set()
@@ -432,7 +432,7 @@ class RiskSensitiveTrendStrategy:
     def _is_st_stock(self, stock_code: str) -> bool:
         """
         简化的ST股票判断（基于本地缓存文件）
-        
+
         Parameters:
         -----------
         stock_code : str
@@ -443,7 +443,7 @@ class RiskSensitiveTrendStrategy:
         if len(stock_code) > 6:
             numeric_code = stock_code[2:] if stock_code[:2] in ('SH', 'SZ', 'BJ') else stock_code
         numeric_code = str(numeric_code).zfill(6)
-        
+
         return numeric_code in self._local_st_stocks
 
     def get_all_available_stocks(self):
@@ -1127,7 +1127,7 @@ class RiskSensitiveTrendStrategy:
 
     def create_enhanced_portfolio_dashboard(self, equity_curve, performance_stats, selected_stocks, position_sizes):
         """创建增强版组合分析仪表板"""
-        
+
         # 创建子图布局 - 更多的分析图表
         fig = make_subplots(
             rows=5, cols=2,
@@ -1140,7 +1140,7 @@ class RiskSensitiveTrendStrategy:
             ],
             specs=[
                 [{'secondary_y': True}, {'type': 'heatmap'}],
-                [{'type': 'histogram'}, {'type': 'scatter'}], 
+                [{'type': 'histogram'}, {'type': 'scatter'}],
                 [{'secondary_y': True}, {'type': 'scatterpolar'}],
                 [{'type': 'pie'}, {'type': 'bar'}],
                 [{'type': 'table'}, {'type': 'scatter'}]
@@ -1152,12 +1152,12 @@ class RiskSensitiveTrendStrategy:
 
         # 1. 净值曲线 & 回撤
         daily_returns = self.daily_return if hasattr(self, 'daily_return') and self.daily_return is not None else equity_curve.pct_change().dropna()
-        
+
         # 计算回撤
         nav = equity_curve
         peak = nav.cummax()
         drawdown = (nav / peak - 1) * 100
-        
+
         # 净值曲线
         fig.add_trace(
             go.Scatter(
@@ -1170,7 +1170,7 @@ class RiskSensitiveTrendStrategy:
             ),
             row=1, col=1
         )
-        
+
         # 回撤曲线
         fig.add_trace(
             go.Scatter(
@@ -1193,10 +1193,10 @@ class RiskSensitiveTrendStrategy:
             monthly_df = monthly_returns.to_frame('return')
             monthly_df['year'] = monthly_df.index.year
             monthly_df['month'] = monthly_df.index.month
-            
+
             # 创建透视表
             pivot_table = monthly_df.pivot(index='year', columns='month', values='return')
-            
+
             fig.add_trace(
                 go.Heatmap(
                     z=pivot_table.values,
@@ -1226,7 +1226,7 @@ class RiskSensitiveTrendStrategy:
         if len(daily_returns) > 63:
             rolling_sharpe = daily_returns.rolling(63).mean() / daily_returns.rolling(63).std() * np.sqrt(252)
             rolling_sharpe = rolling_sharpe.dropna()
-            
+
             fig.add_trace(
                 go.Scatter(
                     x=rolling_sharpe.index,
@@ -1238,7 +1238,7 @@ class RiskSensitiveTrendStrategy:
                 ),
                 row=2, col=2
             )
-            
+
             # 添加参考线
             fig.add_hline(y=1.0, line_dash="dash", line_color="red", row=2, col=2)
             fig.add_hline(y=2.0, line_dash="dash", line_color="green", row=2, col=2)
@@ -1246,7 +1246,7 @@ class RiskSensitiveTrendStrategy:
         # 5. 累计收益分解 - 按年份
         yearly_returns = daily_returns.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
         cumulative_yearly = (1 + yearly_returns/100).cumprod()
-        
+
         fig.add_trace(
             go.Scatter(
                 x=yearly_returns.index.year,
@@ -1259,7 +1259,7 @@ class RiskSensitiveTrendStrategy:
             ),
             row=3, col=1
         )
-        
+
         # 年度收益柱状图
         fig.add_trace(
             go.Bar(
@@ -1283,7 +1283,7 @@ class RiskSensitiveTrendStrategy:
             'Sortino': min(max(performance_stats.get('sortino', 0) / 3, 0), 1),
             '信息比率': min(max(performance_stats.get('info_ratio', 0) / 2 + 0.5, 0), 1)
         }
-        
+
         fig.add_trace(
             go.Scatterpolar(
                 r=list(radar_metrics.values()),
@@ -1300,7 +1300,7 @@ class RiskSensitiveTrendStrategy:
             total_position = sum(position_sizes.values())
             weights = [(v/total_position)*100 for v in position_sizes.values()]
             stock_names = [f"{k}<br>{self.get_stock_name(k)}" for k in position_sizes.keys()]
-            
+
             fig.add_trace(
                 go.Pie(
                     labels=stock_names,
@@ -1316,13 +1316,13 @@ class RiskSensitiveTrendStrategy:
             risk_scores = []
             positions = []
             stock_labels = []
-            
+
             for stock in selected_stocks:
                 if stock in self.risk_metrics and stock in position_sizes:
                     risk_scores.append(self.risk_metrics[stock].get('risk_score', 0))
                     positions.append(position_sizes[stock])
                     stock_labels.append(f"{stock}<br>{self.get_stock_name(stock)}")
-            
+
             fig.add_trace(
                 go.Bar(
                     x=stock_labels,
@@ -1348,7 +1348,7 @@ class RiskSensitiveTrendStrategy:
             ]
         else:
             table_data = [['暂无交易统计', '请运行实际交易']]
-        
+
         fig.add_trace(
             go.Table(
                 header=dict(values=['指标', '数值'], fill_color='lightblue'),
@@ -1364,7 +1364,7 @@ class RiskSensitiveTrendStrategy:
             sizes = []
             colors = []
             labels = []
-            
+
             for stock in selected_stocks:
                 if stock in self.risk_metrics:
                     metrics = self.risk_metrics[stock]
@@ -1374,7 +1374,7 @@ class RiskSensitiveTrendStrategy:
                     sizes.append(position_sizes.get(stock, 0) / 10000)  # 规模调整
                     colors.append(100 - metrics.get('risk_score', 50))  # 颜色表示质量
                     labels.append(f"{stock}<br>{self.get_stock_name(stock)}")
-            
+
             fig.add_trace(
                 go.Scatter(
                     x=volatilities,
@@ -1411,114 +1411,114 @@ class RiskSensitiveTrendStrategy:
         fig.update_xaxes(title_text="日期", row=1, col=1)
         fig.update_yaxes(title_text="净值", row=1, col=1)
         fig.update_yaxes(title_text="回撤(%)", secondary_y=True, row=1, col=1)
-        
+
         fig.update_xaxes(title_text="日收益率(%)", row=2, col=1)
         fig.update_yaxes(title_text="频次", row=2, col=1)
-        
+
         fig.update_xaxes(title_text="日期", row=2, col=2)
         fig.update_yaxes(title_text="夏普比率", row=2, col=2)
-        
+
         fig.update_xaxes(title_text="年份", row=3, col=1)
         fig.update_yaxes(title_text="累计收益", row=3, col=1)
         fig.update_yaxes(title_text="年收益率(%)", secondary_y=True, row=3, col=1)
-        
+
         fig.update_xaxes(title_text="波动率(%)", row=5, col=2)
         fig.update_yaxes(title_text="预期收益(%)", row=5, col=2)
-        
+
         return fig
 
     def print_enhanced_metrics_summary(self, equity_curve, performance_stats, selected_stocks, position_sizes):
         """打印增强版分析报告的关键指标摘要到终端"""
-        
+
         print("\n" + "="*100)
         print(" " * 35 + "📊 增强版策略分析报告摘要")
         print("="*100)
-        
+
         # 基本信息
         print(f"\n🗓️  回测周期: {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}")
         print(f"📈 选中股票: {len(selected_stocks)} 只")
         if position_sizes:
             total_position = sum(position_sizes.values())
             print(f"💰 总仓位: ¥{total_position:,.0f}")
-        
+
         # 核心收益指标
         print(f"\n🎯 核心收益指标:")
         print(f"   总收益率          : {performance_stats.get('total_return', 0):>8.2%}")
         print(f"   年化收益率        : {performance_stats.get('annual_return', 0):>8.2%}")
         print(f"   年化波动率        : {performance_stats.get('annual_vol', 0):>8.2%}")
-        
+
         # 风险调整指标 (最重要)
         print(f"\n⚖️  风险调整指标:")
         sharpe = performance_stats.get('sharpe', 0)
         sortino = performance_stats.get('sortino', 0)
         calmar = performance_stats.get('calmar', 0)
-        
+
         sharpe_emoji = "🟢" if sharpe > 1 else "🟡" if sharpe > 0.5 else "🔴"
         sortino_emoji = "🟢" if sortino > 1.5 else "🟡" if sortino > 0.8 else "🔴"
         calmar_emoji = "🟢" if calmar > 2 else "🟡" if calmar > 1 else "🔴"
-        
+
         print(f"   夏普比率          : {sharpe:>8.3f} {sharpe_emoji}")
         print(f"   Sortino比率       : {sortino:>8.3f} {sortino_emoji}")
         print(f"   Calmar比率        : {calmar:>8.3f} {calmar_emoji}")
-        
+
         # 基准比较
         print(f"\n📊 基准比较 (vs 沪深300年化8%):")
         alpha = performance_stats.get('alpha', 0)
         info_ratio = performance_stats.get('info_ratio', 0)
         alpha_emoji = "🟢" if alpha > 0 else "🔴"
         info_emoji = "🟢" if info_ratio > 0.5 else "🟡" if info_ratio > 0 else "🔴"
-        
+
         print(f"   超额收益(Alpha)   : {alpha:>8.2%} {alpha_emoji}")
         print(f"   信息比率          : {info_ratio:>8.3f} {info_emoji}")
         print(f"   跟踪误差          : {performance_stats.get('tracking_error', 0):>8.2%}")
-        
+
         # 回撤分析
         print(f"\n📉 回撤风险:")
         max_dd = performance_stats.get('max_drawdown', 0)
         dd_duration = performance_stats.get('max_dd_duration', 0)
         dd_emoji = "🟢" if max_dd > -0.1 else "🟡" if max_dd > -0.2 else "🔴"
-        
+
         print(f"   最大回撤          : {max_dd:>8.2%} {dd_emoji}")
         print(f"   回撤持续天数      : {dd_duration:>8.0f} 天")
-        
+
         # 胜负统计
         print(f"\n🎯 胜负统计:")
         win_rate = performance_stats.get('win_rate', 0)
         monthly_win_rate = performance_stats.get('monthly_win_rate', 0)
         profit_factor = performance_stats.get('profit_factor', 0)
-        
+
         win_emoji = "🟢" if win_rate > 0.55 else "🟡" if win_rate > 0.45 else "🔴"
         pf_emoji = "🟢" if profit_factor > 1.5 else "🟡" if profit_factor > 1.0 else "🔴"
-        
+
         print(f"   日胜率            : {win_rate:>8.2%} {win_emoji}")
         print(f"   月胜率            : {monthly_win_rate:>8.2%}")
         print(f"   盈亏比            : {profit_factor:>8.2f} {pf_emoji}")
-        
+
         # 尾部风险
         print(f"\n⚠️  尾部风险:")
         var_95 = performance_stats.get('var_95', 0)
         cvar_95 = performance_stats.get('cvar_95', 0)
         var_emoji = "🟢" if var_95 > -0.03 else "🟡" if var_95 > -0.05 else "🔴"
-        
+
         print(f"   VaR(95%)         : {var_95:>8.2%} {var_emoji}")
         print(f"   CVaR(95%)        : {cvar_95:>8.2%}")
-        
+
         # 持仓分析
         if position_sizes:
             print(f"\n💼 持仓配置:")
             sorted_positions = sorted(position_sizes.items(), key=lambda x: x[1], reverse=True)
-            
+
             for i, (stock_code, position) in enumerate(sorted_positions[:5]):  # 显示前5大持仓
                 stock_name = self.get_stock_name(stock_code)
                 weight = (position / total_position) * 100
                 risk_score = self.risk_metrics.get(stock_code, {}).get('risk_score', 0) if hasattr(self, 'risk_metrics') else 0
                 risk_emoji = "🟢" if risk_score < 30 else "🟡" if risk_score < 60 else "🔴"
-                
+
                 print(f"   #{i+1} {stock_code} {stock_name[:6]:>6s}: {weight:>5.1f}% (¥{position:>7,.0f}) {risk_emoji}")
-            
+
             if len(sorted_positions) > 5:
                 print(f"   ... 还有 {len(sorted_positions)-5} 只股票")
-        
+
         # 交易执行统计
         trading_stats = self.get_trading_statistics()
         if trading_stats['total_orders'] > 0:
@@ -1526,36 +1526,36 @@ class RiskSensitiveTrendStrategy:
             success_rate = trading_stats.get('success_rate', 0)
             fill_rate = trading_stats.get('avg_fill_ratio', 0)
             exec_emoji = "🟢" if success_rate > 0.9 else "🟡" if success_rate > 0.7 else "🔴"
-            
+
             print(f"   总订单数          : {trading_stats['total_orders']:>8.0f}")
             print(f"   成交成功率        : {success_rate:>8.2%} {exec_emoji}")
             print(f"   平均成交比例      : {fill_rate:>8.2%}")
             print(f"   平均交易成本      : ¥{trading_stats.get('avg_transaction_cost', 0):>6.2f}")
-        
+
         # 策略评级总结
         print(f"\n🏆 策略综合评级:")
-        
+
         # 计算综合评分
         score_components = []
         if sharpe > 1.5: score_components.append(("收益质量", "优秀", "🟢"))
         elif sharpe > 1.0: score_components.append(("收益质量", "良好", "🟡"))
         else: score_components.append(("收益质量", "一般", "🔴"))
-        
+
         if max_dd > -0.1: score_components.append(("风险控制", "优秀", "🟢"))
         elif max_dd > -0.2: score_components.append(("风险控制", "良好", "🟡"))
         else: score_components.append(("风险控制", "需改进", "🔴"))
-        
+
         if win_rate > 0.55: score_components.append(("稳定性", "优秀", "🟢"))
         elif win_rate > 0.45: score_components.append(("稳定性", "良好", "🟡"))
         else: score_components.append(("稳定性", "一般", "🔴"))
-        
+
         for component, rating, emoji in score_components:
             print(f"   {component:12s}: {rating:>6s} {emoji}")
-        
+
         # 建议
         print(f"\n💡 策略建议:")
         suggestions = []
-        
+
         if sharpe < 1.0:
             suggestions.append("• 考虑优化选股标准或调整仓位管理")
         if max_dd < -0.15:
@@ -1566,10 +1566,10 @@ class RiskSensitiveTrendStrategy:
             suggestions.append("• 策略未能跑赢基准，需要优化选股或择时逻辑")
         if not suggestions:
             suggestions.append("• 策略表现良好，可考虑适当增加仓位或扩大股票池")
-        
+
         for suggestion in suggestions[:3]:  # 最多显示3条建议
             print(f"   {suggestion}")
-        
+
         print("\n" + "="*100)
         print(f"📄 详细图表分析请查看: portfolio_analysis_enhanced.html")
         print("="*100 + "\n")
@@ -1725,7 +1725,7 @@ class RiskSensitiveTrendStrategy:
         print(f"📈 正在并发获取股票历史数据并计算风险指标...")
         print(f"🔧 系统信息: CPU核心数={cpu_count}, 使用并发线程数={max_workers}")
         print(f"📊 股票池规模: {len(self.stock_pool)} 只股票")
-        
+
         # 估算处理时间
         estimated_time = len(self.stock_pool) * 0.5 / max_workers  # 假设每只股票0.5秒
         if estimated_time > 60:
@@ -1970,7 +1970,7 @@ class RiskSensitiveTrendStrategy:
         # 12. 诊断信息 - 增强异常数据检测
         nonzero_w_days = int((w_active.abs().sum(axis=1) > 1e-12).sum())
         nonzero_ret_days = int((rets_active.abs().sum(axis=1, skipna=True) > 1e-12).sum())
-        
+
         # 检测异常收益率数据
         extreme_returns = port_ret_net.abs() > 0.2  # 日收益超过20%
         if extreme_returns.any():
@@ -1978,20 +1978,20 @@ class RiskSensitiveTrendStrategy:
             extreme_dates = port_ret_net[extreme_returns].index.tolist()[:5]  # 显示前5个
             print(f"🚨 警告：发现{extreme_count}个极端日收益(>20%)，前5个日期: {extreme_dates}")
             print(f"🚨 极端收益值: {port_ret_net[extreme_returns].head().tolist()}")
-        
+
         # 检测收益率统计
         port_ret_stats = port_ret_net.describe()
         print(f"[数据质量] 组合日收益统计:")
         print(f"  均值: {port_ret_stats['mean']:.4f} (年化{port_ret_stats['mean']*252:.1%})")
         print(f"  标准差: {port_ret_stats['std']:.4f}")
         print(f"  最大: {port_ret_stats['max']:.4f}, 最小: {port_ret_stats['min']:.4f}")
-        
+
         # 检测个股收益异常
         individual_extreme = (rets_active.abs() > 0.15).any(axis=1)  # 某天有个股收益>15%
         if individual_extreme.any():
             extreme_stock_days = individual_extreme.sum()
             print(f"⚠️  发现{extreme_stock_days}天存在个股极端收益(>15%)")
-        
+
         print(f"[诊断] 活跃权重日={nonzero_w_days}, 有效收益日={nonzero_ret_days}, 回测周期={len(equity)}")
         print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f} (总收益{((equity.iloc[-1]/equity.iloc[0])-1)*100:.1f}%)")
 
@@ -2028,7 +2028,7 @@ class RiskSensitiveTrendStrategy:
         rf_daily = 0.025 / 252
         excess = daily_ret - rf_daily
         sharpe = float((excess.mean() * 252) / (daily_ret.std() * np.sqrt(252))) if daily_ret.std() > 0 else 0.0
-        
+
         # Sortino比率（下行标准差）
         downside_ret = daily_ret[daily_ret < 0]
         downside_std = float(downside_ret.std() * np.sqrt(252)) if len(downside_ret) > 0 else 0.0
@@ -2039,7 +2039,7 @@ class RiskSensitiveTrendStrategy:
         peak = nav.cummax()
         dd = (nav / peak - 1.0)
         max_dd = float(dd.min()) if len(dd) > 0 else 0.0
-        
+
         # 回撤持续时间
         dd_periods = (dd < -0.01)  # 回撤超过1%的时期
         if dd_periods.any():
@@ -2085,32 +2085,32 @@ class RiskSensitiveTrendStrategy:
             'total_return': total_return,
             'annual_return': ann_return,
             'annual_vol': ann_vol,
-            
+
             # 风险调整指标
             'sharpe': sharpe,
             'sortino': sortino,
             'calmar': calmar,
-            
+
             # 基准比较
             'alpha': alpha,
             'tracking_error': tracking_error,
             'info_ratio': info_ratio,
-            
+
             # 回撤分析
             'max_drawdown': max_dd,
             'max_dd_duration': max_dd_duration,
-            
+
             # 胜负分析
             'win_rate': win_rate,
             'monthly_win_rate': monthly_win_rate,
             'profit_factor': profit_factor,
             'avg_win': avg_win,
             'avg_loss': avg_loss,
-            
+
             # 尾部风险
             'var_95': var_95,
             'cvar_95': cvar_95,
-            
+
             # 其他统计
             'total_days': len(daily_ret),
             'trading_days': len(daily_ret[daily_ret != 0]),
@@ -2138,7 +2138,7 @@ class RiskSensitiveTrendStrategy:
         print("="*80)
         print("                     策略全面绩效分析报告")
         print("="*80)
-        
+
         # 基础收益指标
         print("\n📊 基础收益指标:")
         print(f"  总收益率           : {stats.get('total_return', 0):8.2%}")
@@ -2146,24 +2146,24 @@ class RiskSensitiveTrendStrategy:
         print(f"  年化波动率         : {stats.get('annual_vol', 0):8.2%}")
         print(f"  回测天数           : {stats.get('total_days', 0):8.0f} 天")
         print(f"  有效交易日         : {stats.get('trading_days', 0):8.0f} 天")
-        
+
         # 风险调整指标
         print("\n⚖️  风险调整指标:")
         print(f"  夏普比率           : {stats.get('sharpe', 0):8.3f}")
         print(f"  Sortino比率        : {stats.get('sortino', 0):8.3f}")
         print(f"  Calmar比率         : {stats.get('calmar', 0):8.3f}")
-        
+
         # 基准比较
         print("\n📈 基准比较(vs 沪深300):")
         print(f"  超额收益(Alpha)    : {stats.get('alpha', 0):8.2%}")
         print(f"  跟踪误差           : {stats.get('tracking_error', 0):8.2%}")
         print(f"  信息比率           : {stats.get('info_ratio', 0):8.3f}")
-        
+
         # 回撤分析
         print("\n📉 回撤分析:")
         print(f"  最大回撤           : {stats.get('max_drawdown', 0):8.2%}")
         print(f"  最大回撤持续       : {stats.get('max_dd_duration', 0):8.0f} 天")
-        
+
         # 胜负分析
         print("\n🎯 胜负分析:")
         print(f"  日胜率             : {stats.get('win_rate', 0):8.2%}")
@@ -2171,12 +2171,12 @@ class RiskSensitiveTrendStrategy:
         print(f"  盈亏比             : {stats.get('profit_factor', 0):8.2f}")
         print(f"  平均盈利           : {stats.get('avg_win', 0):8.2%}")
         print(f"  平均亏损           : {stats.get('avg_loss', 0):8.2%}")
-        
+
         # 尾部风险
         print("\n⚠️  尾部风险:")
         print(f"  VaR(95%)          : {stats.get('var_95', 0):8.2%}")
         print(f"  CVaR(95%)         : {stats.get('cvar_95', 0):8.2%}")
-        
+
         print("="*80)
         return equity, stats
 
@@ -3833,17 +3833,17 @@ class RiskSensitiveTrendStrategy:
         alpha = excess_ret.mean() * 252
         tracking_error = excess_ret.std() * np.sqrt(252)
         info_ratio = alpha / tracking_error if tracking_error > 0 else 0
-        
+
         # Sortino比率和Calmar比率
         downside_ret = returns[returns < 0]
         downside_std = downside_ret.std() * np.sqrt(252) if len(downside_ret) > 0 else 0
         sortino = (returns.mean() - daily_rf_rate) * 252 / downside_std if downside_std > 0 else 0
         calmar = abs(annual_return / max_drawdown) if max_drawdown != 0 else 0
-        
+
         # 尾部风险
         var_95 = np.percentile(returns, 5) if len(returns) > 0 else 0
         cvar_95 = returns[returns <= var_95].mean() if len(returns[returns <= var_95]) > 0 else 0
-        
+
         # 月度胜率
         try:
             monthly_rets = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
@@ -4183,12 +4183,12 @@ def main():
             # 保存为HTML文件而不是直接显示
             fig_portfolio.write_html("portfolio_curve.html")
             print("组合净值曲线已保存为 portfolio_curve.html")
-            
+
             # 生成增强版的组合分析报告
             enhanced_fig = strategy.create_enhanced_portfolio_dashboard(equity_curve, performance_stats, selected_stocks, position_sizes)
             enhanced_fig.write_html("portfolio_analysis_enhanced.html")
             print("增强版组合分析报告已保存为 portfolio_analysis_enhanced.html")
-            
+
             # 打印增强版关键指标摘要
             strategy.print_enhanced_metrics_summary(equity_curve, performance_stats, selected_stocks, position_sizes)
     else:
