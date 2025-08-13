@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from functools import partial
 import multiprocessing as mp
 import random
+import logging
+import json
 warnings.filterwarnings('ignore')
 
 
@@ -25,7 +27,7 @@ class RiskSensitiveTrendStrategy:
     """风险敏感型趋势跟踪 + 相对强度策略"""
 
     def __init__(self, start_date='20230101', end_date=None, qlib_dir="~/.qlib/qlib_data/cn_data",
-                 stock_pool_mode='auto', custom_stocks=None, index_code='000300'):
+                 stock_pool_mode='auto', custom_stocks=None, index_code='000300', filter_st=False):
         """
         初始化策略
 
@@ -43,6 +45,8 @@ class RiskSensitiveTrendStrategy:
             自定义股票列表
         index_code : str
             指数代码(当stock_pool_mode='index'时使用)
+        filter_st : bool
+            是否过滤ST股票，True=过滤ST股票，False=保留ST股票
         """
         self.start_date = start_date
         self.end_date = end_date or datetime.now().strftime('%Y%m%d')
@@ -50,6 +54,7 @@ class RiskSensitiveTrendStrategy:
         self.stock_pool_mode = stock_pool_mode
         self.custom_stocks = custom_stocks or []
         self.index_code = index_code
+        self.filter_st = filter_st
         self.stock_pool = []
         self.price_data = {}
         self.rs_scores = pd.DataFrame()
@@ -75,7 +80,16 @@ class RiskSensitiveTrendStrategy:
         self.price_limit_pct = 0.10        # 沪深涨跌停幅度（10%）
         self.st_limit_pct = 0.05           # ST股涨跌停幅度（5%）
         self.bj_limit_pct = 0.30           # 北交所涨跌停幅度（30%）
-        self.transaction_cost = 0.003      # 双边交易成本（0.3%）
+
+        # 交易费用分拆（符合A股实际费率）
+        self.commission_rate = 0.0003      # 券商佣金率（双边各0.03%）
+        self.commission_min = 5.0          # 最低佣金5元
+        self.stamp_tax_rate = 0.0005       # 印花税率（卖出单边0.05%，2023-08-28下调）
+        self.transfer_fee_rate = 0.00002   # 过户费率（双边各0.002%）
+
+        # 向后兼容：总体交易成本（用于简化计算的地方）
+        self.transaction_cost = self.commission_rate + self.stamp_tax_rate/2 + self.transfer_fee_rate
+
         self.slippage_bps = 5              # 滑点（5个基点）
 
         # ST股票缓存
@@ -83,12 +97,59 @@ class RiskSensitiveTrendStrategy:
         self._st_cache_date = None
         self._st_api_failed = False  # 标记API是否已失败，避免重复尝试
 
+        # T+1持仓账本：记录每笔买入的可卖日期
+        self.position_ledger = {}  # {stock_code: [{'shares': int, 'buy_date': str, 'sellable_date': str, 'buy_price': float}]}
+
         # 流动性过滤参数
         self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
+        self.min_adv_20d_bj = 50_000_000   # 北交所单独阈值：5000万元（更严格）
         self.max_suspend_days_60d = 10     # 60日内最大停牌天数
+        self.exclude_bj_stocks = True      # 默认排除北交所股票（风险控制）
+        
+        # ADV单位校准参数
+        self.amount_scale = None           # amount字段的单位缩放：None=自动检测, 1=元, 10000=万元
+
+        # 交易统计和审计
+        self.trading_stats = {
+            'total_orders': 0,
+            'successful_fills': 0,
+            'partial_fills': 0,
+            'rejected_orders': 0,
+            'price_limited_orders': 0,
+            'volume_limited_orders': 0,
+            'total_slippage': 0.0,
+            'total_transaction_costs': 0.0,
+            'fill_ratio_sum': 0.0
+        }
+        self.audit_log = []  # 详细的交易审计日志
+        
+        # 初始化日志
+        self._setup_logging()
 
         # 初始化qlib
         self._init_qlib()
+
+    def _setup_logging(self):
+        """设置交易审计日志"""
+        # 创建交易日志器
+        self.trade_logger = logging.getLogger('trading_audit')
+        self.trade_logger.setLevel(logging.INFO)
+        
+        # 避免重复添加handler
+        if not self.trade_logger.handlers:
+            # 文件handler
+            log_filename = f"trading_audit_{datetime.now().strftime('%Y%m%d')}.log"
+            file_handler = logging.FileHandler(log_filename)
+            file_handler.setLevel(logging.INFO)
+            
+            # 格式化器
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(formatter)
+            
+            self.trade_logger.addHandler(file_handler)
 
     def _init_qlib(self):
         """初始化qlib"""
@@ -430,9 +491,15 @@ class RiskSensitiveTrendStrategy:
         if len(st_stocks) > 0:
             return numeric_code in st_stocks
 
-        # 如果API失败，返回False（保守处理）
-        # 在交易约束层面，将ST股票当作普通股票处理，虽然不够精确，
-        # 但避免了API调用失败导致的程序中断
+        # API失败时使用名称匹配作为降级策略
+        try:
+            stock_name = self.get_stock_name(numeric_code)
+            if stock_name and ('ST' in stock_name or '*ST' in stock_name):
+                return True
+        except Exception:
+            pass
+
+        # 如果无法通过名称判断，返回False（不视为ST）
         return False
 
     def get_all_available_stocks(self):
@@ -510,7 +577,7 @@ class RiskSensitiveTrendStrategy:
             batches = [candidate_pool[i:i+batch_size] for i in range(0, len(candidate_pool), batch_size)]
 
             # 确定并发数
-            max_workers = max(1, int(mp.cpu_count() * 0.7))  # 使用50%CPU核心，避免过载
+            max_workers = max(1, int(mp.cpu_count() * 0.5))  # 使用50%CPU核心，避免过载
             print(f"股票池筛选使用{max_workers}个并发进程处理{len(batches)}个批次")
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -620,6 +687,14 @@ class RiskSensitiveTrendStrategy:
             股票代码
         """
         try:
+            # 北交所股票特殊处理
+            normalized_code = self._normalize_instrument(stock_code)
+            is_bj_stock = normalized_code.startswith('BJ')
+
+            # 如果启用北交所排除，直接过滤
+            if is_bj_stock and self.exclude_bj_stocks:
+                return False
+
             # 基本数据量要求
             if len(stock_data) < 10:  # 降低数据量要求
                 return False
@@ -637,13 +712,16 @@ class RiskSensitiveTrendStrategy:
                 if suspend_days > self.max_suspend_days_60d:
                     return False
 
-            # 3. 日均成交额过滤：ADV20要求
+            # 3. 日均成交额过滤：ADV20要求（北交所使用更严格标准）
             if 'amount' in stock_data.columns and len(stock_data) >= 20:
-                # amount是成交额，单位通常是万元，需要转换为元
                 amount_20d = stock_data['amount'].iloc[-20:]
-                # 假设amount单位是万元，转换为元进行比较
-                avg_amount = amount_20d.mean() * 10000  # 万元转元
-                if avg_amount < self.min_adv_20d:
+                # 使用动态单位缩放
+                scale_factor = self._get_amount_scale()
+                avg_amount = amount_20d.mean() * scale_factor  # 转换为元
+
+                # 北交所使用更严格的ADV阈值
+                min_adv = self.min_adv_20d_bj if is_bj_stock else self.min_adv_20d
+                if avg_amount < min_adv:
                     return False
 
             # 去除价格异常股票
@@ -654,8 +732,8 @@ class RiskSensitiveTrendStrategy:
                 if recent_prices.iloc[-1] < 1:  # 股价过低
                     return False
 
-            # 去除ST股票（使用API识别）
-            if self._is_st_stock(stock_code):
+            # ST股票过滤（根据命令行参数决定）
+            if self.filter_st and self._is_st_stock(stock_code):
                 return False
 
             return True
@@ -665,7 +743,7 @@ class RiskSensitiveTrendStrategy:
 
     def _get_price_limits(self, yesterday_close, stock_code=None, is_st=None):
         """
-        计算涨跌停价格限制（增强版：自动识别股票类型）
+        计算涨跌停价格限制（优化版：独立板块识别和ST识别）
 
         Parameters:
         -----------
@@ -676,32 +754,261 @@ class RiskSensitiveTrendStrategy:
         is_st : bool, optional
             是否为ST股票，如果提供则直接使用
         """
-        if is_st is None and stock_code is not None:
-            # 若传入了带前缀代码，先提取数值以便 _is_st_stock 判定
-            code_up = str(stock_code).strip().upper()
-            numeric = code_up[2:] if len(code_up) > 6 and code_up[:2] in ('SH','SZ','BJ') else code_up
-            is_st = self._is_st_stock(numeric)
-
         # 统一带前缀代码
         code = (stock_code or '').strip().upper() if stock_code else ''
-
-        # 交易所/板块限幅
+        
+        # 板块识别（优先级最高，独立于ST识别）
         if code.startswith('BJ'):
-            limit_pct = self.bj_limit_pct  # 北交所30%
-        elif code.startswith('SH688'):
-            limit_pct = 0.20               # 科创板20%
-        elif is_st:
-            limit_pct = self.st_limit_pct  # ST股5%
+            # 北交所30%
+            limit_pct = self.bj_limit_pct
+        elif code.startswith('SH688') or code.startswith('SZ30'):
+            # 科创板(688)或创业板(30)20%
+            limit_pct = 0.20
         else:
-            limit_pct = self.price_limit_pct  # 普通10%
+            # 沪深主板，需要判断ST状态
+            if is_st is None and stock_code is not None:
+                # 提取数值代码用于ST判定
+                code_up = str(stock_code).strip().upper()
+                numeric = code_up[2:] if len(code_up) > 6 and code_up[:2] in ('SH','SZ','BJ') else code_up
+                is_st = self._is_st_stock(numeric)
+            
+            if is_st:
+                # ST股票5%
+                limit_pct = self.st_limit_pct
+            elif self._st_api_failed:
+                # ST API失败时，主板保守使用5%（科创/北交不受影响）
+                limit_pct = self.st_limit_pct
+            else:
+                # 主板普通股票10%
+                limit_pct = self.price_limit_pct
 
         upper_limit = yesterday_close * (1 + limit_pct)
         lower_limit = yesterday_close * (1 - limit_pct)
         return upper_limit, lower_limit
 
-    def _simulate_order_execution(self, target_price, yesterday_close, volume_available, is_st=False, is_buy=True):
+    def _calculate_transaction_cost(self, price, shares, is_buy=True):
         """
-        模拟A股订单执行（考虑涨跌停和滑点）
+        计算按边计费的交易成本（简化版，返回总成本）
+        
+        Parameters:
+        -----------
+        price : float
+            成交价格
+        shares : int
+            成交股数
+        is_buy : bool
+            是否为买入订单
+            
+        Returns:
+        --------
+        float
+            总交易成本（元）
+        """
+        trade_amount = price * shares
+        cost_details = self._calculate_transaction_costs(trade_amount, is_buy)
+        return cost_details['total_cost']
+
+    def _get_next_trading_date(self, date_str):
+        """
+        获取下一个交易日（T+1）
+        
+        Parameters:
+        -----------
+        date_str : str
+            当前日期，格式YYYYMMDD
+            
+        Returns:
+        --------
+        str
+            下一个交易日，格式YYYYMMDD
+        """
+        from datetime import datetime, timedelta
+        
+        current_date = datetime.strptime(date_str, '%Y%m%d')
+        next_date = current_date + timedelta(days=1)
+        
+        # 简化处理：假设下一天就是下一个交易日
+        # 在实际应用中，应该查询交易日历
+        return next_date.strftime('%Y%m%d')
+
+    def _add_position_to_ledger(self, stock_code, shares, buy_date, buy_price):
+        """
+        向持仓账本添加新的买入记录
+        
+        Parameters:
+        -----------
+        stock_code : str
+            股票代码
+        shares : int
+            买入股数
+        buy_date : str
+            买入日期，格式YYYYMMDD
+        buy_price : float
+            买入价格
+        """
+        if stock_code not in self.position_ledger:
+            self.position_ledger[stock_code] = []
+        
+        sellable_date = self._get_next_trading_date(buy_date)
+        
+        position_record = {
+            'shares': shares,
+            'buy_date': buy_date,
+            'sellable_date': sellable_date,
+            'buy_price': buy_price
+        }
+        
+        self.position_ledger[stock_code].append(position_record)
+
+    def _get_sellable_shares(self, stock_code, current_date):
+        """
+        获取当前日期可卖出的股数
+        
+        Parameters:
+        -----------
+        stock_code : str
+            股票代码
+        current_date : str
+            当前日期，格式YYYYMMDD
+            
+        Returns:
+        --------
+        int
+            可卖出的股数
+        """
+        if stock_code not in self.position_ledger:
+            return 0
+        
+        sellable_shares = 0
+        for record in self.position_ledger[stock_code]:
+            if record['sellable_date'] <= current_date:
+                sellable_shares += record['shares']
+        
+        return sellable_shares
+
+    def _remove_from_ledger(self, stock_code, shares_to_sell, current_date):
+        """
+        从持仓账本中移除卖出的股票（FIFO原则）
+        
+        Parameters:
+        -----------
+        stock_code : str
+            股票代码
+        shares_to_sell : int
+            要卖出的股数
+        current_date : str
+            当前日期，格式YYYYMMDD
+            
+        Returns:
+        --------
+        bool
+            是否成功移除（True表示有足够的可卖股数）
+        """
+        if stock_code not in self.position_ledger:
+            return False
+        
+        remaining_to_sell = shares_to_sell
+        records_to_remove = []
+        
+        # FIFO：从最早买入的开始卖出
+        for i, record in enumerate(self.position_ledger[stock_code]):
+            if record['sellable_date'] <= current_date and remaining_to_sell > 0:
+                if record['shares'] <= remaining_to_sell:
+                    # 这笔买入的股票全部卖出
+                    remaining_to_sell -= record['shares']
+                    records_to_remove.append(i)
+                else:
+                    # 这笔买入的股票部分卖出
+                    record['shares'] -= remaining_to_sell
+                    remaining_to_sell = 0
+                    break
+        
+        # 移除已清仓的记录
+        for i in reversed(records_to_remove):
+            del self.position_ledger[stock_code][i]
+        
+        # 如果该股票已无持仓，删除整个条目
+        if not self.position_ledger[stock_code]:
+            del self.position_ledger[stock_code]
+        
+        return remaining_to_sell == 0
+
+    def _detect_amount_scale(self, sample_stocks=None, sample_size=5):
+        """
+        自动检测amount字段的单位缩放
+        
+        Parameters:
+        -----------
+        sample_stocks : list, optional
+            用于检测的样本股票代码，默认使用股票池中的前几只
+        sample_size : int
+            样本大小，默认5只股票
+            
+        Returns:
+        --------
+        float
+            检测到的缩放因子：1表示"元"，10000表示"万元"
+        """
+        if not self._qlib_initialized:
+            return 10000  # 默认假设万元
+        
+        # 选择样本股票
+        if sample_stocks is None:
+            sample_stocks = self.stock_pool[:sample_size] if len(self.stock_pool) >= sample_size else self.stock_pool
+        
+        if not sample_stocks:
+            return 10000  # 默认假设万元
+        
+        total_amount_samples = []
+        
+        for stock_code in sample_stocks:
+            try:
+                # 获取最近几天的数据来判断数量级
+                df = self.fetch_stock_data(stock_code)
+                if df is not None and 'amount' in df.columns and len(df) > 0:
+                    recent_amounts = df['amount'].iloc[-5:].dropna()
+                    if len(recent_amounts) > 0:
+                        avg_amount = recent_amounts.mean()
+                        total_amount_samples.append(avg_amount)
+            except Exception:
+                continue
+        
+        if not total_amount_samples:
+            print("警告：无法获取样本数据，使用默认ADV单位（万元）")
+            return 10000
+        
+        # 分析数量级
+        import numpy as np
+        median_amount = np.median(total_amount_samples)
+        
+        # 启发式判断：如果中位数在千万以上，可能是"元"单位；如果在万以下，可能是"万元"单位
+        if median_amount > 10_000_000:
+            detected_scale = 1  # 元
+            print(f"自动检测ADV单位：元（样本中位数：{median_amount:,.0f}）")
+        else:
+            detected_scale = 10000  # 万元
+            print(f"自动检测ADV单位：万元（样本中位数：{median_amount:,.0f}）")
+        
+        return detected_scale
+
+    def _get_amount_scale(self):
+        """
+        获取amount字段的缩放因子
+        
+        Returns:
+        --------
+        float
+            缩放因子
+        """
+        if self.amount_scale is None:
+            # 第一次调用时自动检测
+            self.amount_scale = self._detect_amount_scale()
+        
+        return self.amount_scale
+
+    def _simulate_order_execution(self, target_price, yesterday_close, target_shares, volume_available, stock_code=None, is_st=None, is_buy=True, max_participation_rate=0.1):
+        """
+        模拟A股订单执行（考虑涨跌停、滑点和成交量约束）
 
         Parameters:
         -----------
@@ -709,34 +1016,46 @@ class RiskSensitiveTrendStrategy:
             目标价格
         yesterday_close : float
             昨日收盘价
+        target_shares : int
+            目标成交股数
         volume_available : float
-            可用成交量
-        is_st : bool
+            当日可用成交量（股数）
+        stock_code : str, optional
+            股票代码，用于ST判断
+        is_st : bool, optional
             是否为ST股票
         is_buy : bool
             是否为买单
+        max_participation_rate : float
+            最大成交量参与率，默认10%
+            
+        Returns:
+        --------
+        tuple
+            (execution_result, error_message)
+            execution_result包含: executed_shares, executed_price, transaction_cost, slippage, fill_ratio等
         """
-        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=None, is_st=is_st)
+        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=stock_code, is_st=is_st)
 
-        # 检查价格是否触及涨跌停
+        # 检查价格是否触及涨跌停（硬约束，直接拒绝成交）
         if is_buy:
             if target_price >= upper_limit:
-                # 买单触及涨停，可能无法成交
-                execution_prob = min(0.3, volume_available / 1000000)  # 基于成交量估算成交概率
-                if np.random.random() > execution_prob:
-                    return None, "涨停无法买入"
-                actual_price = upper_limit
+                return None, "涨停无法买入"
             else:
                 actual_price = target_price
         else:
             if target_price <= lower_limit:
-                # 卖单触及跌停，可能无法成交
-                execution_prob = min(0.3, volume_available / 1000000)
-                if np.random.random() > execution_prob:
-                    return None, "跌停无法卖出"
-                actual_price = lower_limit
+                return None, "跌停无法卖出"
             else:
                 actual_price = target_price
+
+        # 成交量约束：限制最大可成交数量
+        max_tradable_shares = int(volume_available * max_participation_rate) if volume_available > 0 else target_shares
+        executed_shares = min(target_shares, max_tradable_shares)
+        
+        # 如果无法成交任何股数，返回失败
+        if executed_shares <= 0:
+            return None, "成交量不足，无法执行订单"
 
         # 应用滑点
         slippage = actual_price * self.slippage_bps / 10000
@@ -745,17 +1064,118 @@ class RiskSensitiveTrendStrategy:
         else:
             final_price = actual_price - slippage
 
-        # 应用交易成本
-        cost = final_price * self.transaction_cost
+        # 计算交易成本
+        cost = self._calculate_transaction_cost(final_price, executed_shares, is_buy=is_buy)
+        
+        # 计算成交率
+        fill_ratio = executed_shares / target_shares if target_shares > 0 else 0.0
+
+        # 更新交易统计
+        self._update_trading_stats(target_shares, executed_shares, cost, slippage, fill_ratio,
+                                   target_price != actual_price, executed_shares < target_shares)
+
+        # 记录审计日志
+        self._log_trade_audit(stock_code, target_shares, executed_shares, target_price, final_price,
+                              cost, slippage, fill_ratio, is_buy, volume_available)
 
         return {
+            'executed_shares': executed_shares,
             'executed_price': final_price,
             'transaction_cost': cost,
             'slippage': slippage,
-            'price_limited': target_price != actual_price
+            'fill_ratio': fill_ratio,
+            'price_limited': target_price != actual_price,
+            'volume_limited': executed_shares < target_shares,
+            'unfilled_shares': target_shares - executed_shares
         }, None
 
-    def _calculate_realistic_stop_loss(self, current_price, atr, yesterday_close, is_st=False):
+    def _update_trading_stats(self, target_shares, executed_shares, cost, slippage, fill_ratio, 
+                             price_limited, volume_limited):
+        """更新交易统计"""
+        self.trading_stats['total_orders'] += 1
+        
+        if executed_shares > 0:
+            self.trading_stats['successful_fills'] += 1
+            self.trading_stats['total_transaction_costs'] += cost
+            self.trading_stats['total_slippage'] += abs(slippage)
+            self.trading_stats['fill_ratio_sum'] += fill_ratio
+            
+            if executed_shares < target_shares:
+                self.trading_stats['partial_fills'] += 1
+        else:
+            self.trading_stats['rejected_orders'] += 1
+        
+        if price_limited:
+            self.trading_stats['price_limited_orders'] += 1
+        
+        if volume_limited:
+            self.trading_stats['volume_limited_orders'] += 1
+
+    def _log_trade_audit(self, stock_code, target_shares, executed_shares, target_price, 
+                        final_price, cost, slippage, fill_ratio, is_buy, volume_available):
+        """记录详细的交易审计日志"""
+        audit_record = {
+            'timestamp': datetime.now().isoformat(),
+            'stock_code': stock_code,
+            'direction': 'BUY' if is_buy else 'SELL',
+            'target_shares': target_shares,
+            'executed_shares': executed_shares,
+            'target_price': target_price,
+            'executed_price': final_price,
+            'slippage': slippage,
+            'transaction_cost': cost,
+            'fill_ratio': fill_ratio,
+            'volume_available': volume_available,
+            'unfilled_shares': target_shares - executed_shares,
+            'price_limited': target_price != final_price,
+            'volume_limited': executed_shares < target_shares
+        }
+        
+        # 添加到内存日志
+        self.audit_log.append(audit_record)
+        
+        # 写入文件日志
+        if hasattr(self, 'trade_logger'):
+            log_message = (
+                f"TRADE: {stock_code} {audit_record['direction']} "
+                f"Target:{target_shares} Executed:{executed_shares} "
+                f"Price:{final_price:.3f} Cost:{cost:.2f} "
+                f"FillRatio:{fill_ratio:.2%} "
+                f"Slippage:{slippage:.4f}"
+            )
+            self.trade_logger.info(log_message)
+
+    def get_trading_statistics(self):
+        """获取交易统计报告"""
+        stats = self.trading_stats.copy()
+        
+        # 计算衍生指标
+        if stats['total_orders'] > 0:
+            stats['success_rate'] = stats['successful_fills'] / stats['total_orders']
+            stats['rejection_rate'] = stats['rejected_orders'] / stats['total_orders']
+            stats['partial_fill_rate'] = stats['partial_fills'] / stats['total_orders']
+            stats['price_limit_rate'] = stats['price_limited_orders'] / stats['total_orders']
+            stats['volume_limit_rate'] = stats['volume_limited_orders'] / stats['total_orders']
+            
+        if stats['successful_fills'] > 0:
+            stats['avg_fill_ratio'] = stats['fill_ratio_sum'] / stats['successful_fills']
+            stats['avg_transaction_cost'] = stats['total_transaction_costs'] / stats['successful_fills']
+            stats['avg_slippage'] = stats['total_slippage'] / stats['successful_fills']
+        
+        return stats
+
+    def export_audit_log(self, filename=None):
+        """导出审计日志到文件"""
+        if filename is None:
+            filename = f"audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(self.audit_log, f, ensure_ascii=False, indent=2)
+        
+        print(f"审计日志已导出到: {filename}")
+        return filename
+
+    def _calculate_realistic_stop_loss(self, current_price, atr, yesterday_close, stock_code=None, is_st=None):
         """
         计算考虑A股制度约束的止损价格
 
@@ -774,7 +1194,7 @@ class RiskSensitiveTrendStrategy:
         theoretical_stop = current_price - (atr * self.atr_multiplier)
 
         # 考虑跌停限制
-        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=None, is_st=is_st)
+        upper_limit, lower_limit = self._get_price_limits(yesterday_close, stock_code=stock_code, is_st=is_st)
 
         # 如果理论止损低于跌停价，实际止损就是跌停价
         if theoretical_stop < lower_limit:
@@ -1123,9 +1543,13 @@ class RiskSensitiveTrendStrategy:
         # 8. 组合日收益（只在有效收益上聚合）
         port_ret = (w_active * rets_active).sum(axis=1, skipna=True)
 
-        # 9. 交易成本
+        # 9. 交易成本（使用加权平均费率：买入+卖出各占50%）
         turnover = w_active.diff().abs().sum(axis=1).fillna(0.0)
-        port_ret_net = port_ret - turnover * self.transaction_cost
+        # 计算平均交易成本率（买卖各占一半）
+        avg_buy_cost_rate = (self.commission_rate + self.transfer_fee_rate)
+        avg_sell_cost_rate = (self.commission_rate + self.transfer_fee_rate + self.stamp_tax_rate)
+        avg_transaction_cost_rate = (avg_buy_cost_rate + avg_sell_cost_rate) / 2
+        port_ret_net = port_ret - turnover * avg_transaction_cost_rate
 
         # 10. 处理NaN：若当日无任何有效标的→延续前值而非强制0
         valid_ret_mask = port_ret_net.notna()
@@ -1451,7 +1875,7 @@ class RiskSensitiveTrendStrategy:
 
     def calculate_position_size(self, stock_code, capital=100000):
         """
-        基于风险计算仓位大小（凯利公式简化版）
+        基于风险的精确仓位计算（与ATR止损闭环）
 
         Parameters:
         -----------
@@ -1459,36 +1883,412 @@ class RiskSensitiveTrendStrategy:
             股票代码
         capital : float
             可用资金
+
+        Returns:
+        --------
+        dict : 包含股数、仓位价值、风险指标等详细信息
         """
-        if stock_code not in self.risk_metrics:
-            return 0
+        if stock_code not in self.price_data:
+            return None
 
-        metrics = self.risk_metrics[stock_code]
         df = self.price_data[stock_code]
+        if len(df) < 20:  # 确保有足够数据计算ATR
+            return None
 
-        # 基于ATR的仓位计算
-        atr = df['ATR'].iloc[-1]
-        price = df['close'].iloc[-1]
+        # 获取当前价格和ATR
+        current_price = df['close'].iloc[-1]
+        atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else df['close'].rolling(14).std().iloc[-1]
+        yesterday_close = df['close'].iloc[-2] if len(df) >= 2 else current_price
 
-        # 每笔交易的风险金额
+        # 计算理论止损位，考虑A股制度约束
+        stop_loss_info = self._calculate_realistic_stop_loss(
+            current_price, atr, yesterday_close, stock_code=stock_code
+        )
+        stop_distance = current_price - stop_loss_info['stop_price']
+
+        # 基于risk_per_trade计算风险预算
         risk_amount = capital * self.risk_per_trade
 
-        # 止损距离（ATR的倍数）
-        stop_distance = atr * self.atr_multiplier
+        # 计算理论股数: shares = risk_amount / stop_distance
+        if stop_distance <= 0:
+            return None
 
-        # 计算仓位
-        shares = risk_amount / stop_distance
-        position_value = shares * price
+        theoretical_shares = risk_amount / stop_distance
 
-        # 根据风险评分调整仓位
-        risk_adjustment = 1 - (metrics['risk_score'] / 200)  # 风险越高，仓位越小
-        position_value *= risk_adjustment
+        # 调整为100股整数倍（A股交易单位）
+        shares = int(theoretical_shares // 100) * 100
+        if shares <= 0:
+            shares = 100  # 最小单位
 
-        # 限制单一仓位不超过总资金的20%
-        max_position = capital * 0.2
-        position_value = min(position_value, max_position)
+        # 计算实际仓位价值
+        position_value = shares * current_price
 
-        return position_value
+        # 应用各种约束
+        # 1. 单票最大比例约束（15%）
+        max_single_position = capital * 0.15
+        if position_value > max_single_position:
+            shares = int(max_single_position / current_price // 100) * 100
+            position_value = shares * current_price
+
+        # 2. ADV流动性约束（单日成交不超过20日平均成交额的5%）
+        if self._check_adv_constraint_for_sizing(stock_code, shares, current_price):
+            shares = self._adjust_for_adv_constraint_sizing(stock_code, current_price)
+            position_value = shares * current_price
+
+        # 3. 行业/相关性约束（简化版，可后续扩展）
+        # 这里可以加入与已持仓股票的相关性检查
+
+        # 计算实际风险指标
+        actual_risk = shares * stop_distance
+        risk_utilization = actual_risk / risk_amount if risk_amount > 0 else 0
+
+        return {
+            'shares': shares,
+            'position_value': position_value,
+            'current_price': current_price,
+            'stop_loss_price': stop_loss_info['stop_price'],
+            'stop_distance': stop_distance,
+            'risk_amount_budget': risk_amount,
+            'actual_risk_amount': actual_risk,
+            'risk_utilization': risk_utilization,
+            'atr': atr,
+            'position_pct': position_value / capital,
+            'is_stop_limited': stop_loss_info.get('is_limited', False)
+        }
+
+    def _check_adv_constraint_for_sizing(self, stock_code, shares, price):
+        """检查仓位计算时的ADV流动性约束"""
+        if stock_code not in self.price_data:
+            return False
+
+        df = self.price_data[stock_code]
+        if 'amount' in df.columns and len(df) >= 20:
+            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
+            trade_value = shares * price
+            # 检查是否超过ADV20的5%
+            if trade_value > amount_20d * 0.05:
+                return True
+        return False
+
+    def _adjust_for_adv_constraint_sizing(self, stock_code, price):
+        """根据ADV约束调整仓位（用于仓位计算）"""
+        if stock_code not in self.price_data:
+            return 100
+
+        df = self.price_data[stock_code]
+        if 'amount' in df.columns and len(df) >= 20:
+            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
+            max_trade_value = amount_20d * 0.05
+            max_shares = int(max_trade_value / price // 100) * 100  # 调整为100股整数倍
+            return max(100, max_shares)  # 至少100股
+        return 100
+
+    def _validate_amount_unit(self, stock_code=None, sample_size=5):
+        """
+        验证Qlib数据中amount字段的单位定义
+        通过采样对比成交额和价格*成交量来推断单位
+
+        Parameters:
+        -----------
+        stock_code : str, optional
+            指定股票代码进行验证，None则随机选择
+        sample_size : int
+            验证样本数量
+
+        Returns:
+        --------
+        dict : 包含单位推断结果和建议
+        """
+        print("正在验证amount字段单位定义...")
+
+        # 选择验证样本
+        if stock_code and stock_code in self.price_data:
+            test_stocks = [stock_code]
+        else:
+            available_stocks = list(self.price_data.keys())
+            test_stocks = random.sample(available_stocks, min(sample_size, len(available_stocks)))
+
+        unit_results = []
+
+        for stock in test_stocks:
+            df = self.price_data[stock]
+            if 'amount' in df.columns and 'volume' in df.columns and len(df) >= 10:
+                # 取最近10天数据进行验证
+                recent_data = df.iloc[-10:]
+
+                for i, row in recent_data.iterrows():
+                    price = row['close']
+                    volume = row['volume']
+                    amount = row['amount']
+
+                    if price > 0 and volume > 0 and amount > 0:
+                        # 理论成交额 = 价格 * 成交量
+                        theoretical_amount = price * volume
+
+                        # 计算比值来推断单位
+                        ratio = amount / theoretical_amount
+
+                        if 0.0001 <= ratio <= 0.001:  # amount单位为万元
+                            unit_type = "万元"
+                            multiplier = 10000
+                        elif 0.9 <= ratio <= 1.1:  # amount单位为元
+                            unit_type = "元"
+                            multiplier = 1
+                        elif 900 <= ratio <= 1100:  # amount单位为千元
+                            unit_type = "千元"
+                            multiplier = 1000
+                        else:
+                            unit_type = "未知"
+                            multiplier = None
+
+                        unit_results.append({
+                            'stock': stock,
+                            'date': i,
+                            'ratio': ratio,
+                            'unit_type': unit_type,
+                            'multiplier': multiplier,
+                            'price': price,
+                            'volume': volume,
+                            'amount': amount
+                        })
+
+        if not unit_results:
+            return {'status': 'error', 'message': '无法获取足够的验证数据'}
+
+        # 统计结果
+        unit_counts = {}
+        for result in unit_results:
+            unit_type = result['unit_type']
+            unit_counts[unit_type] = unit_counts.get(unit_type, 0) + 1
+
+        # 确定最可能的单位
+        most_likely_unit = max(unit_counts, key=unit_counts.get)
+        confidence = unit_counts[most_likely_unit] / len(unit_results)
+
+        # 获取对应的乘数
+        if most_likely_unit == "万元":
+            recommended_multiplier = 10000
+        elif most_likely_unit == "千元":
+            recommended_multiplier = 1000
+        elif most_likely_unit == "元":
+            recommended_multiplier = 1
+        else:
+            recommended_multiplier = 10000  # 默认按万元处理（保守）
+
+        result = {
+            'status': 'success',
+            'most_likely_unit': most_likely_unit,
+            'confidence': confidence,
+            'recommended_multiplier': recommended_multiplier,
+            'current_code_multiplier': 10000,  # 当前代码使用的乘数
+            'unit_distribution': unit_counts,
+            'sample_count': len(unit_results),
+            'needs_adjustment': recommended_multiplier != 10000
+        }
+
+        print(f"验证结果：amount字段最可能的单位是 {most_likely_unit}（置信度：{confidence:.2%}）")
+        if result['needs_adjustment']:
+            print(f"⚠️ 建议调整乘数从 {result['current_code_multiplier']} 到 {recommended_multiplier}")
+        else:
+            print("✅ 当前代码中的单位处理是正确的")
+
+        return result
+
+    def run_consistency_test(self, test_runs=3, random_seed_base=42):
+        """
+        回测一致性测试：多次运行相同参数，验证结果一致性
+
+        Parameters:
+        -----------
+        test_runs : int
+            测试运行次数
+        random_seed_base : int
+            随机种子基数
+
+        Returns:
+        --------
+        dict : 一致性测试结果
+        """
+        print(f"开始进行{test_runs}次回测一致性测试...")
+
+        results = []
+
+        for i in range(test_runs):
+            print(f"执行第{i+1}次测试...")
+
+            # 设置固定随机种子确保可重现性
+            random.seed(random_seed_base + i)
+            np.random.seed(random_seed_base + i)
+
+            try:
+                # 重新运行策略选股和回测
+                selected_stocks = self.select_stocks()
+                if not selected_stocks:
+                    print(f"第{i+1}次测试：选股失败")
+                    continue
+
+                # 计算仓位（使用新的精确方法）
+                position_info = {}
+                for stock in selected_stocks:
+                    pos_info = self.calculate_position_size(stock, capital=1000000)
+                    if pos_info:
+                        position_info[stock] = pos_info['position_value']
+
+                if not position_info:
+                    print(f"第{i+1}次测试：仓位计算失败")
+                    continue
+
+                # 执行回测
+                equity_curve, performance_stats = self.backtest_with_risk_management(
+                    selected_stocks, position_info, initial_capital=1000000
+                )
+
+                results.append({
+                    'run': i + 1,
+                    'selected_stocks': selected_stocks.copy(),
+                    'position_info': position_info.copy(),
+                    'final_return': performance_stats.get('total_return', 0),
+                    'sharpe_ratio': performance_stats.get('sharpe_ratio', 0),
+                    'max_drawdown': performance_stats.get('max_drawdown', 0),
+                    'success': True
+                })
+
+            except Exception as e:
+                print(f"第{i+1}次测试出现异常: {e}")
+                results.append({
+                    'run': i + 1,
+                    'error': str(e),
+                    'success': False
+                })
+
+        # 分析一致性
+        successful_runs = [r for r in results if r.get('success', False)]
+
+        if len(successful_runs) < 2:
+            return {
+                'status': 'failed',
+                'message': f'成功运行次数不足: {len(successful_runs)}/{test_runs}',
+                'results': results
+            }
+
+        # 检查选股一致性
+        stock_consistency = True
+        base_stocks = set(successful_runs[0]['selected_stocks'])
+        for run in successful_runs[1:]:
+            if set(run['selected_stocks']) != base_stocks:
+                stock_consistency = False
+                break
+
+        # 检查收益率一致性（允许小幅差异）
+        returns = [r['final_return'] for r in successful_runs]
+        return_std = np.std(returns)
+        return_consistency = return_std < 0.001  # 允许0.1%的差异
+
+        consistency_result = {
+            'status': 'success',
+            'total_runs': test_runs,
+            'successful_runs': len(successful_runs),
+            'stock_consistency': stock_consistency,
+            'return_consistency': return_consistency,
+            'return_std': return_std,
+            'avg_return': np.mean(returns),
+            'results': results
+        }
+
+        print(f"一致性测试完成：")
+        print(f"  成功运行: {len(successful_runs)}/{test_runs}")
+        print(f"  选股一致性: {'✅' if stock_consistency else '❌'}")
+        print(f"  收益一致性: {'✅' if return_consistency else '❌'} (标准差: {return_std:.4f})")
+
+        return consistency_result
+
+    def create_detailed_trading_log(self):
+        """
+        创建详细的交易日志记录器
+        记录信号生成、约束检查、订单执行、成交回报等全流程
+        """
+        self.trading_log = {
+            'signals': [],          # 信号记录
+            'constraints': [],      # 约束检查记录
+            'orders': [],          # 订单记录
+            'executions': [],      # 执行记录
+            'failures': [],        # 失败记录
+            'daily_summary': {}    # 日度汇总
+        }
+        print("已初始化详细交易日志系统")
+
+    def log_signal(self, stock_code, signal_type, signal_value, metadata=None):
+        """记录交易信号"""
+        if not hasattr(self, 'trading_log'):
+            self.create_detailed_trading_log()
+
+        self.trading_log['signals'].append({
+            'timestamp': datetime.now().isoformat(),
+            'stock_code': stock_code,
+            'signal_type': signal_type,
+            'signal_value': signal_value,
+            'metadata': metadata or {}
+        })
+
+    def log_constraint_check(self, stock_code, constraint_type, passed, details=None):
+        """记录约束检查结果"""
+        if not hasattr(self, 'trading_log'):
+            self.create_detailed_trading_log()
+
+        self.trading_log['constraints'].append({
+            'timestamp': datetime.now().isoformat(),
+            'stock_code': stock_code,
+            'constraint_type': constraint_type,
+            'passed': passed,
+            'details': details or {}
+        })
+
+    def log_order(self, stock_code, order_type, quantity, target_price, metadata=None):
+        """记录订单信息"""
+        if not hasattr(self, 'trading_log'):
+            self.create_detailed_trading_log()
+
+        order_id = f"{stock_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.trading_log['orders'].append({
+            'order_id': order_id,
+            'timestamp': datetime.now().isoformat(),
+            'stock_code': stock_code,
+            'order_type': order_type,
+            'quantity': quantity,
+            'target_price': target_price,
+            'metadata': metadata or {}
+        })
+        return order_id
+
+    def log_execution(self, order_id, executed_quantity, executed_price, slippage, success, reason=None):
+        """记录执行结果"""
+        if not hasattr(self, 'trading_log'):
+            self.create_detailed_trading_log()
+
+        self.trading_log['executions'].append({
+            'timestamp': datetime.now().isoformat(),
+            'order_id': order_id,
+            'executed_quantity': executed_quantity,
+            'executed_price': executed_price,
+            'slippage': slippage,
+            'success': success,
+            'reason': reason
+        })
+
+    def export_trading_log(self, filepath=None):
+        """导出交易日志到文件"""
+        if not hasattr(self, 'trading_log'):
+            return None
+
+        if filepath is None:
+            filepath = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        import json
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(self.trading_log, f, ensure_ascii=False, indent=2)
+
+        print(f"交易日志已导出到: {filepath}")
+        return filepath
 
     def _calculate_transaction_costs(self, trade_value, is_buy=True):
         """
@@ -1501,20 +2301,21 @@ class RiskSensitiveTrendStrategy:
         is_buy : bool
             是否为买入交易
         """
-        # A股交易成本构成：
-        # 1. 印花税：卖出时收取0.1%，买入免收
-        # 2. 券商佣金：双边收取，一般0.025%，最低5元
-        # 3. 过户费：双边收取0.002%（仅上海）
+        # A股交易成本构成（更新至2023-08-28印花税下调）：
+        # 1. 印花税：卖出时收取0.05%，买入免收
+        # 2. 券商佣金：双边收取，一般0.03%，最低5元
+        # 3. 过户费：双边收取0.002%
 
+        # 印花税（仅卖出，2023-08-28下调至0.05%）
         stamp_duty = 0
-        if not is_buy:  # 只有卖出时收印花税
-            stamp_duty = trade_value * 0.001
+        if not is_buy:
+            stamp_duty = trade_value * self.stamp_tax_rate
 
-        # 券商佣金
-        commission = max(trade_value * 0.00025, 5)  # 最低5元
+        # 券商佣金（双边）
+        commission = max(trade_value * self.commission_rate, self.commission_min)
 
-        # 过户费（简化：统一按0.002%计算）
-        transfer_fee = trade_value * 0.00002
+        # 过户费（双边）
+        transfer_fee = trade_value * self.transfer_fee_rate
 
         total_cost = stamp_duty + commission + transfer_fee
 
@@ -1890,6 +2691,10 @@ class RiskSensitiveTrendStrategy:
                         self.code_alias[stock] = norm_code
 
             print(f"成功获取{len(self.price_data)}只股票数据（已过滤高风险）")
+            if hasattr(self, 'filter_st') and self.filter_st:
+                print("✓ ST股票已被过滤")
+            else:
+                print("✓ ST股票已保留（如需过滤请使用 --filter-st 选项）")
 
         # 4. 计算风险调整后的相对强度
         self.calculate_relative_strength()
@@ -1947,7 +2752,11 @@ class RiskSensitiveTrendStrategy:
         position_sizes = {}
 
         for stock in selected_stocks:
-            position_sizes[stock] = self.calculate_position_size(stock)
+            pos_info = self.calculate_position_size(stock)
+            if pos_info:
+                position_sizes[stock] = pos_info['position_value']
+            else:
+                position_sizes[stock] = 0
 
         # 根据市场状态调整仓位
         if market_regime == 'RISK_OFF':
@@ -2638,6 +3447,10 @@ def parse_args():
     parser.add_argument('--max-workers', type=int, default=None,
                        help='最大并发线程数(默认为CPU核心数的75%%)')
 
+    # 过滤选项
+    parser.add_argument('--filter-st', action='store_true',
+                       help='过滤ST股票（指定时筛选ST股票，不指定则保留ST股票）')
+
     # 输出选项
     parser.add_argument('--no-dashboard', action='store_true',
                        help='不生成风险仪表板HTML文件')
@@ -2657,6 +3470,7 @@ def main():
         print(f"总资本: ¥{args.capital:,.0f}")
         print(f"最大持仓: {args.max_positions}只")
         print(f"交易日期: {args.trade_date if args.trade_date else '今天'}")
+        print(f"ST股票过滤: {'开启' if args.filter_st else '关闭'}")
 
         # 读取当前持仓
         current_holdings = {}
@@ -2673,7 +3487,8 @@ def main():
             max_stocks=args.max_stocks if args.max_stocks > 0 else 200,
             capital=args.capital,
             max_positions=args.max_positions,
-            current_holdings=current_holdings
+            current_holdings=current_holdings,
+            filter_st=args.filter_st
         )
 
         print(f"\n=== 交易引擎完成 ===")
@@ -2703,7 +3518,8 @@ def main():
             qlib_dir=args.qlib_dir,
             stock_pool_mode=args.pool_mode,
             custom_stocks=custom_stocks,
-            index_code=args.index_code
+            index_code=args.index_code,
+            filter_st=args.filter_st
         )
 
         # 设置股票数量限制（如果是auto模式且指定了max_stocks）
@@ -3255,7 +4071,7 @@ class DailyTradingPlan:
 
 
 def run_daily_trading_engine(start_date='20230101', end_date=None, max_stocks=200,
-                           capital=1000000, max_positions=5, current_holdings=None):
+                           capital=1000000, max_positions=5, current_holdings=None, filter_st=False):
     """运行每日交易引擎 - 一键生成交易计划"""
     print("=== 启动每日交易引擎 ===")
 
@@ -3263,7 +4079,8 @@ def run_daily_trading_engine(start_date='20230101', end_date=None, max_stocks=20
     strategy = RiskSensitiveTrendStrategy(
         start_date=start_date,
         end_date=end_date,
-        stock_pool_mode='auto'
+        stock_pool_mode='auto',
+        filter_st=filter_st
     )
     strategy.max_stocks = max_stocks
 
