@@ -99,6 +99,9 @@ class RiskSensitiveTrendStrategy:
 
         # T+1持仓账本：记录每笔买入的可卖日期
         self.position_ledger = {}  # {stock_code: [{'shares': int, 'buy_date': str, 'sellable_date': str, 'buy_price': float}]}
+        
+        # ST判断缓存（避免重复名称查询）
+        self._st_name_cache = {}  # {stock_code: is_st_by_name}
 
         # 流动性过滤参数
         self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
@@ -462,6 +465,7 @@ class RiskSensitiveTrendStrategy:
         if len(st_stocks) == 0:
             self._st_api_failed = True
             print("ST股票API获取失败，后续将使用保守策略（不区分ST股票）")
+            print("💡 提示：为提升性能，ST判断将使用缓存机制")
         else:
             print(f"成功识别{len(st_stocks)}只ST/风险警示股票")
 
@@ -473,7 +477,7 @@ class RiskSensitiveTrendStrategy:
 
     def _is_st_stock(self, stock_code: str) -> bool:
         """
-        判断是否为ST股票（带后备机制）
+        判断是否为ST股票（带后备机制，优化缓存）
 
         Parameters:
         -----------
@@ -491,16 +495,22 @@ class RiskSensitiveTrendStrategy:
         if len(st_stocks) > 0:
             return numeric_code in st_stocks
 
-        # API失败时使用名称匹配作为降级策略
+        # API失败时使用缓存的名称匹配结果
+        if numeric_code in self._st_name_cache:
+            return self._st_name_cache[numeric_code]
+
+        # API失败且无缓存时，进行名称匹配（仅执行一次）
+        is_st_by_name = False
         try:
             stock_name = self.get_stock_name(numeric_code)
             if stock_name and ('ST' in stock_name or '*ST' in stock_name):
-                return True
+                is_st_by_name = True
         except Exception:
             pass
 
-        # 如果无法通过名称判断，返回False（不视为ST）
-        return False
+        # 缓存结果避免重复查询
+        self._st_name_cache[numeric_code] = is_st_by_name
+        return is_st_by_name
 
     def get_all_available_stocks(self):
         """
@@ -568,9 +578,15 @@ class RiskSensitiveTrendStrategy:
             print(f"候选股票数量（来自 Qlib instruments）：{len(candidate_pool)}")
 
             # 批量过滤：检查数据可用性和基本质量
+            print("📊 开始股票池质量过滤...")
             filtered_stocks = []
             start_date_qlib = self._convert_date_format(self.start_date)
             end_date_qlib = self._convert_date_format(self.end_date)
+            
+            # 预先获取ST股票列表（批量优化）
+            print("🔍 预先获取ST股票名单...")
+            if self.filter_st:
+                _ = self._fetch_st_stocks_list()  # 触发ST股票获取和缓存
 
             # 使用并发处理批量筛选
             batch_size = 20
@@ -611,11 +627,16 @@ class RiskSensitiveTrendStrategy:
                             else:
                                 filtered_stocks.extend(batch_filtered)
 
-                        print(f"批次进度: {batch_count}/{len(batches)}, 已筛选: {len(filtered_stocks)}")
+                        # 每处理5个批次或最后一个批次才显示进度
+                        if batch_count % 5 == 0 or batch_count == len(batches):
+                            progress_pct = (batch_count / len(batches)) * 100
+                            print(f"批次进度: {batch_count}/{len(batches)} ({progress_pct:.1f}%), 已筛选: {len(filtered_stocks)} 只股票")
                     except Exception as e:
                         print(f"处理批次时出错: {e}")
 
-            print(f"从{len(candidate_pool)}个候选股票中筛选出{len(filtered_stocks)}只合格股票")
+            print(f"✅ 股票池筛选完成：从{len(candidate_pool)}个候选股票中筛选出{len(filtered_stocks)}只合格股票")
+            if self._st_api_failed:
+                print(f"💡 ST筛选性能优化：已缓存{len(self._st_name_cache)}只股票的ST判断结果")
 
             # 随机化筛选结果，避免偏差
             if filtered_stocks:
@@ -1772,8 +1793,16 @@ class RiskSensitiveTrendStrategy:
             max_workers = max(1, int(mp.cpu_count() * 0.75))
 
         cpu_count = mp.cpu_count()
-        print(f"正在并发获取股票历史数据并计算风险指标...")
-        print(f"系统信息: CPU核心数={cpu_count}, 使用并发线程数={max_workers}")
+        print(f"📈 正在并发获取股票历史数据并计算风险指标...")
+        print(f"🔧 系统信息: CPU核心数={cpu_count}, 使用并发线程数={max_workers}")
+        print(f"📊 股票池规模: {len(self.stock_pool)} 只股票")
+        
+        # 估算处理时间
+        estimated_time = len(self.stock_pool) * 0.5 / max_workers  # 假设每只股票0.5秒
+        if estimated_time > 60:
+            print(f"⏱️  预计处理时间: {estimated_time/60:.1f} 分钟")
+        else:
+            print(f"⏱️  预计处理时间: {estimated_time:.0f} 秒")
 
         successful_count = 0
         total_count = len(self.stock_pool)
