@@ -92,16 +92,11 @@ class RiskSensitiveTrendStrategy:
 
         self.slippage_bps = 5              # 滑点（5个基点）
 
-        # ST股票缓存
-        self._st_stocks_cache = {}
-        self._st_cache_date = None
-        self._st_api_failed = False  # 标记API是否已失败，避免重复尝试
+        # ST股票本地缓存
+        self._local_st_stocks = self._load_local_st_stocks()
 
         # T+1持仓账本：记录每笔买入的可卖日期
         self.position_ledger = {}  # {stock_code: [{'shares': int, 'buy_date': str, 'sellable_date': str, 'buy_price': float}]}
-        
-        # ST判断缓存（避免重复名称查询）
-        self._st_name_cache = {}  # {stock_code: is_st_by_name}
 
         # 流动性过滤参数
         self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
@@ -131,6 +126,30 @@ class RiskSensitiveTrendStrategy:
 
         # 初始化qlib
         self._init_qlib()
+
+    def _load_local_st_stocks(self):
+        """从本地JSON文件加载ST股票列表"""
+        st_file_path = "st_stocks_akshare.json"
+        try:
+            with open(st_file_path, 'r', encoding='utf-8') as f:
+                st_data = json.load(f)
+            
+            # 提取股票代码
+            st_codes = {item['code'] for item in st_data}
+            print(f"📋 从本地文件加载了 {len(st_codes)} 只ST股票")
+            # 显示部分ST股票信息用于验证
+            if st_codes:
+                sample_names = [item['name'] for item in st_data[:5]]  # 显示前5个
+                print(f"   示例ST股票: {', '.join(sample_names)}")
+            
+            return st_codes
+            
+        except FileNotFoundError:
+            print(f"⚠️  本地ST股票文件 {st_file_path} 未找到，将不进行ST股票过滤")
+            return set()
+        except Exception as e:
+            print(f"❌ 加载本地ST股票文件失败: {e}")
+            return set()
 
     def _setup_logging(self):
         """设置交易审计日志"""
@@ -410,75 +429,10 @@ class RiskSensitiveTrendStrategy:
         # 兜底：返回原始代码
         return stock_code
 
-    def _fetch_st_stocks_list(self) -> set:
-        """
-        获取当前ST/风险警示股票名单
-        使用AkShare API而非字符串判断，增强错误处理
-        """
-        today = datetime.now().strftime('%Y-%m-%d')
-
-        # 检查缓存
-        if self._st_cache_date == today and self._st_stocks_cache:
-            return self._st_stocks_cache
-
-        # 如果API已标记为失败，直接返回空集合避免重复尝试
-        if self._st_api_failed:
-            return set()
-
-        st_stocks = set()
-
-        # 方法1：尝试获取风险警示板块股票（静默失败避免过多错误信息）
-        try:
-            import time
-            time.sleep(0.1)  # 简单的API限流
-            risk_warning_stocks = ak.stock_board_concept_cons_em(symbol="风险警示")
-            if risk_warning_stocks is not None and not risk_warning_stocks.empty and '代码' in risk_warning_stocks.columns:
-                codes = risk_warning_stocks['代码'].astype(str).str.zfill(6)
-                if len(codes) > 0:
-                    st_stocks.update(codes.tolist())
-                    print(f"通过风险警示板块获取到{len(codes)}只ST股票")
-        except Exception as e:
-            # 静默处理，避免过多错误日志
-            pass
-
-        # 方法2：通过股票名称匹配ST（更鲁棒的实现）
-        try:
-            import time
-            time.sleep(0.1)  # 简单的API限流
-            all_stocks = ak.stock_info_a_code_name()
-            if all_stocks is not None and not all_stocks.empty and '名称' in all_stocks.columns and '代码' in all_stocks.columns:
-                # 查找名称包含ST的股票
-                name_col = all_stocks['名称']
-                st_mask = name_col.str.contains('ST|\\*ST|S\\*ST', na=False, regex=True)
-                if st_mask.any():
-                    st_names = all_stocks[st_mask]
-                    codes = st_names['代码'].astype(str).str.zfill(6)
-                    if len(codes) > 0:
-                        new_st_count = len(codes)
-                        st_stocks.update(codes.tolist())
-                        print(f"通过名称匹配新增{new_st_count}只ST股票")
-        except Exception as e:
-            # 静默处理，避免过多错误日志
-            pass
-
-        # 如果两种方法都失败，标记API失败避免重复尝试
-        if len(st_stocks) == 0:
-            self._st_api_failed = True
-            print("ST股票API获取失败，后续将使用保守策略（不区分ST股票）")
-            print("💡 提示：为提升性能，ST判断将使用缓存机制")
-        else:
-            print(f"成功识别{len(st_stocks)}只ST/风险警示股票")
-
-        # 更新缓存
-        self._st_stocks_cache = st_stocks
-        self._st_cache_date = today
-
-        return st_stocks
-
     def _is_st_stock(self, stock_code: str) -> bool:
         """
-        判断是否为ST股票（带后备机制，优化缓存）
-
+        简化的ST股票判断（基于本地缓存文件）
+        
         Parameters:
         -----------
         stock_code : str
@@ -489,28 +443,8 @@ class RiskSensitiveTrendStrategy:
         if len(stock_code) > 6:
             numeric_code = stock_code[2:] if stock_code[:2] in ('SH', 'SZ', 'BJ') else stock_code
         numeric_code = str(numeric_code).zfill(6)
-
-        # 首先尝试API方法
-        st_stocks = self._fetch_st_stocks_list()
-        if len(st_stocks) > 0:
-            return numeric_code in st_stocks
-
-        # API失败时使用缓存的名称匹配结果
-        if numeric_code in self._st_name_cache:
-            return self._st_name_cache[numeric_code]
-
-        # API失败且无缓存时，进行名称匹配（仅执行一次）
-        is_st_by_name = False
-        try:
-            stock_name = self.get_stock_name(numeric_code)
-            if stock_name and ('ST' in stock_name or '*ST' in stock_name):
-                is_st_by_name = True
-        except Exception:
-            pass
-
-        # 缓存结果避免重复查询
-        self._st_name_cache[numeric_code] = is_st_by_name
-        return is_st_by_name
+        
+        return numeric_code in self._local_st_stocks
 
     def get_all_available_stocks(self):
         """
@@ -577,16 +511,18 @@ class RiskSensitiveTrendStrategy:
             candidate_pool = self._list_all_qlib_instruments_in_range()
             print(f"候选股票数量（来自 Qlib instruments）：{len(candidate_pool)}")
 
+            # 首先剔除ST股票（如果启用ST过滤）
+            if self.filter_st and self._local_st_stocks:
+                original_count = len(candidate_pool)
+                candidate_pool = [code for code in candidate_pool if code not in self._local_st_stocks]
+                removed_count = original_count - len(candidate_pool)
+                print(f"🚫 已剔除 {removed_count} 只ST股票，剩余 {len(candidate_pool)} 只股票")
+
             # 批量过滤：检查数据可用性和基本质量
             print("📊 开始股票池质量过滤...")
             filtered_stocks = []
             start_date_qlib = self._convert_date_format(self.start_date)
             end_date_qlib = self._convert_date_format(self.end_date)
-            
-            # 预先获取ST股票列表（批量优化）
-            print("🔍 预先获取ST股票名单...")
-            if self.filter_st:
-                _ = self._fetch_st_stocks_list()  # 触发ST股票获取和缓存
 
             # 使用并发处理批量筛选
             batch_size = 20
@@ -635,8 +571,6 @@ class RiskSensitiveTrendStrategy:
                         print(f"处理批次时出错: {e}")
 
             print(f"✅ 股票池筛选完成：从{len(candidate_pool)}个候选股票中筛选出{len(filtered_stocks)}只合格股票")
-            if self._st_api_failed:
-                print(f"💡 ST筛选性能优化：已缓存{len(self._st_name_cache)}只股票的ST判断结果")
 
             # 随机化筛选结果，避免偏差
             if filtered_stocks:
@@ -753,9 +687,7 @@ class RiskSensitiveTrendStrategy:
                 if recent_prices.iloc[-1] < 1:  # 股价过低
                     return False
 
-            # ST股票过滤（根据命令行参数决定）
-            if self.filter_st and self._is_st_stock(stock_code):
-                return False
+            # ST股票已在候选池阶段预先剔除，此处无需重复过滤
 
             return True
 
@@ -795,9 +727,6 @@ class RiskSensitiveTrendStrategy:
 
             if is_st:
                 # ST股票5%
-                limit_pct = self.st_limit_pct
-            elif self._st_api_failed:
-                # ST API失败时，主板保守使用5%（科创/北交不受影响）
                 limit_pct = self.st_limit_pct
             else:
                 # 主板普通股票10%
@@ -3278,7 +3207,7 @@ class RiskSensitiveTrendStrategy:
 
             print(f"成功获取{len(self.price_data)}只股票数据（已过滤高风险）")
             if hasattr(self, 'filter_st') and self.filter_st:
-                print("✓ ST股票已被过滤")
+                print("✓ ST股票已在股票池构建阶段预先剔除")
             else:
                 print("✓ ST股票已保留（如需过滤请使用 --filter-st 选项）")
 
@@ -4035,7 +3964,7 @@ def parse_args():
 
     # 过滤选项
     parser.add_argument('--filter-st', action='store_true',
-                       help='过滤ST股票（指定时筛选ST股票，不指定则保留ST股票）')
+                       help='过滤ST股票（基于本地st_stocks_akshare.json文件，在股票池构建初期就剔除）')
 
     # 输出选项
     parser.add_argument('--no-dashboard', action='store_true',
