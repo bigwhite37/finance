@@ -1175,6 +1175,308 @@ class RiskSensitiveTrendStrategy:
         print(f"审计日志已导出到: {filename}")
         return filename
 
+    def create_enhanced_portfolio_dashboard(self, equity_curve, performance_stats, selected_stocks, position_sizes):
+        """创建增强版组合分析仪表板"""
+        
+        # 创建子图布局 - 更多的分析图表
+        fig = make_subplots(
+            rows=5, cols=2,
+            subplot_titles=[
+                '净值曲线 & 回撤', '月度收益热力图',
+                '日收益分布', '滚动夏普比率',
+                '累计收益分解', '风险指标雷达图',
+                '持仓权重分布', '个股贡献分析',
+                '交易统计概览', '风险-收益散点图'
+            ],
+            specs=[
+                [{'secondary_y': True}, {'type': 'heatmap'}],
+                [{'type': 'histogram'}, {'type': 'scatter'}], 
+                [{'secondary_y': True}, {'type': 'scatterpolar'}],
+                [{'type': 'pie'}, {'type': 'bar'}],
+                [{'type': 'table'}, {'type': 'scatter'}]
+            ],
+            vertical_spacing=0.06,
+            horizontal_spacing=0.1,
+            row_heights=[0.25, 0.2, 0.2, 0.2, 0.15]
+        )
+
+        # 1. 净值曲线 & 回撤
+        daily_returns = self.daily_return if hasattr(self, 'daily_return') and self.daily_return is not None else equity_curve.pct_change().dropna()
+        
+        # 计算回撤
+        nav = equity_curve
+        peak = nav.cummax()
+        drawdown = (nav / peak - 1) * 100
+        
+        # 净值曲线
+        fig.add_trace(
+            go.Scatter(
+                x=equity_curve.index,
+                y=equity_curve.values,
+                mode='lines',
+                name='净值曲线',
+                line=dict(color='blue', width=2),
+                hovertemplate='日期: %{x}<br>净值: %{y:.4f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # 回撤曲线
+        fig.add_trace(
+            go.Scatter(
+                x=drawdown.index,
+                y=drawdown.values,
+                mode='lines',
+                name='回撤(%)',
+                line=dict(color='red', width=1),
+                fill='tonexty',
+                fillcolor='rgba(255,0,0,0.3)',
+                yaxis='y2',
+                hovertemplate='日期: %{x}<br>回撤: %{y:.2f}%<extra></extra>'
+            ),
+            row=1, col=1, secondary_y=True
+        )
+
+        # 2. 月度收益热力图
+        if len(daily_returns) > 30:
+            monthly_returns = daily_returns.resample('M').apply(lambda x: (1 + x).prod() - 1) * 100
+            monthly_df = monthly_returns.to_frame('return')
+            monthly_df['year'] = monthly_df.index.year
+            monthly_df['month'] = monthly_df.index.month
+            
+            # 创建透视表
+            pivot_table = monthly_df.pivot(index='year', columns='month', values='return')
+            
+            fig.add_trace(
+                go.Heatmap(
+                    z=pivot_table.values,
+                    x=[f"{i}月" for i in range(1, 13)],
+                    y=pivot_table.index,
+                    colorscale='RdYlGn',
+                    name='月度收益(%)',
+                    hovertemplate='%{y}年%{x}: %{z:.2f}%<extra></extra>'
+                ),
+                row=1, col=2
+            )
+
+        # 3. 日收益分布直方图
+        fig.add_trace(
+            go.Histogram(
+                x=daily_returns * 100,
+                nbinsx=50,
+                name='日收益分布',
+                marker_color='lightblue',
+                opacity=0.7,
+                hovertemplate='收益率: %{x:.2f}%<br>频次: %{y}<extra></extra>'
+            ),
+            row=2, col=1
+        )
+
+        # 4. 滚动夏普比率
+        if len(daily_returns) > 63:
+            rolling_sharpe = daily_returns.rolling(63).mean() / daily_returns.rolling(63).std() * np.sqrt(252)
+            rolling_sharpe = rolling_sharpe.dropna()
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=rolling_sharpe.index,
+                    y=rolling_sharpe.values,
+                    mode='lines',
+                    name='滚动夏普比率(63日)',
+                    line=dict(color='green', width=2),
+                    hovertemplate='日期: %{x}<br>夏普比率: %{y:.3f}<extra></extra>'
+                ),
+                row=2, col=2
+            )
+            
+            # 添加参考线
+            fig.add_hline(y=1.0, line_dash="dash", line_color="red", row=2, col=2)
+            fig.add_hline(y=2.0, line_dash="dash", line_color="green", row=2, col=2)
+
+        # 5. 累计收益分解 - 按年份
+        yearly_returns = daily_returns.resample('Y').apply(lambda x: (1 + x).prod() - 1) * 100
+        cumulative_yearly = (1 + yearly_returns/100).cumprod()
+        
+        fig.add_trace(
+            go.Scatter(
+                x=yearly_returns.index.year,
+                y=cumulative_yearly.values,
+                mode='lines+markers',
+                name='年度累计收益',
+                line=dict(color='purple', width=3),
+                marker=dict(size=8),
+                hovertemplate='年份: %{x}<br>累计收益: %{y:.2f}<extra></extra>'
+            ),
+            row=3, col=1
+        )
+        
+        # 年度收益柱状图
+        fig.add_trace(
+            go.Bar(
+                x=yearly_returns.index.year,
+                y=yearly_returns.values,
+                name='年度收益率(%)',
+                marker_color=['green' if x > 0 else 'red' for x in yearly_returns.values],
+                yaxis='y2',
+                opacity=0.6,
+                hovertemplate='年份: %{x}<br>年收益率: %{y:.2f}%<extra></extra>'
+            ),
+            row=3, col=1, secondary_y=True
+        )
+
+        # 6. 风险指标雷达图
+        radar_metrics = {
+            '收益率': min(performance_stats.get('annual_return', 0) * 5, 1),  # 标准化到0-1
+            '夏普比率': min(max(performance_stats.get('sharpe', 0) / 3, 0), 1),
+            '胜率': performance_stats.get('win_rate', 0),
+            '稳定性': 1 - min(abs(performance_stats.get('max_drawdown', 0)) * 5, 1),
+            'Sortino': min(max(performance_stats.get('sortino', 0) / 3, 0), 1),
+            '信息比率': min(max(performance_stats.get('info_ratio', 0) / 2 + 0.5, 0), 1)
+        }
+        
+        fig.add_trace(
+            go.Scatterpolar(
+                r=list(radar_metrics.values()),
+                theta=list(radar_metrics.keys()),
+                fill='toself',
+                name='策略表现',
+                line_color='blue'
+            ),
+            row=3, col=2
+        )
+
+        # 7. 持仓权重分布饼图
+        if position_sizes:
+            total_position = sum(position_sizes.values())
+            weights = [(v/total_position)*100 for v in position_sizes.values()]
+            stock_names = [f"{k}<br>{self.get_stock_name(k)}" for k in position_sizes.keys()]
+            
+            fig.add_trace(
+                go.Pie(
+                    labels=stock_names,
+                    values=weights,
+                    name="持仓权重",
+                    hovertemplate='%{label}<br>权重: %{value:.1f}%<extra></extra>'
+                ),
+                row=4, col=1
+            )
+
+        # 8. 个股贡献分析（风险评分 vs 仓位）
+        if selected_stocks and hasattr(self, 'risk_metrics'):
+            risk_scores = []
+            positions = []
+            stock_labels = []
+            
+            for stock in selected_stocks:
+                if stock in self.risk_metrics and stock in position_sizes:
+                    risk_scores.append(self.risk_metrics[stock].get('risk_score', 0))
+                    positions.append(position_sizes[stock])
+                    stock_labels.append(f"{stock}<br>{self.get_stock_name(stock)}")
+            
+            fig.add_trace(
+                go.Bar(
+                    x=stock_labels,
+                    y=positions,
+                    name='仓位大小',
+                    marker_color='lightgreen',
+                    hovertemplate='%{x}<br>仓位: ¥%{y:,.0f}<extra></extra>'
+                ),
+                row=4, col=2
+            )
+
+        # 9. 交易统计表格
+        trading_stats = self.get_trading_statistics()
+        if trading_stats['total_orders'] > 0:
+            table_data = [
+                ['总订单数', f"{trading_stats['total_orders']}"],
+                ['成功成交', f"{trading_stats['successful_fills']}"],
+                ['成交率', f"{trading_stats.get('success_rate', 0):.2%}"],
+                ['平均成交比例', f"{trading_stats.get('avg_fill_ratio', 0):.2%}"],
+                ['平均交易成本', f"¥{trading_stats.get('avg_transaction_cost', 0):.2f}"],
+                ['价格限制订单', f"{trading_stats['price_limited_orders']}"],
+                ['成交量限制订单', f"{trading_stats['volume_limited_orders']}"]
+            ]
+        else:
+            table_data = [['暂无交易统计', '请运行实际交易']]
+        
+        fig.add_trace(
+            go.Table(
+                header=dict(values=['指标', '数值'], fill_color='lightblue'),
+                cells=dict(values=list(zip(*table_data)), fill_color='white')
+            ),
+            row=5, col=1
+        )
+
+        # 10. 风险-收益散点图（选中股票）
+        if selected_stocks and hasattr(self, 'risk_metrics'):
+            volatilities = []
+            returns = []
+            sizes = []
+            colors = []
+            labels = []
+            
+            for stock in selected_stocks:
+                if stock in self.risk_metrics:
+                    metrics = self.risk_metrics[stock]
+                    volatilities.append(metrics.get('volatility', 0) * 100)
+                    # 估算收益率（简化）
+                    returns.append(metrics.get('sharpe_ratio', 0) * metrics.get('volatility', 0) * 100)
+                    sizes.append(position_sizes.get(stock, 0) / 10000)  # 规模调整
+                    colors.append(100 - metrics.get('risk_score', 50))  # 颜色表示质量
+                    labels.append(f"{stock}<br>{self.get_stock_name(stock)}")
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=volatilities,
+                    y=returns,
+                    mode='markers',
+                    marker=dict(
+                        size=[max(s, 10) for s in sizes],
+                        color=colors,
+                        colorscale='RdYlGn',
+                        showscale=True,
+                        colorbar=dict(title="质量分数")
+                    ),
+                    text=labels,
+                    name='个股分析',
+                    hovertemplate='%{text}<br>波动率: %{x:.1f}%<br>预期收益: %{y:.1f}%<extra></extra>'
+                ),
+                row=5, col=2
+            )
+
+        # 更新布局
+        fig.update_layout(
+            height=2000,
+            title={
+                'text': f'增强版组合分析报告 - {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}',
+                'x': 0.5,
+                'xanchor': 'center',
+                'font': {'size': 20}
+            },
+            showlegend=False,
+            template='plotly_white'
+        )
+
+        # 设置轴标签
+        fig.update_xaxes(title_text="日期", row=1, col=1)
+        fig.update_yaxes(title_text="净值", row=1, col=1)
+        fig.update_yaxes(title_text="回撤(%)", secondary_y=True, row=1, col=1)
+        
+        fig.update_xaxes(title_text="日收益率(%)", row=2, col=1)
+        fig.update_yaxes(title_text="频次", row=2, col=1)
+        
+        fig.update_xaxes(title_text="日期", row=2, col=2)
+        fig.update_yaxes(title_text="夏普比率", row=2, col=2)
+        
+        fig.update_xaxes(title_text="年份", row=3, col=1)
+        fig.update_yaxes(title_text="累计收益", row=3, col=1)
+        fig.update_yaxes(title_text="年收益率(%)", secondary_y=True, row=3, col=1)
+        
+        fig.update_xaxes(title_text="波动率(%)", row=5, col=2)
+        fig.update_yaxes(title_text="预期收益(%)", row=5, col=2)
+        
+        return fig
+
     def _calculate_realistic_stop_loss(self, current_price, atr, yesterday_close, stock_code=None, is_st=None):
         """
         计算考虑A股制度约束的止损价格
@@ -1572,26 +1874,61 @@ class RiskSensitiveTrendStrategy:
         return equity
 
     def _compute_performance_stats(self, equity: pd.Series | None = None) -> dict:
-        """基于回测结果计算统一口径绩效指标。若 equity 为空则使用 self.equity_curve/self.daily_return。"""
+        """基于回测结果计算全面绩效指标。若 equity 为空则使用 self.equity_curve/self.daily_return。"""
         if equity is None:
             equity = getattr(self, 'equity_curve', None)
         daily_ret = getattr(self, 'daily_return', None)
         if equity is None or daily_ret is None or equity.empty or daily_ret.empty:
             return {}
 
+        # 基础收益指标
         total_return = float(equity.iloc[-1] - 1.0)
         ann_return = float((1.0 + daily_ret.mean()) ** 252 - 1.0)
         ann_vol = float(daily_ret.std() * np.sqrt(252)) if daily_ret.std() == daily_ret.std() else 0.0
 
+        # 基准比较（使用沪深300作为基准）
+        try:
+            # 简化基准收益率估算（年化8%）
+            benchmark_daily = 0.08 / 252
+            excess_ret = daily_ret - benchmark_daily
+            alpha = float(excess_ret.mean() * 252)
+            tracking_error = float(excess_ret.std() * np.sqrt(252))
+            info_ratio = alpha / tracking_error if tracking_error > 0 else 0.0
+        except:
+            alpha, tracking_error, info_ratio = 0.0, 0.0, 0.0
+
+        # 风险调整指标
         rf_daily = 0.025 / 252
         excess = daily_ret - rf_daily
         sharpe = float((excess.mean() * 252) / (daily_ret.std() * np.sqrt(252))) if daily_ret.std() > 0 else 0.0
+        
+        # Sortino比率（下行标准差）
+        downside_ret = daily_ret[daily_ret < 0]
+        downside_std = float(downside_ret.std() * np.sqrt(252)) if len(downside_ret) > 0 else 0.0
+        sortino = float((daily_ret.mean() - rf_daily) * 252 / downside_std) if downside_std > 0 else 0.0
 
+        # 回撤分析
         nav = equity
         peak = nav.cummax()
         dd = nav / peak - 1.0
         max_dd = float(dd.min())
+        
+        # 回撤持续时间
+        dd_periods = (dd < -0.01)  # 回撤超过1%的时期
+        if dd_periods.any():
+            dd_duration = 0
+            current_dd = 0
+            max_dd_duration = 0
+            for is_dd in dd_periods:
+                if is_dd:
+                    current_dd += 1
+                    max_dd_duration = max(max_dd_duration, current_dd)
+                else:
+                    current_dd = 0
+        else:
+            max_dd_duration = 0
 
+        # 胜负分析
         wins = (daily_ret > 0).sum()
         losses = (daily_ret < 0).sum()
         win_rate = float(wins) / float(wins + losses) if (wins + losses) > 0 else 0.0
@@ -1599,14 +1936,53 @@ class RiskSensitiveTrendStrategy:
         avg_loss = float(-daily_ret[daily_ret < 0].mean()) if losses > 0 else 0.0
         profit_factor = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
+        # 尾部风险
+        var_95 = float(np.percentile(daily_ret, 5)) if len(daily_ret) > 0 else 0.0
+        cvar_95 = float(daily_ret[daily_ret <= var_95].mean()) if len(daily_ret[daily_ret <= var_95]) > 0 else 0.0
+
+        # 一致性指标
+        monthly_rets = daily_ret.resample('M').apply(lambda x: (1 + x).prod() - 1)
+        monthly_wins = (monthly_rets > 0).sum()
+        monthly_total = len(monthly_rets)
+        monthly_win_rate = float(monthly_wins / monthly_total) if monthly_total > 0 else 0.0
+
+        # Calmar比率 (年化收益/最大回撤)
+        calmar = abs(ann_return / max_dd) if max_dd != 0 else 0.0
+
         return {
+            # 基础收益指标
             'total_return': total_return,
             'annual_return': ann_return,
             'annual_vol': ann_vol,
+            
+            # 风险调整指标
             'sharpe': sharpe,
+            'sortino': sortino,
+            'calmar': calmar,
+            
+            # 基准比较
+            'alpha': alpha,
+            'tracking_error': tracking_error,
+            'info_ratio': info_ratio,
+            
+            # 回撤分析
             'max_drawdown': max_dd,
+            'max_dd_duration': max_dd_duration,
+            
+            # 胜负分析
             'win_rate': win_rate,
+            'monthly_win_rate': monthly_win_rate,
             'profit_factor': profit_factor,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            
+            # 尾部风险
+            'var_95': var_95,
+            'cvar_95': cvar_95,
+            
+            # 其他统计
+            'total_days': len(daily_ret),
+            'trading_days': len(daily_ret[daily_ret != 0]),
         }
 
     def run_rolling_backtest(self, top_k: int = 5, rebalance: str = 'M', skip_recent: int = 21, mom_window: int = 126, min_live_stocks: int = 3):
@@ -1628,15 +2004,49 @@ class RiskSensitiveTrendStrategy:
             return None, {}
 
         stats = self._compute_performance_stats(equity)
-        print("================  滚动回测绩效（统一口径）  ================")
-        print(f"总收益率: {stats.get('total_return', 0.0)*100:.2f}%")
-        print(f"年化收益率: {stats.get('annual_return', 0.0)*100:.2f}%")
-        print(f"年化波动率: {stats.get('annual_vol', 0.0)*100:.2f}%")
-        print(f"夏普比率: {stats.get('sharpe', 0.0):.3f}")
-        print(f"最大回撤: {stats.get('max_drawdown', 0.0)*100:.2f}%")
-        print(f"胜率: {stats.get('win_rate', 0.0)*100:.1f}%")
-        print(f"盈亏比: {stats.get('profit_factor', 0.0):.2f}")
-        print("============================================================")
+        print("="*80)
+        print("                     策略全面绩效分析报告")
+        print("="*80)
+        
+        # 基础收益指标
+        print("\n📊 基础收益指标:")
+        print(f"  总收益率           : {stats.get('total_return', 0):8.2%}")
+        print(f"  年化收益率         : {stats.get('annual_return', 0):8.2%}")
+        print(f"  年化波动率         : {stats.get('annual_vol', 0):8.2%}")
+        print(f"  回测天数           : {stats.get('total_days', 0):8.0f} 天")
+        print(f"  有效交易日         : {stats.get('trading_days', 0):8.0f} 天")
+        
+        # 风险调整指标
+        print("\n⚖️  风险调整指标:")
+        print(f"  夏普比率           : {stats.get('sharpe', 0):8.3f}")
+        print(f"  Sortino比率        : {stats.get('sortino', 0):8.3f}")
+        print(f"  Calmar比率         : {stats.get('calmar', 0):8.3f}")
+        
+        # 基准比较
+        print("\n📈 基准比较(vs 沪深300):")
+        print(f"  超额收益(Alpha)    : {stats.get('alpha', 0):8.2%}")
+        print(f"  跟踪误差           : {stats.get('tracking_error', 0):8.2%}")
+        print(f"  信息比率           : {stats.get('info_ratio', 0):8.3f}")
+        
+        # 回撤分析
+        print("\n📉 回撤分析:")
+        print(f"  最大回撤           : {stats.get('max_drawdown', 0):8.2%}")
+        print(f"  最大回撤持续       : {stats.get('max_dd_duration', 0):8.0f} 天")
+        
+        # 胜负分析
+        print("\n🎯 胜负分析:")
+        print(f"  日胜率             : {stats.get('win_rate', 0):8.2%}")
+        print(f"  月胜率             : {stats.get('monthly_win_rate', 0):8.2%}")
+        print(f"  盈亏比             : {stats.get('profit_factor', 0):8.2f}")
+        print(f"  平均盈利           : {stats.get('avg_win', 0):8.2%}")
+        print(f"  平均亏损           : {stats.get('avg_loss', 0):8.2%}")
+        
+        # 尾部风险
+        print("\n⚠️  尾部风险:")
+        print(f"  VaR(95%)          : {stats.get('var_95', 0):8.2%}")
+        print(f"  CVaR(95%)         : {stats.get('cvar_95', 0):8.2%}")
+        
+        print("="*80)
         return equity, stats
 
     def _build_tradable_mask(self, prices: pd.DataFrame, valid: pd.DataFrame) -> pd.DataFrame:
@@ -3609,6 +4019,11 @@ def main():
             # 保存为HTML文件而不是直接显示
             fig_portfolio.write_html("portfolio_curve.html")
             print("组合净值曲线已保存为 portfolio_curve.html")
+            
+            # 生成增强版的组合分析报告
+            enhanced_fig = self.create_enhanced_portfolio_dashboard(equity_curve, performance_stats, selected_stocks, position_sizes)
+            enhanced_fig.write_html("portfolio_analysis_enhanced.html")
+            print("增强版组合分析报告已保存为 portfolio_analysis_enhanced.html")
     else:
         print("没有符合风险条件的股票")
 
