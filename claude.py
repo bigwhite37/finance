@@ -15,8 +15,15 @@ from qlib.data import D
 import os
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from functools import partial
+from functools import partial, lru_cache
+import threading
 import multiprocessing as mp
+try:
+    import numba
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("⚠️  Numba未安装，将使用标准pandas计算（建议安装numba以获得更好性能）")
 import random
 import logging
 import json
@@ -95,6 +102,10 @@ class RiskSensitiveTrendStrategy:
         # ST股票本地缓存
         self._local_st_stocks = self._load_local_st_stocks()
 
+        # 股票名称映射缓存，避免频繁网络请求
+        self._code_name_map = {}
+        self._name_cache_built = False
+
         # T+1持仓账本：记录每笔买入的可卖日期
         self.position_ledger = {}  # {stock_code: [{'shares': int, 'buy_date': str, 'sellable_date': str, 'buy_price': float}]}
 
@@ -106,6 +117,13 @@ class RiskSensitiveTrendStrategy:
 
         # ADV单位校准参数
         self.amount_scale = None           # amount字段的单位缩放：None=自动检测, 1=元, 10000=万元
+
+        # 性能优化配置
+        self.enable_numba = NUMBA_AVAILABLE        # 是否启用Numba加速
+        self.enable_vectorized_indicators = True  # 是否使用面板化技术指标计算
+        self.enable_vectorized_tradable = True    # 是否使用向量化可交易性掩码
+        self.io_workers_ratio = 0.75               # I/O线程数相对于CPU核心数的比例
+        self.cpu_workers_ratio = 0.5               # CPU进程数相对于CPU核心数的比例
 
         # 交易统计和审计
         self.trading_stats = {
@@ -126,6 +144,9 @@ class RiskSensitiveTrendStrategy:
 
         # 初始化qlib
         self._init_qlib()
+
+        # 初始化名称映射缓存（在后台进行，不阻塞主流程）
+        self._build_name_cache_async()
 
     def _load_local_st_stocks(self):
         """从本地JSON文件加载ST股票列表"""
@@ -150,6 +171,105 @@ class RiskSensitiveTrendStrategy:
         except Exception as e:
             print(f"❌ 加载本地ST股票文件失败: {e}")
             return set()
+
+    def _build_name_cache_async(self):
+        """异步构建股票名称映射缓存"""
+        def _build_cache():
+            try:
+                # 一次性获取全市场A股名称映射
+                print("🔄 正在构建股票名称缓存...")
+                name_map = {}
+
+                # 获取A股信息
+                try:
+                    df_a = ak.stock_info_a_code_name()
+                    if df_a is not None and not df_a.empty:
+                        # 兼容不同的列名
+                        code_col = None
+                        name_col = None
+                        for c in df_a.columns:
+                            if '代码' in c or 'code' in c.lower():
+                                code_col = c
+                            if '简称' in c or '名称' in c or 'name' in c.lower():
+                                name_col = c
+
+                        if code_col and name_col:
+                            for _, row in df_a.iterrows():
+                                code = str(row[code_col]).strip()
+                                name = str(row[name_col]).strip()
+                                if code and name and len(code) == 6:
+                                    name_map[code] = name
+                except Exception:
+                    pass
+
+                # 获取北交所信息
+                try:
+                    df_bj = ak.stock_info_bj_name_code()
+                    if df_bj is not None and not df_bj.empty:
+                        code_col = None
+                        name_col = None
+                        for c in df_bj.columns:
+                            if '代码' in c or 'code' in c.lower():
+                                code_col = c
+                            if '简称' in c or '名称' in c or 'name' in c.lower():
+                                name_col = c
+
+                        if code_col and name_col:
+                            for _, row in df_bj.iterrows():
+                                code = str(row[code_col]).strip()
+                                name = str(row[name_col]).strip()
+                                # 统一存储为6位代码
+                                if code and name:
+                                    if len(code) == 8 and code.startswith('BJ'):
+                                        code = code[2:]
+                                    if len(code) == 6:
+                                        name_map[code] = name
+                except Exception:
+                    pass
+
+                self._code_name_map = name_map
+                self._name_cache_built = True
+                print(f"✅ 股票名称缓存构建完成，共缓存 {len(name_map)} 只股票")
+
+            except Exception as e:
+                print(f"⚠️  股票名称缓存构建失败: {e}")
+                self._name_cache_built = True  # 标记为已尝试，避免重复尝试
+
+        # 在后台线程中构建缓存
+        threading.Thread(target=_build_cache, daemon=True).start()
+
+    @lru_cache(maxsize=8192)
+    def get_stock_name(self, stock_code: str) -> str:
+        """获取股票名称（优化版，使用缓存）"""
+        code = str(stock_code).strip().upper()
+        # 提取6位数字代码
+        numeric = code[2:] if len(code) > 6 and code[:2] in ("SH", "SZ", "BJ") else code
+
+        # 如果缓存已构建，直接从缓存获取
+        if self._name_cache_built and numeric in self._code_name_map:
+            return self._code_name_map[numeric]
+
+        # 缓存未构建或未命中时，回退到原始方法（但只对特定股票调用）
+        if not self._name_cache_built:
+            # 如果缓存正在构建，先返回股票代码，避免阻塞
+            return stock_code
+
+        # 缓存已构建但未命中，可能是新股或特殊情况，进行单次查询
+        try:
+            info = ak.stock_individual_info_em(symbol=numeric)
+            if info is not None and not info.empty and {"item", "value"}.issubset(set(info.columns)):
+                row = info.loc[info["item"].isin(["股票简称", "证券简称"])]
+                if not row.empty:
+                    name_val = str(row["value"].iloc[0]).strip()
+                    if name_val:
+                        # 更新缓存
+                        self._code_name_map[numeric] = name_val
+                        return name_val
+        except Exception:
+            pass
+
+        # 最后回退
+        return stock_code
 
     def _setup_logging(self):
         """设置交易审计日志"""
@@ -241,7 +361,7 @@ class RiskSensitiveTrendStrategy:
                 start_time=start_q,
                 end_time=end_q,
                 freq="day",
-                disk_cache=0,
+                disk_cache=1,  # 开启数据集缓存，显著提升I/O性能
             )
         except Exception:
             df = None
@@ -369,65 +489,6 @@ class RiskSensitiveTrendStrategy:
             'nav_end': float(nav.iloc[-1])
         }
 
-    def get_stock_name(self, stock_code: str) -> str:
-        """使用akshare获取股票名称（兼容 SH/SZ/BJ 前缀与北证）"""
-        code = str(stock_code).strip().upper()
-        # 提取用于 AkShare 的纯 6 位代码
-        numeric = code[2:] if len(code) > 6 and code[:2] in ("SH", "SZ", "BJ") else code
-
-        # 1) 首选：东财个股信息接口（包含“股票简称/证券简称”）
-        try:
-            info = ak.stock_individual_info_em(symbol=numeric)
-            if info is not None and not info.empty and {"item", "value"}.issubset(set(info.columns)):
-                row = info.loc[info["item"].isin(["股票简称", "证券简称"])]
-                if not row.empty:
-                    name_val = str(row["value"].iloc[0]).strip()
-                    if name_val:
-                        return name_val
-        except Exception:
-            pass
-
-        # 2) 回退：若是北交所代码，使用北证代码-简称映射
-        try:
-            if code.startswith("BJ"):
-                bj_df = ak.stock_info_bj_name_code()
-                if bj_df is not None and not bj_df.empty:
-                    # 兼容不同版本的列名
-                    cols = {c: c for c in bj_df.columns}
-                    code_col = "证券代码" if "证券代码" in cols else ("代码" if "代码" in cols else list(cols)[0])
-                    name_col = "证券简称" if "证券简称" in cols else ("名称" if "名称" in cols else list(cols)[1])
-                    hit = bj_df[bj_df[code_col].astype(str).str.endswith(numeric)]
-                    if not hit.empty:
-                        return str(hit.iloc[0][name_col]).strip()
-        except Exception:
-            pass
-
-        # 3) 最后回退：全 A 股代码-简称映射（包含北证）
-        try:
-            all_df = ak.stock_info_a_code_name()
-            if all_df is not None and not all_df.empty:
-                cols = {c: c for c in all_df.columns}
-                # 常见列名兼容
-                code_candidates = [c for c in ["证券代码", "代码", "code", "股票代码"] if c in cols] or [list(cols)[0]]
-                name_candidates = [c for c in ["证券简称", "名称", "name"] if c in cols] or [list(cols)[1]]
-                code_col = code_candidates[0]
-                name_col = name_candidates[0]
-
-                # 去掉可能的交易所前缀后匹配
-                series_code = all_df[code_col].astype(str).str.upper()
-                series_code = (
-                    series_code.str.replace("^SH", "", regex=True)
-                               .str.replace("^SZ", "", regex=True)
-                               .str.replace("^BJ", "", regex=True)
-                )
-                hit = all_df[series_code == numeric]
-                if not hit.empty:
-                    return str(hit.iloc[0][name_col]).strip()
-        except Exception:
-            pass
-
-        # 兜底：返回原始代码
-        return stock_code
 
     def _is_st_stock(self, stock_code: str) -> bool:
         """
@@ -525,14 +586,14 @@ class RiskSensitiveTrendStrategy:
             end_date_qlib = self._convert_date_format(self.end_date)
 
             # 使用并发处理批量筛选
-            batch_size = 20
+            batch_size = 200  # 提高批量大小到200，减少调用次数和I/O开销
             batches = [candidate_pool[i:i+batch_size] for i in range(0, len(candidate_pool), batch_size)]
 
-            # 确定并发数
-            max_workers = max(1, int(mp.cpu_count() * 0.5))  # 使用50%CPU核心，避免过载
-            print(f"股票池筛选使用{max_workers}个并发进程处理{len(batches)}个批次")
+            # 优化并发策略：I/O密集型使用线程池
+            io_workers = max(1, int(mp.cpu_count() * 0.75))  # I/O密集型可以使用更多线程
+            print(f"股票池筛选使用{io_workers}个I/O线程处理{len(batches)}个批次")
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=io_workers) as executor:
                 # 提交所有批次任务
                 future_to_batch = {
                     executor.submit(self._process_stock_batch, batch, start_date_qlib, end_date_qlib): batch
@@ -614,7 +675,7 @@ class RiskSensitiveTrendStrategy:
             start_time=start_date_qlib,
             end_time=end_date_qlib,
             freq='day',
-            disk_cache=0
+            disk_cache=1  # 开启数据集缓存，显著提升I/O性能
         )
 
         if batch_data is not None and not batch_data.empty:
@@ -1639,7 +1700,7 @@ class RiskSensitiveTrendStrategy:
                 start_time=start_date_qlib,
                 end_time=end_date_qlib,
                 freq='day',
-                disk_cache=0
+                disk_cache=1  # 开启数据集缓存，显著提升I/O性能
             )
 
             if df is not None and not df.empty:
@@ -1737,7 +1798,8 @@ class RiskSensitiveTrendStrategy:
         total_count = len(self.stock_pool)
         completed_count = 0
 
-        # 使用ThreadPoolExecutor处理I/O密集型任务（Qlib数据获取主要是I/O操作）
+        # 优化并发策略：使用ThreadPoolExecutor处理I/O密集型任务（数据获取）
+        # 对于I/O密集型的Qlib数据获取，线程池比进程池更合适
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
             future_to_stock = {
@@ -1891,6 +1953,183 @@ class RiskSensitiveTrendStrategy:
             prices = prices.groupby(prices.index).last().reindex(cal)
 
         return prices
+
+    def build_multi_price_panels(self, use_adjusted: bool = True) -> dict:
+        """
+        构建多个价格面板（高开低收量）用于面板化技术指标计算
+
+        Returns:
+        --------
+        dict: 包含 'high', 'low', 'close', 'open', 'volume' 的面板字典
+        """
+        if not self.price_data:
+            print("price_data 为空，尚未加载任何股票数据")
+            return {}
+
+        price_cols = ['high', 'low', 'close', 'open', 'volume']
+        if not use_adjusted:
+            price_cols = ['high', 'low', 'raw_close', 'open', 'volume']  # raw_close替代close
+
+        panels = {}
+
+        for col in price_cols:
+            series = []
+            for code, df in self.price_data.items():
+                if col in df.columns:
+                    s = df[col].rename(code)
+                    s.index = pd.to_datetime(s.index)
+                    series.append(s)
+
+            if series:
+                panel = pd.concat(series, axis=1).sort_index()
+                panel.index = pd.to_datetime(panel.index).normalize()
+
+                # 使用交易日历对齐
+                cal = self._get_calendar()
+                if cal is not None and len(cal) > 0:
+                    cal = pd.DatetimeIndex(pd.to_datetime(cal)).normalize()
+                    panel = panel.groupby(panel.index).last().reindex(cal)
+
+                # 统一key名称
+                key = 'close' if col == 'raw_close' else col
+                panels[key] = panel
+
+        return panels
+
+    def compute_indicators_panel(self, panels: dict, atr_period=14, vol_window=20, drawdown_window=60):
+        """
+        面板化计算技术指标，使用向量化和Numba加速
+
+        Parameters:
+        -----------
+        panels : dict
+            包含价格面板的字典
+        atr_period : int
+            ATR计算周期
+        vol_window : int
+            波动率计算窗口
+        drawdown_window : int
+            回撤计算窗口
+
+        Returns:
+        --------
+        dict: 包含计算结果的面板字典
+        """
+        results = {}
+
+        if 'high' not in panels or 'low' not in panels or 'close' not in panels:
+            print("⚠️  缺少必要的价格面板，跳过指标计算")
+            return results
+
+        hi = panels['high']
+        lo = panels['low']
+        cl = panels['close']
+
+        print(f"🔬 开始面板化技术指标计算...")
+
+        # 1. ATR计算（面板化 + Numba加速）
+        try:
+            atr_panel, atr_pct_panel = self._compute_atr_panel_optimized(hi, lo, cl, atr_period)
+            results['atr'] = atr_panel
+            results['atr_pct'] = atr_pct_panel
+            print(f"✅ ATR计算完成")
+        except Exception as e:
+            print(f"❌ ATR计算失败: {e}")
+
+        # 2. 波动率计算（向量化）
+        try:
+            rets = cl.pct_change()
+            vol_panel = rets.rolling(vol_window).std() * np.sqrt(252)  # 年化波动率
+            results['volatility'] = vol_panel
+            print(f"✅ 波动率计算完成")
+        except Exception as e:
+            print(f"❌ 波动率计算失败: {e}")
+
+        # 3. 回撤计算（向量化）
+        try:
+            rolling_max = cl.rolling(drawdown_window, min_periods=1).max()
+            drawdown_panel = (cl - rolling_max) / rolling_max
+            max_drawdown_panel = drawdown_panel.rolling(drawdown_window, min_periods=1).min()
+            results['drawdown'] = drawdown_panel
+            results['max_drawdown'] = max_drawdown_panel
+            print(f"✅ 回撤计算完成")
+        except Exception as e:
+            print(f"❌ 回撤计算失败: {e}")
+
+        # 4. RSI计算（面板化）
+        try:
+            rsi_panel = self._compute_rsi_panel_optimized(cl, 14)
+            results['rsi'] = rsi_panel
+            print(f"✅ RSI计算完成")
+        except Exception as e:
+            print(f"❌ RSI计算失败: {e}")
+
+        print(f"🎯 面板化指标计算完成，共计算 {len(results)} 个指标")
+        return results
+
+    def _compute_atr_panel_optimized(self, hi: pd.DataFrame, lo: pd.DataFrame, cl: pd.DataFrame, period=14):
+        """面板化ATR计算，使用Numba加速（如果可用）"""
+        # True Range 计算（完全向量化）
+        tr1 = (hi - lo)
+        tr2 = (hi - cl.shift(1)).abs()
+        tr3 = (lo - cl.shift(1)).abs()
+
+        # 使用numpy的maximum.reduce更高效
+        tr_array = np.maximum.reduce([tr1.values, tr2.values, tr3.values])
+        tr = pd.DataFrame(tr_array, index=cl.index, columns=cl.columns)
+
+        # Wilder RMA计算
+        if NUMBA_AVAILABLE:
+            try:
+                atr = tr.rolling(window=period, min_periods=period).apply(
+                    self._wilder_rma_numba_wrapper,
+                    args=(period,),
+                    raw=True,
+                    engine="numba",
+                    engine_kwargs={"parallel": False, "nogil": True}
+                )
+            except Exception as e:
+                print(f"⚠️  Numba ATR计算失败，回退到标准方法: {e}")
+                atr = tr.ewm(alpha=1.0/period, adjust=False).mean()
+        else:
+            # 回退到pandas标准方法
+            atr = tr.ewm(alpha=1.0/period, adjust=False).mean()
+
+        # ATR百分比
+        atr_pct = atr / cl * 100.0
+
+        return atr, atr_pct
+
+    def _wilder_rma_numba_wrapper(self, window_data, period):
+        """Numba兼容的Wilder RMA计算wrapper"""
+        if len(window_data) == 0:
+            return np.nan
+
+        alpha = 1.0 / period
+        rma = window_data[0]
+
+        for i in range(1, len(window_data)):
+            rma = rma * (1 - alpha) + window_data[i] * alpha
+
+        return rma
+
+    def _compute_rsi_panel_optimized(self, cl: pd.DataFrame, period=14):
+        """面板化RSI计算"""
+        # 计算价格变化
+        delta = cl.diff()
+        gain = delta.where(delta > 0, 0)
+        loss = (-delta.where(delta < 0, 0))
+
+        # 使用EWM计算平均收益和损失
+        alpha = 1.0 / period
+        avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+
+        # 计算RSI
+        rs = avg_gain / avg_loss.replace(0, np.inf)
+        rsi = 100 - (100 / (1 + rs))
+
+        return rsi
 
     def backtest_equity_curve(self, weights: pd.DataFrame | None = None, use_adjusted: bool = True, min_live_stocks: int = 3) -> pd.Series | None:
         """
@@ -2182,7 +2421,7 @@ class RiskSensitiveTrendStrategy:
 
     def _build_tradable_mask(self, prices: pd.DataFrame, valid: pd.DataFrame) -> pd.DataFrame:
         """
-        构建可交易性掩码，处理涨跌停、停牌等不可交易情况
+        构建可交易性掩码，处理涨跌停、停牌等不可交易情况（向量化优化版）
 
         Parameters:
         -----------
@@ -2199,25 +2438,77 @@ class RiskSensitiveTrendStrategy:
         # 基础掩码：必须有有效价格
         tradable = valid.copy()
 
-        # 涨跌停掩码：检查是否触及价格限制
-        prev_close = prices.shift(1)
+        # 向量化的涨跌停掩码计算
+        tradable_vectorized = self._build_tradable_mask_vectorized(prices, tradable)
 
-        for stock in prices.columns:
-            stock_prices = prices[stock]
-            stock_prev = prev_close[stock]
+        return tradable_vectorized.fillna(False)
 
-            code = stock.strip().upper()
-            numeric = code[2:] if len(code) > 6 and code[:2] in ('SH','SZ','BJ') else code
-            is_st = self._is_st_stock(numeric)
+    def _build_tradable_mask_vectorized(self, prices: pd.DataFrame, base_mask: pd.DataFrame) -> pd.DataFrame:
+        """
+        向量化构建可交易性掩码，避免逐股票循环（重大性能优化）
 
-            upper_limit, lower_limit = self._get_price_limits(stock_prev, stock_code=code, is_st=is_st)
-            limit_hit = (stock_prices >= upper_limit * 0.999) | (stock_prices <= lower_limit * 1.001)
-            tradable[stock] = tradable[stock] & ~limit_hit
+        Parameters:
+        -----------
+        prices : pd.DataFrame
+            价格面板 [日期 x 股票代码]
+        base_mask : pd.DataFrame
+            基础有效性掩码
 
-        # 成交量过滤：过滤流动性不足的标的
-        # 这里简化处理，实际可以加入成交量/换手率判断
+        Returns:
+        --------
+        pd.DataFrame
+            可交易性掩码
+        """
+        cl = prices
+        pc = cl.shift(1)  # 前一交易日收盘价
 
-        return tradable.fillna(False)
+        # 1. 构建股票分类的布尔矩阵（向量化）
+        columns = pd.Index(cl.columns)
+        is_bj = columns.str.startswith("BJ")
+        is_sh688 = columns.str.startswith("SH688")  # 科创板
+        is_sz30 = columns.str.startswith("SZ30")    # 创业板
+        is_ke = is_sh688 | is_sz30  # 科创+创业
+
+        # ST股票向量化判断
+        numeric_codes = columns.map(lambda c: c[2:] if len(c) > 6 and c[:2] in ('SH','SZ','BJ') else c)
+        is_st = numeric_codes.map(lambda code: self._is_st_stock(code))
+
+        # 2. 构建涨跌停限制百分比矩阵（向量化）
+        # 优先级：北交所30% > 科创/创业20% > ST 5% > 主板10%
+        limit_pct = np.where(is_bj, 0.30,
+                      np.where(is_ke, 0.20,
+                        np.where(is_st, 0.05, 0.10))).astype(float)
+
+        # 3. 广播为完整的价格限制矩阵
+        limit_pct_matrix = pd.DataFrame(
+            np.broadcast_to(limit_pct, cl.shape),
+            index=cl.index,
+            columns=cl.columns
+        )
+
+        # 4. 计算涨跌停价格限制（完全向量化）
+        upper_limit = pc * (1 + limit_pct_matrix)
+        lower_limit = pc * (1 - limit_pct_matrix)
+
+        # 5. 检测涨跌停触发（向量化比较）
+        # 留出0.1%的容差避免浮点误差
+        limit_tolerance = 0.001
+        upper_hit = cl >= (upper_limit * (1 - limit_tolerance))
+        lower_hit = cl <= (lower_limit * (1 + limit_tolerance))
+        limit_hit = upper_hit | lower_hit
+
+        # 6. 应用可交易性掩码
+        tradable_mask = base_mask & (~limit_hit)
+
+        # 添加调试信息
+        if limit_hit.any().any():
+            hit_count = limit_hit.sum().sum()
+            total_observations = cl.notna().sum().sum()
+            hit_rate = hit_count / total_observations * 100 if total_observations > 0 else 0
+            print(f"🔍 发现涨跌停触发: {hit_count} 次 ({hit_rate:.2f}%)")
+
+        return tradable_mask
+
 
     def calculate_ma_signals(self, df, short_window=20, long_window=60):
         """
@@ -3082,7 +3373,7 @@ class RiskSensitiveTrendStrategy:
                 start_time=start_date,
                 end_time=end_date,
                 freq='day',
-                disk_cache=0
+                disk_cache=1  # 开启数据集缓存，显著提升I/O性能
             )
 
             if market_df is None or market_df.empty:
