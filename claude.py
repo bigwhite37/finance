@@ -1967,11 +1967,33 @@ class RiskSensitiveTrendStrategy:
         # 11. 累计净值
         equity = (1.0 + port_ret_net.fillna(0.0)).cumprod()
 
-        # 12. 诊断信息
+        # 12. 诊断信息 - 增强异常数据检测
         nonzero_w_days = int((w_active.abs().sum(axis=1) > 1e-12).sum())
         nonzero_ret_days = int((rets_active.abs().sum(axis=1, skipna=True) > 1e-12).sum())
+        
+        # 检测异常收益率数据
+        extreme_returns = port_ret_net.abs() > 0.2  # 日收益超过20%
+        if extreme_returns.any():
+            extreme_count = extreme_returns.sum()
+            extreme_dates = port_ret_net[extreme_returns].index.tolist()[:5]  # 显示前5个
+            print(f"🚨 警告：发现{extreme_count}个极端日收益(>20%)，前5个日期: {extreme_dates}")
+            print(f"🚨 极端收益值: {port_ret_net[extreme_returns].head().tolist()}")
+        
+        # 检测收益率统计
+        port_ret_stats = port_ret_net.describe()
+        print(f"[数据质量] 组合日收益统计:")
+        print(f"  均值: {port_ret_stats['mean']:.4f} (年化{port_ret_stats['mean']*252:.1%})")
+        print(f"  标准差: {port_ret_stats['std']:.4f}")
+        print(f"  最大: {port_ret_stats['max']:.4f}, 最小: {port_ret_stats['min']:.4f}")
+        
+        # 检测个股收益异常
+        individual_extreme = (rets_active.abs() > 0.15).any(axis=1)  # 某天有个股收益>15%
+        if individual_extreme.any():
+            extreme_stock_days = individual_extreme.sum()
+            print(f"⚠️  发现{extreme_stock_days}天存在个股极端收益(>15%)")
+        
         print(f"[诊断] 活跃权重日={nonzero_w_days}, 有效收益日={nonzero_ret_days}, 回测周期={len(equity)}")
-        print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f}")
+        print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f} (总收益{((equity.iloc[-1]/equity.iloc[0])-1)*100:.1f}%)")
 
         # 暴露给外部
         self.daily_return = port_ret_net
@@ -1986,8 +2008,8 @@ class RiskSensitiveTrendStrategy:
         if equity is None or daily_ret is None or equity.empty or daily_ret.empty:
             return {}
 
-        # 基础收益指标
-        total_return = float(equity.iloc[-1] - 1.0)
+        # 基础收益指标 - 修正计算方式
+        total_return = float((equity.iloc[-1] / equity.iloc[0]) - 1.0)
         ann_return = float((1.0 + daily_ret.mean()) ** 252 - 1.0)
         ann_vol = float(daily_ret.std() * np.sqrt(252)) if daily_ret.std() == daily_ret.std() else 0.0
 
@@ -2012,11 +2034,11 @@ class RiskSensitiveTrendStrategy:
         downside_std = float(downside_ret.std() * np.sqrt(252)) if len(downside_ret) > 0 else 0.0
         sortino = float((daily_ret.mean() - rf_daily) * 252 / downside_std) if downside_std > 0 else 0.0
 
-        # 回撤分析
-        nav = equity
+        # 回撤分析 - 修正计算方式
+        nav = equity.copy()
         peak = nav.cummax()
-        dd = nav / peak - 1.0
-        max_dd = float(dd.min())
+        dd = (nav / peak - 1.0)
+        max_dd = float(dd.min()) if len(dd) > 0 else 0.0
         
         # 回撤持续时间
         dd_periods = (dd < -0.01)  # 回撤超过1%的时期
@@ -2033,23 +2055,27 @@ class RiskSensitiveTrendStrategy:
         else:
             max_dd_duration = 0
 
-        # 胜负分析
-        wins = (daily_ret > 0).sum()
-        losses = (daily_ret < 0).sum()
-        win_rate = float(wins) / float(wins + losses) if (wins + losses) > 0 else 0.0
+        # 胜负分析 - 修正计算方式
+        wins = int((daily_ret > 0).sum())
+        losses = int((daily_ret < 0).sum())
+        total_trades = wins + losses
+        win_rate = float(wins) / float(total_trades) if total_trades > 0 else 0.0
         avg_win = float(daily_ret[daily_ret > 0].mean()) if wins > 0 else 0.0
-        avg_loss = float(-daily_ret[daily_ret < 0].mean()) if losses > 0 else 0.0
+        avg_loss = float(abs(daily_ret[daily_ret < 0].mean())) if losses > 0 else 0.0
         profit_factor = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
         # 尾部风险
         var_95 = float(np.percentile(daily_ret, 5)) if len(daily_ret) > 0 else 0.0
         cvar_95 = float(daily_ret[daily_ret <= var_95].mean()) if len(daily_ret[daily_ret <= var_95]) > 0 else 0.0
 
-        # 一致性指标
-        monthly_rets = daily_ret.resample('M').apply(lambda x: (1 + x).prod() - 1)
-        monthly_wins = (monthly_rets > 0).sum()
-        monthly_total = len(monthly_rets)
-        monthly_win_rate = float(monthly_wins / monthly_total) if monthly_total > 0 else 0.0
+        # 一致性指标 - 修正计算方式
+        try:
+            monthly_rets = daily_ret.resample('M').apply(lambda x: (1 + x).prod() - 1)
+            monthly_wins = int((monthly_rets > 0).sum())
+            monthly_total = len(monthly_rets)
+            monthly_win_rate = float(monthly_wins) / float(monthly_total) if monthly_total > 0 else 0.0
+        except Exception:
+            monthly_win_rate = 0.0
 
         # Calmar比率 (年化收益/最大回撤)
         calmar = abs(ann_return / max_dd) if max_dd != 0 else 0.0
@@ -3771,12 +3797,12 @@ class RiskSensitiveTrendStrategy:
         if len(returns) == 0:
             return {}
 
-        # 基础指标
-        total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0] - 1) * 100
+        # 基础指标 - 修正：返回比例而非百分比
+        total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0] - 1)  # 不乘100，保持比例
         # 使用几何年化（复合收益）
         periods = len(returns)
-        annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / periods) - 1) * 100
-        volatility = returns.std() * np.sqrt(252) * 100
+        annual_return = ((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / periods) - 1)  # 不乘100
+        volatility = returns.std() * np.sqrt(252)  # 不乘100，保持比例
 
         # 夏普比率（统一口径：日频超额均值 × √252 / 日频波动率）
         # 假设无风险利率为2.5%（当前中国1年期国债收益率）
@@ -3789,26 +3815,59 @@ class RiskSensitiveTrendStrategy:
         else:
             sharpe_ratio = 0
 
-        # 最大回撤
+        # 最大回撤 - 修正：保持比例格式
         cumulative = equity_curve
         running_max = cumulative.expanding().max()
         drawdown = (cumulative - running_max) / running_max
-        max_drawdown = drawdown.min() * 100
+        max_drawdown = drawdown.min()  # 不乘100，保持比例
 
-        # 胜率和盈亏比（基于日度收益）
+        # 胜率和盈亏比（基于日度收益）- 修正：保持比例格式
         positive_returns = returns[returns > 0]
         negative_returns = returns[returns < 0]
-        win_rate = len(positive_returns) / len(returns) * 100 if len(returns) > 0 else 0
-        profit_factor = positive_returns.sum() / abs(negative_returns.sum()) if len(negative_returns) > 0 and negative_returns.sum() < 0 else float('inf')
+        win_rate = len(positive_returns) / len(returns) if len(returns) > 0 else 0  # 不乘100，保持比例
+        profit_factor = positive_returns.sum() / abs(negative_returns.sum()) if len(negative_returns) > 0 and negative_returns.sum() < 0 else 0
+
+        # 基准比较
+        benchmark_daily = 0.08 / 252
+        excess_ret = returns - benchmark_daily
+        alpha = excess_ret.mean() * 252
+        tracking_error = excess_ret.std() * np.sqrt(252)
+        info_ratio = alpha / tracking_error if tracking_error > 0 else 0
+        
+        # Sortino比率和Calmar比率
+        downside_ret = returns[returns < 0]
+        downside_std = downside_ret.std() * np.sqrt(252) if len(downside_ret) > 0 else 0
+        sortino = (returns.mean() - daily_rf_rate) * 252 / downside_std if downside_std > 0 else 0
+        calmar = abs(annual_return / max_drawdown) if max_drawdown != 0 else 0
+        
+        # 尾部风险
+        var_95 = np.percentile(returns, 5) if len(returns) > 0 else 0
+        cvar_95 = returns[returns <= var_95].mean() if len(returns[returns <= var_95]) > 0 else 0
+        
+        # 月度胜率
+        try:
+            monthly_rets = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
+            monthly_win_rate = (monthly_rets > 0).mean() if len(monthly_rets) > 0 else 0
+        except:
+            monthly_win_rate = 0
 
         return {
             'total_return': total_return,
             'annual_return': annual_return,
-            'volatility': volatility,
-            'sharpe_ratio': sharpe_ratio,
+            'annual_vol': volatility,  # 改名匹配
+            'sharpe': sharpe_ratio,    # 改名匹配
+            'sortino': sortino,        # 新增
+            'calmar': calmar,          # 新增
+            'alpha': alpha,            # 新增
+            'tracking_error': tracking_error,  # 新增
+            'info_ratio': info_ratio,  # 新增
             'max_drawdown': max_drawdown,
             'win_rate': win_rate,
+            'monthly_win_rate': monthly_win_rate,  # 新增
             'profit_factor': profit_factor,
+            'var_95': var_95,          # 新增
+            'cvar_95': cvar_95,        # 新增
+            'max_dd_duration': 0,      # 简化处理
             'total_trades': len(returns),
             'periods': len(equity_curve)
         }
@@ -4094,14 +4153,14 @@ def main():
             equity_curve = backtest_result['equity_curve']
             performance_stats = backtest_result['performance_stats']
 
-            # 显示绩效统计
+            # 显示绩效统计 - 修正格式化，使用统一的百分比显示
             print(f"组合绩效指标（统一口径）:")
-            print(f"  - 总收益率: {performance_stats.get('total_return', 0):.2f}%")
-            print(f"  - 年化收益率: {performance_stats.get('annual_return', 0):.2f}%")
-            print(f"  - 年化波动率: {performance_stats.get('volatility', 0):.2f}%")
-            print(f"  - 夏普比率: {performance_stats.get('sharpe_ratio', 0):.3f}")
-            print(f"  - 最大回撤: {performance_stats.get('max_drawdown', 0):.2f}%")
-            print(f"  - 胜率: {performance_stats.get('win_rate', 0):.1f}%")
+            print(f"  - 总收益率: {performance_stats.get('total_return', 0):.2%}")
+            print(f"  - 年化收益率: {performance_stats.get('annual_return', 0):.2%}")
+            print(f"  - 年化波动率: {performance_stats.get('annual_vol', performance_stats.get('volatility', 0)):.2%}")
+            print(f"  - 夏普比率: {performance_stats.get('sharpe', performance_stats.get('sharpe_ratio', 0)):.3f}")
+            print(f"  - 最大回撤: {performance_stats.get('max_drawdown', 0):.2%}")
+            print(f"  - 胜率: {performance_stats.get('win_rate', 0):.2%}")
             print(f"  - 盈亏比: {performance_stats.get('profit_factor', 0):.2f}")
 
             # 绘制组合净值曲线
