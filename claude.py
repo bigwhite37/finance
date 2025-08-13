@@ -105,7 +105,7 @@ class RiskSensitiveTrendStrategy:
         self.min_adv_20d_bj = 50_000_000   # 北交所单独阈值：5000万元（更严格）
         self.max_suspend_days_60d = 10     # 60日内最大停牌天数
         self.exclude_bj_stocks = True      # 默认排除北交所股票（风险控制）
-        
+
         # ADV单位校准参数
         self.amount_scale = None           # amount字段的单位缩放：None=自动检测, 1=元, 10000=万元
 
@@ -122,7 +122,7 @@ class RiskSensitiveTrendStrategy:
             'fill_ratio_sum': 0.0
         }
         self.audit_log = []  # 详细的交易审计日志
-        
+
         # 初始化日志
         self._setup_logging()
 
@@ -134,21 +134,21 @@ class RiskSensitiveTrendStrategy:
         # 创建交易日志器
         self.trade_logger = logging.getLogger('trading_audit')
         self.trade_logger.setLevel(logging.INFO)
-        
+
         # 避免重复添加handler
         if not self.trade_logger.handlers:
             # 文件handler
             log_filename = f"trading_audit_{datetime.now().strftime('%Y%m%d')}.log"
             file_handler = logging.FileHandler(log_filename)
             file_handler.setLevel(logging.INFO)
-            
+
             # 格式化器
             formatter = logging.Formatter(
                 '%(asctime)s - %(levelname)s - %(message)s',
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
             file_handler.setFormatter(formatter)
-            
+
             self.trade_logger.addHandler(file_handler)
 
     def _init_qlib(self):
@@ -756,7 +756,7 @@ class RiskSensitiveTrendStrategy:
         """
         # 统一带前缀代码
         code = (stock_code or '').strip().upper() if stock_code else ''
-        
+
         # 板块识别（优先级最高，独立于ST识别）
         if code.startswith('BJ'):
             # 北交所30%
@@ -771,7 +771,7 @@ class RiskSensitiveTrendStrategy:
                 code_up = str(stock_code).strip().upper()
                 numeric = code_up[2:] if len(code_up) > 6 and code_up[:2] in ('SH','SZ','BJ') else code_up
                 is_st = self._is_st_stock(numeric)
-            
+
             if is_st:
                 # ST股票5%
                 limit_pct = self.st_limit_pct
@@ -789,7 +789,7 @@ class RiskSensitiveTrendStrategy:
     def _calculate_transaction_cost(self, price, shares, is_buy=True):
         """
         计算按边计费的交易成本（简化版，返回总成本）
-        
+
         Parameters:
         -----------
         price : float
@@ -798,7 +798,7 @@ class RiskSensitiveTrendStrategy:
             成交股数
         is_buy : bool
             是否为买入订单
-            
+
         Returns:
         --------
         float
@@ -811,22 +811,22 @@ class RiskSensitiveTrendStrategy:
     def _get_next_trading_date(self, date_str):
         """
         获取下一个交易日（T+1）
-        
+
         Parameters:
         -----------
         date_str : str
             当前日期，格式YYYYMMDD
-            
+
         Returns:
         --------
         str
             下一个交易日，格式YYYYMMDD
         """
         from datetime import datetime, timedelta
-        
+
         current_date = datetime.strptime(date_str, '%Y%m%d')
         next_date = current_date + timedelta(days=1)
-        
+
         # 简化处理：假设下一天就是下一个交易日
         # 在实际应用中，应该查询交易日历
         return next_date.strftime('%Y%m%d')
@@ -834,7 +834,7 @@ class RiskSensitiveTrendStrategy:
     def _add_position_to_ledger(self, stock_code, shares, buy_date, buy_price):
         """
         向持仓账本添加新的买入记录
-        
+
         Parameters:
         -----------
         stock_code : str
@@ -848,29 +848,29 @@ class RiskSensitiveTrendStrategy:
         """
         if stock_code not in self.position_ledger:
             self.position_ledger[stock_code] = []
-        
+
         sellable_date = self._get_next_trading_date(buy_date)
-        
+
         position_record = {
             'shares': shares,
             'buy_date': buy_date,
             'sellable_date': sellable_date,
             'buy_price': buy_price
         }
-        
+
         self.position_ledger[stock_code].append(position_record)
 
     def _get_sellable_shares(self, stock_code, current_date):
         """
         获取当前日期可卖出的股数
-        
+
         Parameters:
         -----------
         stock_code : str
             股票代码
         current_date : str
             当前日期，格式YYYYMMDD
-            
+
         Returns:
         --------
         int
@@ -878,18 +878,18 @@ class RiskSensitiveTrendStrategy:
         """
         if stock_code not in self.position_ledger:
             return 0
-        
+
         sellable_shares = 0
         for record in self.position_ledger[stock_code]:
             if record['sellable_date'] <= current_date:
                 sellable_shares += record['shares']
-        
+
         return sellable_shares
 
     def _remove_from_ledger(self, stock_code, shares_to_sell, current_date):
         """
         从持仓账本中移除卖出的股票（FIFO原则）
-        
+
         Parameters:
         -----------
         stock_code : str
@@ -898,7 +898,7 @@ class RiskSensitiveTrendStrategy:
             要卖出的股数
         current_date : str
             当前日期，格式YYYYMMDD
-            
+
         Returns:
         --------
         bool
@@ -906,10 +906,10 @@ class RiskSensitiveTrendStrategy:
         """
         if stock_code not in self.position_ledger:
             return False
-        
+
         remaining_to_sell = shares_to_sell
         records_to_remove = []
-        
+
         # FIFO：从最早买入的开始卖出
         for i, record in enumerate(self.position_ledger[stock_code]):
             if record['sellable_date'] <= current_date and remaining_to_sell > 0:
@@ -922,28 +922,28 @@ class RiskSensitiveTrendStrategy:
                     record['shares'] -= remaining_to_sell
                     remaining_to_sell = 0
                     break
-        
+
         # 移除已清仓的记录
         for i in reversed(records_to_remove):
             del self.position_ledger[stock_code][i]
-        
+
         # 如果该股票已无持仓，删除整个条目
         if not self.position_ledger[stock_code]:
             del self.position_ledger[stock_code]
-        
+
         return remaining_to_sell == 0
 
     def _detect_amount_scale(self, sample_stocks=None, sample_size=5):
         """
         自动检测amount字段的单位缩放
-        
+
         Parameters:
         -----------
         sample_stocks : list, optional
             用于检测的样本股票代码，默认使用股票池中的前几只
         sample_size : int
             样本大小，默认5只股票
-            
+
         Returns:
         --------
         float
@@ -951,16 +951,16 @@ class RiskSensitiveTrendStrategy:
         """
         if not self._qlib_initialized:
             return 10000  # 默认假设万元
-        
+
         # 选择样本股票
         if sample_stocks is None:
             sample_stocks = self.stock_pool[:sample_size] if len(self.stock_pool) >= sample_size else self.stock_pool
-        
+
         if not sample_stocks:
             return 10000  # 默认假设万元
-        
+
         total_amount_samples = []
-        
+
         for stock_code in sample_stocks:
             try:
                 # 获取最近几天的数据来判断数量级
@@ -972,15 +972,15 @@ class RiskSensitiveTrendStrategy:
                         total_amount_samples.append(avg_amount)
             except Exception:
                 continue
-        
+
         if not total_amount_samples:
             print("警告：无法获取样本数据，使用默认ADV单位（万元）")
             return 10000
-        
+
         # 分析数量级
         import numpy as np
         median_amount = np.median(total_amount_samples)
-        
+
         # 启发式判断：如果中位数在千万以上，可能是"元"单位；如果在万以下，可能是"万元"单位
         if median_amount > 10_000_000:
             detected_scale = 1  # 元
@@ -988,13 +988,13 @@ class RiskSensitiveTrendStrategy:
         else:
             detected_scale = 10000  # 万元
             print(f"自动检测ADV单位：万元（样本中位数：{median_amount:,.0f}）")
-        
+
         return detected_scale
 
     def _get_amount_scale(self):
         """
         获取amount字段的缩放因子
-        
+
         Returns:
         --------
         float
@@ -1003,7 +1003,7 @@ class RiskSensitiveTrendStrategy:
         if self.amount_scale is None:
             # 第一次调用时自动检测
             self.amount_scale = self._detect_amount_scale()
-        
+
         return self.amount_scale
 
     def _simulate_order_execution(self, target_price, yesterday_close, target_shares, volume_available, stock_code=None, is_st=None, is_buy=True, max_participation_rate=0.1):
@@ -1028,7 +1028,7 @@ class RiskSensitiveTrendStrategy:
             是否为买单
         max_participation_rate : float
             最大成交量参与率，默认10%
-            
+
         Returns:
         --------
         tuple
@@ -1052,7 +1052,7 @@ class RiskSensitiveTrendStrategy:
         # 成交量约束：限制最大可成交数量
         max_tradable_shares = int(volume_available * max_participation_rate) if volume_available > 0 else target_shares
         executed_shares = min(target_shares, max_tradable_shares)
-        
+
         # 如果无法成交任何股数，返回失败
         if executed_shares <= 0:
             return None, "成交量不足，无法执行订单"
@@ -1066,7 +1066,7 @@ class RiskSensitiveTrendStrategy:
 
         # 计算交易成本
         cost = self._calculate_transaction_cost(final_price, executed_shares, is_buy=is_buy)
-        
+
         # 计算成交率
         fill_ratio = executed_shares / target_shares if target_shares > 0 else 0.0
 
@@ -1089,29 +1089,29 @@ class RiskSensitiveTrendStrategy:
             'unfilled_shares': target_shares - executed_shares
         }, None
 
-    def _update_trading_stats(self, target_shares, executed_shares, cost, slippage, fill_ratio, 
+    def _update_trading_stats(self, target_shares, executed_shares, cost, slippage, fill_ratio,
                              price_limited, volume_limited):
         """更新交易统计"""
         self.trading_stats['total_orders'] += 1
-        
+
         if executed_shares > 0:
             self.trading_stats['successful_fills'] += 1
             self.trading_stats['total_transaction_costs'] += cost
             self.trading_stats['total_slippage'] += abs(slippage)
             self.trading_stats['fill_ratio_sum'] += fill_ratio
-            
+
             if executed_shares < target_shares:
                 self.trading_stats['partial_fills'] += 1
         else:
             self.trading_stats['rejected_orders'] += 1
-        
+
         if price_limited:
             self.trading_stats['price_limited_orders'] += 1
-        
+
         if volume_limited:
             self.trading_stats['volume_limited_orders'] += 1
 
-    def _log_trade_audit(self, stock_code, target_shares, executed_shares, target_price, 
+    def _log_trade_audit(self, stock_code, target_shares, executed_shares, target_price,
                         final_price, cost, slippage, fill_ratio, is_buy, volume_available):
         """记录详细的交易审计日志"""
         audit_record = {
@@ -1130,10 +1130,10 @@ class RiskSensitiveTrendStrategy:
             'price_limited': target_price != final_price,
             'volume_limited': executed_shares < target_shares
         }
-        
+
         # 添加到内存日志
         self.audit_log.append(audit_record)
-        
+
         # 写入文件日志
         if hasattr(self, 'trade_logger'):
             log_message = (
@@ -1148,7 +1148,7 @@ class RiskSensitiveTrendStrategy:
     def get_trading_statistics(self):
         """获取交易统计报告"""
         stats = self.trading_stats.copy()
-        
+
         # 计算衍生指标
         if stats['total_orders'] > 0:
             stats['success_rate'] = stats['successful_fills'] / stats['total_orders']
@@ -1156,22 +1156,22 @@ class RiskSensitiveTrendStrategy:
             stats['partial_fill_rate'] = stats['partial_fills'] / stats['total_orders']
             stats['price_limit_rate'] = stats['price_limited_orders'] / stats['total_orders']
             stats['volume_limit_rate'] = stats['volume_limited_orders'] / stats['total_orders']
-            
+
         if stats['successful_fills'] > 0:
             stats['avg_fill_ratio'] = stats['fill_ratio_sum'] / stats['successful_fills']
             stats['avg_transaction_cost'] = stats['total_transaction_costs'] / stats['successful_fills']
             stats['avg_slippage'] = stats['total_slippage'] / stats['successful_fills']
-        
+
         return stats
 
     def export_audit_log(self, filename=None):
         """导出审计日志到文件"""
         if filename is None:
             filename = f"audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
+
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(self.audit_log, f, ensure_ascii=False, indent=2)
-        
+
         print(f"审计日志已导出到: {filename}")
         return filename
 
