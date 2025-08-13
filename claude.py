@@ -1477,6 +1477,153 @@ class RiskSensitiveTrendStrategy:
         
         return fig
 
+    def print_enhanced_metrics_summary(self, equity_curve, performance_stats, selected_stocks, position_sizes):
+        """打印增强版分析报告的关键指标摘要到终端"""
+        
+        print("\n" + "="*100)
+        print(" " * 35 + "📊 增强版策略分析报告摘要")
+        print("="*100)
+        
+        # 基本信息
+        print(f"\n🗓️  回测周期: {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}")
+        print(f"📈 选中股票: {len(selected_stocks)} 只")
+        if position_sizes:
+            total_position = sum(position_sizes.values())
+            print(f"💰 总仓位: ¥{total_position:,.0f}")
+        
+        # 核心收益指标
+        print(f"\n🎯 核心收益指标:")
+        print(f"   总收益率          : {performance_stats.get('total_return', 0):>8.2%}")
+        print(f"   年化收益率        : {performance_stats.get('annual_return', 0):>8.2%}")
+        print(f"   年化波动率        : {performance_stats.get('annual_vol', 0):>8.2%}")
+        
+        # 风险调整指标 (最重要)
+        print(f"\n⚖️  风险调整指标:")
+        sharpe = performance_stats.get('sharpe', 0)
+        sortino = performance_stats.get('sortino', 0)
+        calmar = performance_stats.get('calmar', 0)
+        
+        sharpe_emoji = "🟢" if sharpe > 1 else "🟡" if sharpe > 0.5 else "🔴"
+        sortino_emoji = "🟢" if sortino > 1.5 else "🟡" if sortino > 0.8 else "🔴"
+        calmar_emoji = "🟢" if calmar > 2 else "🟡" if calmar > 1 else "🔴"
+        
+        print(f"   夏普比率          : {sharpe:>8.3f} {sharpe_emoji}")
+        print(f"   Sortino比率       : {sortino:>8.3f} {sortino_emoji}")
+        print(f"   Calmar比率        : {calmar:>8.3f} {calmar_emoji}")
+        
+        # 基准比较
+        print(f"\n📊 基准比较 (vs 沪深300年化8%):")
+        alpha = performance_stats.get('alpha', 0)
+        info_ratio = performance_stats.get('info_ratio', 0)
+        alpha_emoji = "🟢" if alpha > 0 else "🔴"
+        info_emoji = "🟢" if info_ratio > 0.5 else "🟡" if info_ratio > 0 else "🔴"
+        
+        print(f"   超额收益(Alpha)   : {alpha:>8.2%} {alpha_emoji}")
+        print(f"   信息比率          : {info_ratio:>8.3f} {info_emoji}")
+        print(f"   跟踪误差          : {performance_stats.get('tracking_error', 0):>8.2%}")
+        
+        # 回撤分析
+        print(f"\n📉 回撤风险:")
+        max_dd = performance_stats.get('max_drawdown', 0)
+        dd_duration = performance_stats.get('max_dd_duration', 0)
+        dd_emoji = "🟢" if max_dd > -0.1 else "🟡" if max_dd > -0.2 else "🔴"
+        
+        print(f"   最大回撤          : {max_dd:>8.2%} {dd_emoji}")
+        print(f"   回撤持续天数      : {dd_duration:>8.0f} 天")
+        
+        # 胜负统计
+        print(f"\n🎯 胜负统计:")
+        win_rate = performance_stats.get('win_rate', 0)
+        monthly_win_rate = performance_stats.get('monthly_win_rate', 0)
+        profit_factor = performance_stats.get('profit_factor', 0)
+        
+        win_emoji = "🟢" if win_rate > 0.55 else "🟡" if win_rate > 0.45 else "🔴"
+        pf_emoji = "🟢" if profit_factor > 1.5 else "🟡" if profit_factor > 1.0 else "🔴"
+        
+        print(f"   日胜率            : {win_rate:>8.2%} {win_emoji}")
+        print(f"   月胜率            : {monthly_win_rate:>8.2%}")
+        print(f"   盈亏比            : {profit_factor:>8.2f} {pf_emoji}")
+        
+        # 尾部风险
+        print(f"\n⚠️  尾部风险:")
+        var_95 = performance_stats.get('var_95', 0)
+        cvar_95 = performance_stats.get('cvar_95', 0)
+        var_emoji = "🟢" if var_95 > -0.03 else "🟡" if var_95 > -0.05 else "🔴"
+        
+        print(f"   VaR(95%)         : {var_95:>8.2%} {var_emoji}")
+        print(f"   CVaR(95%)        : {cvar_95:>8.2%}")
+        
+        # 持仓分析
+        if position_sizes:
+            print(f"\n💼 持仓配置:")
+            sorted_positions = sorted(position_sizes.items(), key=lambda x: x[1], reverse=True)
+            
+            for i, (stock_code, position) in enumerate(sorted_positions[:5]):  # 显示前5大持仓
+                stock_name = self.get_stock_name(stock_code)
+                weight = (position / total_position) * 100
+                risk_score = self.risk_metrics.get(stock_code, {}).get('risk_score', 0) if hasattr(self, 'risk_metrics') else 0
+                risk_emoji = "🟢" if risk_score < 30 else "🟡" if risk_score < 60 else "🔴"
+                
+                print(f"   #{i+1} {stock_code} {stock_name[:6]:>6s}: {weight:>5.1f}% (¥{position:>7,.0f}) {risk_emoji}")
+            
+            if len(sorted_positions) > 5:
+                print(f"   ... 还有 {len(sorted_positions)-5} 只股票")
+        
+        # 交易执行统计
+        trading_stats = self.get_trading_statistics()
+        if trading_stats['total_orders'] > 0:
+            print(f"\n🔄 交易执行统计:")
+            success_rate = trading_stats.get('success_rate', 0)
+            fill_rate = trading_stats.get('avg_fill_ratio', 0)
+            exec_emoji = "🟢" if success_rate > 0.9 else "🟡" if success_rate > 0.7 else "🔴"
+            
+            print(f"   总订单数          : {trading_stats['total_orders']:>8.0f}")
+            print(f"   成交成功率        : {success_rate:>8.2%} {exec_emoji}")
+            print(f"   平均成交比例      : {fill_rate:>8.2%}")
+            print(f"   平均交易成本      : ¥{trading_stats.get('avg_transaction_cost', 0):>6.2f}")
+        
+        # 策略评级总结
+        print(f"\n🏆 策略综合评级:")
+        
+        # 计算综合评分
+        score_components = []
+        if sharpe > 1.5: score_components.append(("收益质量", "优秀", "🟢"))
+        elif sharpe > 1.0: score_components.append(("收益质量", "良好", "🟡"))
+        else: score_components.append(("收益质量", "一般", "🔴"))
+        
+        if max_dd > -0.1: score_components.append(("风险控制", "优秀", "🟢"))
+        elif max_dd > -0.2: score_components.append(("风险控制", "良好", "🟡"))
+        else: score_components.append(("风险控制", "需改进", "🔴"))
+        
+        if win_rate > 0.55: score_components.append(("稳定性", "优秀", "🟢"))
+        elif win_rate > 0.45: score_components.append(("稳定性", "良好", "🟡"))
+        else: score_components.append(("稳定性", "一般", "🔴"))
+        
+        for component, rating, emoji in score_components:
+            print(f"   {component:12s}: {rating:>6s} {emoji}")
+        
+        # 建议
+        print(f"\n💡 策略建议:")
+        suggestions = []
+        
+        if sharpe < 1.0:
+            suggestions.append("• 考虑优化选股标准或调整仓位管理")
+        if max_dd < -0.15:
+            suggestions.append("• 加强回撤控制，可考虑降低单笔仓位或增加止损")
+        if win_rate < 0.45:
+            suggestions.append("• 检查入场时机，提高交易成功率")
+        if alpha < 0:
+            suggestions.append("• 策略未能跑赢基准，需要优化选股或择时逻辑")
+        if not suggestions:
+            suggestions.append("• 策略表现良好，可考虑适当增加仓位或扩大股票池")
+        
+        for suggestion in suggestions[:3]:  # 最多显示3条建议
+            print(f"   {suggestion}")
+        
+        print("\n" + "="*100)
+        print(f"📄 详细图表分析请查看: portfolio_analysis_enhanced.html")
+        print("="*100 + "\n")
+
     def _calculate_realistic_stop_loss(self, current_price, atr, yesterday_close, stock_code=None, is_st=None):
         """
         计算考虑A股制度约束的止损价格
@@ -4021,9 +4168,12 @@ def main():
             print("组合净值曲线已保存为 portfolio_curve.html")
             
             # 生成增强版的组合分析报告
-            enhanced_fig = self.create_enhanced_portfolio_dashboard(equity_curve, performance_stats, selected_stocks, position_sizes)
+            enhanced_fig = strategy.create_enhanced_portfolio_dashboard(equity_curve, performance_stats, selected_stocks, position_sizes)
             enhanced_fig.write_html("portfolio_analysis_enhanced.html")
             print("增强版组合分析报告已保存为 portfolio_analysis_enhanced.html")
+            
+            # 打印增强版关键指标摘要
+            strategy.print_enhanced_metrics_summary(equity_curve, performance_stats, selected_stocks, position_sizes)
     else:
         print("没有符合风险条件的股票")
 
