@@ -30,6 +30,38 @@ import json
 warnings.filterwarnings('ignore')
 
 
+def get_previous_trading_day(date=None):
+    """
+    获取前一个交易日
+
+    Parameters:
+    -----------
+    date : str or None
+        基准日期，格式 YYYYMMDD，默认为今天
+
+    Returns:
+    --------
+    str
+        前一个交易日，格式 YYYYMMDD
+    """
+    if date is None:
+        base_date = datetime.now()
+    else:
+        if isinstance(date, str) and len(date) == 8:
+            base_date = datetime.strptime(date, '%Y%m%d')
+        else:
+            base_date = datetime.now()
+
+    # 向前查找最近的交易日（非周末）
+    current_date = base_date - timedelta(days=1)
+
+    # 如果是周末，继续向前查找
+    while current_date.weekday() >= 5:  # 5=周六, 6=周日
+        current_date -= timedelta(days=1)
+
+    return current_date.strftime('%Y%m%d')
+
+
 class RiskSensitiveTrendStrategy:
     """风险敏感型趋势跟踪 + 相对强度策略"""
 
@@ -43,7 +75,7 @@ class RiskSensitiveTrendStrategy:
         start_date : str
             开始日期，格式'YYYYMMDD'
         end_date : str
-            结束日期，默认为今天
+            结束日期，默认为前一个交易日
         qlib_dir : str
             qlib数据目录
         stock_pool_mode : str
@@ -56,7 +88,7 @@ class RiskSensitiveTrendStrategy:
             是否过滤ST股票，True=过滤ST股票，False=保留ST股票
         """
         self.start_date = start_date
-        self.end_date = end_date or datetime.now().strftime('%Y%m%d')
+        self.end_date = end_date or get_previous_trading_day()
         self.qlib_dir = os.path.expanduser(qlib_dir)
         self.stock_pool_mode = stock_pool_mode
         self.custom_stocks = custom_stocks or []
@@ -1740,31 +1772,96 @@ class RiskSensitiveTrendStrategy:
 
     def _process_single_stock(self, stock_code):
         """
-        处理单只股票的数据获取和指标计算（用于并发处理）
+        并发任务：获取单只股票数据、计算指标与风险分，并做“硬性门槛”判定
+        返回: (stock_code, df or None, risk_score or None, is_valid: bool)
         """
         try:
             stock_name = self.get_stock_name(stock_code)
             df = self.fetch_stock_data(stock_code)
 
-            if df is not None and len(df) > 5:
-                # 计算技术指标
-                df = self.calculate_ma_signals(df)
-                df = self.calculate_rsi(df)
-                df = self.calculate_atr(df)
-                df = self.calculate_volatility(df)
-                df = self.calculate_max_drawdown(df)
-                df = self.calculate_bollinger_bands(df)
-
-                # 计算风险指标
-                risk_score = self.calculate_risk_metrics(df, stock_code)
-
-                # 返回结果
-                if risk_score is not None and risk_score < 85:
-                    return stock_code, df, risk_score, True
-                else:
-                    return stock_code, None, risk_score, False
-            else:
+            if df is None or len(df) <= 5:
                 return stock_code, None, None, False
+
+            # === 技术指标（与现有管线保持一致） ===
+            df = self.calculate_ma_signals(df)      # 生成: MA_short, MA_long, MA_slope, trend_signal, trend_strength
+            df = self.calculate_rsi(df)             # 生成: RSI
+            df = self.calculate_atr(df)             # 生成: ATR, ATR_pct
+            df = self.calculate_volatility(df)      # 生成: returns, volatility, volatility_10d, volatility_ratio
+            df = self.calculate_max_drawdown(df)    # 生成: drawdown, max_drawdown
+            df = self.calculate_bollinger_bands(df) # 生成: BB_*
+
+            # === 风险评分（你原有的综合分） ===
+            risk_score = self.calculate_risk_metrics(df, stock_code)
+
+            # === 组合型“硬性门槛”过滤（任一不满足 → 不选） ===
+
+            # 1) 长趋势：用已经计算的 trend_signal（1=多头，-1=空头，0=震荡）
+            #    若该列不存在（极少数异常），回退为 MA_short > MA_long
+            if 'trend_signal' in df.columns and not pd.isna(df['trend_signal'].iloc[-1]):
+                trend_ok = (int(df['trend_signal'].iloc[-1]) == 1)
+            else:
+                trend_ok = ('MA_short' in df.columns and 'MA_long' in df.columns
+                            and float(df['MA_short'].iloc[-1]) > float(df['MA_long'].iloc[-1]))
+
+            # 2) 短期趋势：严格使用 5 日 > 10 日（避免等于时被判“走强”，对应你日志里 3.46 vs 3.46 的情况）
+            s5  = df['close'].rolling(5).mean()
+            s10 = df['close'].rolling(10).mean()
+            short_term_trend_ok = (not pd.isna(s5.iloc[-1]) and not pd.isna(s10.iloc[-1])
+                                and float(s5.iloc[-1]) > float(s10.iloc[-1]))
+
+            # 3) RSI 区间（默认 35~70，避免超买/超卖）
+            if 'RSI' in df.columns and not pd.isna(df['RSI'].iloc[-1]):
+                rsi_val = float(df['RSI'].iloc[-1])
+                rsi_ok = (35.0 <= rsi_val <= 70.0)
+            else:
+                rsi_ok = True  # 缺失时不强卡
+
+            # 4) 波动率与比率（阈值沿用你现有设置：年化 < self.volatility_threshold，短/长 比率 < 1.5）
+            vol_threshold = getattr(self, 'volatility_threshold', 0.35)
+            vol_ok = ('volatility' in df.columns and not pd.isna(df['volatility'].iloc[-1])
+                    and float(df['volatility'].iloc[-1]) < float(vol_threshold))
+            vr_ok = ('volatility_ratio' not in df.columns or pd.isna(df['volatility_ratio'].iloc[-1])
+                    or float(df['volatility_ratio'].iloc[-1]) < 1.5)
+
+            # 5) 近期回撤（近 20 个交易日，距近 20 日内高点的回撤不超过 10%）
+            if len(df) >= 20:
+                recent = df.iloc[-20:]
+                peak_recent = float(recent['close'].max())
+                recent_dd = (float(recent['close'].iloc[-1]) / peak_recent - 1.0) if peak_recent > 0 else 0.0
+                recent_dd_ok = (recent_dd > -0.10)
+            else:
+                recent_dd_ok = True
+
+            # 6) 高点回撤（近 120 日回撤不超过 18%）
+            if len(df) >= 60:
+                peak120 = float(df['close'].rolling(120, min_periods=1).max().iloc[-1])
+                high_dd = (float(df['close'].iloc[-1]) / peak120 - 1.0) if peak120 > 0 else 0.0
+                high_dd_ok = (high_dd > -0.18)
+            else:
+                high_dd_ok = True
+
+            # 7) 终判定：风险分 + 所有硬性门槛
+            is_valid = (risk_score is not None and risk_score < 85
+                        and trend_ok and short_term_trend_ok
+                        and rsi_ok and vol_ok and vr_ok
+                        and recent_dd_ok and high_dd_ok)
+
+            # 调试输出：一眼看清哪条门槛把票放进/挡出
+            try:
+                print(
+                    f"[debug] {stock_code} 选择判定 — "
+                    f"风险:{(risk_score if risk_score is not None else float('nan')):.1f} "
+                    f"趋势:{trend_ok} 短期:{short_term_trend_ok} RSI:{rsi_ok} "
+                    f"波动:{vol_ok} 比率:{vr_ok} 近回撤:{recent_dd_ok} 高回撤:{high_dd_ok}"
+                )
+            except Exception:
+                # 打印里容忍格式异常，不影响主流程
+                pass
+
+            if is_valid:
+                return stock_code, df, risk_score, True
+            else:
+                return stock_code, None, risk_score, False
 
         except Exception as e:
             stock_name = self.get_stock_name(stock_code)
@@ -1872,19 +1969,27 @@ class RiskSensitiveTrendStrategy:
 
         return df
 
-    def calculate_volatility(self, df, window=20):
+    def calculate_volatility(self, df, window=15):
         """
-        计算历史波动率
+        计算历史波动率（优化窗口期以更好捕捉近期变化）
 
         Parameters:
         -----------
         df : DataFrame
             股票价格数据
         window : int
-            计算窗口
+            计算窗口（默认15天，更敏感地反映近期波动）
         """
         df['returns'] = df['close'].pct_change()
+
+        # 主要波动率指标（15天）- 更敏感
         df['volatility'] = df['returns'].rolling(window).std() * np.sqrt(252)  # 年化
+
+        # 短期波动率指标（10天）- 用于捕捉最新变化
+        df['volatility_10d'] = df['returns'].rolling(10).std() * np.sqrt(252)  # 年化
+
+        # 波动率比率：短期/长期，用于识别波动率突增
+        df['volatility_ratio'] = df['volatility_10d'] / (df['volatility'] + 1e-8)  # 避免除零
 
         return df
 
@@ -2220,16 +2325,37 @@ class RiskSensitiveTrendStrategy:
 
         # 检测收益率统计
         port_ret_stats = port_ret_net.describe()
+        # 计算几何和算术年化收益率
+        arithmetic_annual = port_ret_stats['mean'] * 252
+        geometric_annual = (1 + port_ret_stats['mean']) ** 252 - 1
+
         print(f"[数据质量] 组合日收益统计:")
-        print(f"  均值: {port_ret_stats['mean']:.4f} (年化{port_ret_stats['mean']*252:.1%})")
+        print(f"  均值: {port_ret_stats['mean']:.4f} (几何年化{geometric_annual:.1%}, 算术年化{arithmetic_annual:.1%})")
         print(f"  标准差: {port_ret_stats['std']:.4f}")
         print(f"  最大: {port_ret_stats['max']:.4f}, 最小: {port_ret_stats['min']:.4f}")
 
-        # 检测个股收益异常
-        individual_extreme = (rets_active.abs() > 0.15).any(axis=1)  # 某天有个股收益>15%
+        # 检测个股收益异常 - 使用板块特定阈值
+        def get_extreme_threshold(stock_code: str) -> float:
+            """根据股票代码确定极端收益阈值"""
+            if stock_code.startswith('68'):  # 科创板
+                return 0.22  # >22%
+            elif stock_code.startswith('30'):  # 创业板
+                return 0.22  # >22%
+            elif stock_code.startswith('8') or stock_code.startswith('4'):  # 北交所
+                return 0.33  # >33%
+            else:  # 主板
+                return 0.11  # >11%
+
+        # 按股票分别检测
+        extreme_by_stock = pd.DataFrame(index=rets_active.index, columns=rets_active.columns, dtype=bool)
+        for stock_code in rets_active.columns:
+            threshold = get_extreme_threshold(stock_code)
+            extreme_by_stock[stock_code] = rets_active[stock_code].abs() > threshold
+
+        individual_extreme = extreme_by_stock.any(axis=1)  # 某天有个股超过板块阈值
         if individual_extreme.any():
             extreme_stock_days = individual_extreme.sum()
-            print(f"⚠️  发现{extreme_stock_days}天存在个股极端收益(>15%)")
+            print(f"⚠️  发现{extreme_stock_days}天存在个股极端收益(按板块阈值:主板>11%,科创/创业>22%,北交所>33%)")
 
         print(f"[诊断] 活跃权重日={nonzero_w_days}, 有效收益日={nonzero_ret_days}, 回测周期={len(equity)}")
         print(f"[诊断] 净值区间: {equity.iloc[0]:.6f} → {equity.iloc[-1]:.6f} (总收益{((equity.iloc[-1]/equity.iloc[0])-1)*100:.1f}%)")
@@ -2257,7 +2383,7 @@ class RiskSensitiveTrendStrategy:
             # 简化基准收益率估算（年化8%）
             benchmark_daily = 0.08 / 252
             excess_ret = daily_ret - benchmark_daily
-            alpha = float(excess_ret.mean() * 252)
+            alpha = float((1 + excess_ret.mean()) ** 252 - 1)  # 几何年化
             tracking_error = float(excess_ret.std() * np.sqrt(252))
             info_ratio = alpha / tracking_error if tracking_error > 0 else 0.0
         except:
@@ -2266,12 +2392,12 @@ class RiskSensitiveTrendStrategy:
         # 风险调整指标
         rf_daily = 0.025 / 252
         excess = daily_ret - rf_daily
-        sharpe = float((excess.mean() * 252) / (daily_ret.std() * np.sqrt(252))) if daily_ret.std() > 0 else 0.0
+        sharpe = float(((1 + excess.mean()) ** 252 - 1) / (daily_ret.std() * np.sqrt(252))) if daily_ret.std() > 0 else 0.0
 
         # Sortino比率（下行标准差）
         downside_ret = daily_ret[daily_ret < 0]
         downside_std = float(downside_ret.std() * np.sqrt(252)) if len(downside_ret) > 0 else 0.0
-        sortino = float((daily_ret.mean() - rf_daily) * 252 / downside_std) if downside_std > 0 else 0.0
+        sortino = float(((1 + daily_ret.mean()) ** 252 - 1 - ((1 + rf_daily) ** 252 - 1)) / downside_std) if downside_std > 0 else 0.0
 
         # 回撤分析 - 修正计算方式
         nav = equity.copy()
@@ -2629,6 +2755,12 @@ class RiskSensitiveTrendStrategy:
         else:
             current_volatility = 0.25  # 默认值
 
+        # 波动率比率：短期/长期
+        if 'volatility_ratio' in df.columns and not df['volatility_ratio'].iloc[:eval_point+1].empty:
+            volatility_ratio = df['volatility_ratio'].iloc[:eval_point+1].iloc[-1]
+        else:
+            volatility_ratio = 1.0  # 默认值
+
         # 回撤：使用滚动窗口
         if 'drawdown' in df.columns and not df['drawdown'].iloc[:eval_point+1].empty:
             current_drawdown = abs(df['drawdown'].iloc[:eval_point+1].iloc[-1])
@@ -2663,7 +2795,7 @@ class RiskSensitiveTrendStrategy:
                     # 统一使用2.5%无风险利率
                     daily_rf_rate = 0.025 / 252
                     excess_returns = window_returns - daily_rf_rate
-                    sharpe_ratio = (excess_returns.mean() * 252) / (window_returns.std() * np.sqrt(252))
+                    sharpe_ratio = ((1 + excess_returns.mean()) ** 252 - 1) / (window_returns.std() * np.sqrt(252))
                 else:
                     sharpe_ratio = 0
             else:
@@ -2691,6 +2823,7 @@ class RiskSensitiveTrendStrategy:
 
         metrics_obj = {
             'volatility': current_volatility,
+            'volatility_ratio': volatility_ratio,
             'current_drawdown': current_drawdown,
             'max_drawdown_60d': max_drawdown_60d,
             'atr_pct': atr_pct,
@@ -3341,10 +3474,18 @@ class RiskSensitiveTrendStrategy:
 
             print(f"相关性过滤完成: {len(candidate_stocks)} -> {len(selected)}")
 
-            # 如果过滤后股票太少，适当放宽标准
-            if len(selected) < 3 and max_corr > 0.5:
-                print(f"股票数量过少，放宽相关性阈值到 {max_corr + 0.1}")
-                return self._filter_by_correlation(candidate_stocks, max_corr + 0.1)
+            # 如果过滤后股票太少，适当放宽标准（但不超过1.0）
+            if len(selected) < 3 and max_corr < 1.0:
+                new_threshold = min(max_corr + 0.1, 1.0)  # 强制上限1.0
+                print(f"股票数量过少，放宽相关性阈值到 {new_threshold:.3f}")
+                return self._filter_by_correlation(candidate_stocks, new_threshold)
+            elif len(selected) < 3 and max_corr >= 1.0:
+                print(f"相关性阈值已达上限1.0，跳过相关性过滤，按评分排序取前{min(len(candidate_stocks), 5)}只")
+                # 当阈值已达上限时，直接按RS评分排序返回
+                if hasattr(self, 'rs_scores') and not self.rs_scores.empty:
+                    rs_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['rs_score']))
+                    candidate_stocks.sort(key=lambda x: rs_dict.get(x, 0), reverse=True)
+                return candidate_stocks[:min(len(candidate_stocks), 5)]
 
             return selected
 
@@ -4102,7 +4243,7 @@ class RiskSensitiveTrendStrategy:
         excess_returns = returns - daily_rf_rate
 
         if returns.std() > 0:
-            sharpe_ratio = (excess_returns.mean() * 252) / (returns.std() * np.sqrt(252))
+            sharpe_ratio = ((1 + excess_returns.mean()) ** 252 - 1) / (returns.std() * np.sqrt(252))
         else:
             sharpe_ratio = 0
 
@@ -4121,14 +4262,14 @@ class RiskSensitiveTrendStrategy:
         # 基准比较
         benchmark_daily = 0.08 / 252
         excess_ret = returns - benchmark_daily
-        alpha = excess_ret.mean() * 252
+        alpha = (1 + excess_ret.mean()) ** 252 - 1  # 几何年化
         tracking_error = excess_ret.std() * np.sqrt(252)
         info_ratio = alpha / tracking_error if tracking_error > 0 else 0
 
         # Sortino比率和Calmar比率
         downside_ret = returns[returns < 0]
         downside_std = downside_ret.std() * np.sqrt(252) if len(downside_ret) > 0 else 0
-        sortino = (returns.mean() - daily_rf_rate) * 252 / downside_std if downside_std > 0 else 0
+        sortino = ((1 + returns.mean()) ** 252 - 1 - ((1 + daily_rf_rate) ** 252 - 1)) / downside_std if downside_std > 0 else 0
         calmar = abs(annual_return / max_drawdown) if max_drawdown != 0 else 0
 
         # 尾部风险
@@ -4282,7 +4423,7 @@ def parse_args():
     parser.add_argument('--start-date', '-s', default='20250101',
                        help='开始日期，格式YYYYMMDD (默认: 20250101)')
     parser.add_argument('--end-date', '-e', default=None,
-                       help='结束日期，格式YYYYMMDD (默认: 今天)')
+                       help='结束日期，格式YYYYMMDD (默认: 前一个交易日)')
     parser.add_argument('--qlib-dir', default='~/.qlib/qlib_data/cn_data',
                        help='qlib数据目录路径 (默认: ~/.qlib/qlib_data/cn_data)')
 
@@ -4356,17 +4497,32 @@ def main():
             filter_st=args.filter_st
         )
 
+        # 导出invest.py格式的信号文件
+        print("\n正在导出invest.py格式信号...")
+        # 创建交易计划生成器来导出信号
+        trading_plan_generator = DailyTradingPlan(strategy)
+        signals_path = trading_plan_generator.export_invest_signals(
+            capital=args.capital,
+            max_positions=args.max_positions * 2  # 扩大候选范围
+        )
+
         print(f"\n=== 交易引擎完成 ===")
         print(f"交易计划文件: {daily_plan['csv_path']}")
+        print(f"投资信号文件: {signals_path}")
         print(f"风险利用率: {daily_plan['summary']['risk_utilization']:.1f}%")
         print(f"总投入资金: ¥{daily_plan['summary']['total_value']:,.0f}")
 
         # 生成执行提示
+        # 格式化日期显示
+        data_date_formatted = f"{strategy.end_date[:4]}-{strategy.end_date[4:6]}-{strategy.end_date[6:8]}"
+
         print(f"\n=== 执行提示 ===")
-        print("1. 收盘后: 已生成明日交易计划CSV文件")
-        print("2. 盘前9:20-9:30: 核对前收与涨跌停价")
-        print("3. 盘中: 按计划执行，注意风控触发")
-        print("4. 收盘后: 记录实际成交，更新持仓文件")
+        print(f"1. 数据日期: {strategy.end_date} (信号生成基准日)")
+        print(f"2. 使用 python invest.py plan --date {data_date_formatted} 生成详细交易计划")
+        print("3. 盘前9:20-9:30: 核对前收与涨跌停价")
+        print("4. 盘中: 按计划执行，注意风控触发")
+        print("5. 收盘后: 使用 python invest.py reconcile 更新账本")
+        print(f"\n注意: invest.py 使用数据日期 {data_date_formatted}，不是执行日期")
 
         return daily_plan
     else:
@@ -4491,7 +4647,8 @@ class DailyTradingPlan:
 
     def __init__(self, strategy_instance):
         self.strategy = strategy_instance
-        self.trade_date = datetime.now().strftime('%Y%m%d')
+        # 使用策略的 end_date 作为交易日期（数据日期）
+        self.trade_date = self.strategy.end_date
         self.max_position_pct = 0.05  # 单笔交易不超过ADV20的5%
 
     def set_random_seed(self, trade_date=None):
@@ -4523,7 +4680,33 @@ class DailyTradingPlan:
 
         df = self.strategy.price_data[stock_code]
         current_price = df['close'].iloc[-1]
-        atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else current_price * 0.02
+
+        # 验证基础数据
+        if pd.isna(current_price) or current_price <= 0:
+            print(f"警告: {stock_code} 价格数据无效: {current_price}")
+            return None
+
+        if pd.isna(capital) or capital <= 0:
+            print(f"警告: 资本金额无效: {capital}")
+            return None
+
+        # ATR处理 - 添加NaN检查和多重fallback
+        atr = None
+        if 'ATR' in df.columns:
+            atr_value = df['ATR'].iloc[-1]
+            if pd.notna(atr_value) and atr_value > 0:
+                atr = atr_value
+            else:
+                # ATR无效，尝试从前几天获取
+                atr_series = df['ATR'].dropna()
+                if len(atr_series) > 0:
+                    atr = atr_series.iloc[-1]
+                    print(f"警告: {stock_code} 最新ATR无效，使用历史ATR: {atr:.4f}")
+
+        # 如果ATR仍然无效，使用价格的2%作为fallback
+        if atr is None or pd.isna(atr) or atr <= 0:
+            atr = current_price * 0.02
+            print(f"警告: {stock_code} ATR无效，使用价格2%作为fallback: {atr:.4f}")
 
         # 计算ATR止损价
         stop_loss_price = current_price - (atr * self.strategy.atr_multiplier)
@@ -4534,13 +4717,24 @@ class DailyTradingPlan:
         # 止损距离
         stop_distance = current_price - stop_loss_price
 
-        if stop_distance <= 0:
+        # 验证计算结果
+        if pd.isna(stop_distance) or stop_distance <= 0:
+            print(f"警告: {stock_code} 止损距离无效: {stop_distance}, current_price={current_price}, stop_loss_price={stop_loss_price}")
+            return None
+
+        if pd.isna(risk_amount) or risk_amount <= 0:
+            print(f"警告: {stock_code} 风险金额无效: {risk_amount}")
             return None
 
         # 理论股数 = 风险金额 / 止损距离
         theoretical_shares = risk_amount / stop_distance
 
-        # 调整为100股的整数倍（A股最小交易单位）
+        # 验证theoretical_shares
+        if pd.isna(theoretical_shares) or theoretical_shares <= 0:
+            print(f"警告: {stock_code} 理论股数无效: {theoretical_shares}, risk_amount={risk_amount}, stop_distance={stop_distance}")
+            return None
+
+        # 调整为100股的整数倍（A股最小交易单位） - 现在theoretical_shares已验证不是NaN
         shares = int(theoretical_shares // 100) * 100
 
         if shares <= 0:
@@ -4640,57 +4834,232 @@ class DailyTradingPlan:
             print("未找到相对强度评分数据，请先运行策略")
             return buy_list
 
-        # 选择候选股票
+        # DEBUG: 确认交易日期和信号基准日
+        trade_date = self.trade_date
+
+        # 选择候选股票并进行详细诊断
         candidates = []
+        debug_conditions = []
+
         for _, row in self.strategy.rs_scores.head(20).iterrows():
             stock = row['stock_code']
-            if stock in self.strategy.price_data:
-                df = self.strategy.price_data[stock]
-                metrics = self.strategy.risk_metrics.get(stock, {})
 
-                # 技术条件过滤
-                if (len(df) > 0 and
-                    'trend_signal' in df.columns and
-                    df['trend_signal'].iloc[-1] == 1 and  # 趋势向上
-                    'RSI' in df.columns and
-                    25 < df['RSI'].iloc[-1] < 75 and      # RSI合理区间
-                    metrics.get('volatility', 1) < self.strategy.volatility_threshold):
-                    candidates.append(stock)
+            # 代码格式对齐：尝试多种格式
+            stock_variants = [
+                stock,  # 原始格式
+                f"SH{stock}" if stock.startswith('6') else f"SZ{stock}",  # 带前缀
+                stock.replace('SH', '').replace('SZ', '') if stock.startswith(('SH', 'SZ')) else stock  # 去前缀
+            ]
+
+            matched_stock = None
+            for variant in stock_variants:
+                if variant in self.strategy.price_data:
+                    matched_stock = variant
+                    break
+
+            if matched_stock:
+                df = self.strategy.price_data[matched_stock]
+                metrics = self.strategy.risk_metrics.get(matched_stock, {})
+
+                # DEBUG: 检查每个条件
+                has_data = len(df) > 0
+                has_trend = 'trend_signal' in df.columns
+                trend_up = has_trend and df['trend_signal'].iloc[-1] == 1
+                has_rsi = 'RSI' in df.columns
+                rsi_ok = has_rsi and (25 < df['RSI'].iloc[-1] < 75)
+                # 改进的波动率检查：同时考虑绝对波动率和波动率突增
+                base_volatility = metrics.get('volatility', 1)
+                volatility_ratio = metrics.get('volatility_ratio', 1)  # 短期/长期波动率比
+
+                vol_ok = (base_volatility < self.strategy.volatility_threshold and
+                         volatility_ratio < 1.5)  # 短期波动率不能大幅超过长期波动率
+
+                debug_info = {
+                    'stock': stock,
+                    'has_data': has_data,
+                    'has_trend': has_trend,
+                    'trend_up': trend_up,
+                    'trend_value': df['trend_signal'].iloc[-1] if has_trend else 'N/A',
+                    'has_rsi': has_rsi,
+                    'rsi_ok': rsi_ok,
+                    'rsi_value': df['RSI'].iloc[-1] if has_rsi else 'N/A',
+                    'vol_ok': vol_ok,
+                    'volatility': base_volatility,
+                    'volatility_ratio': volatility_ratio,
+                    'vol_threshold': self.strategy.volatility_threshold
+                }
+                debug_conditions.append(debug_info)
+
+                # 添加近期回撤和短期趋势检查
+                recent_drawdown_ok = True
+                high_point_drawdown_ok = True
+                short_term_trend_ok = True
+
+                if len(df) >= 20:  # 确保有足够数据
+                    # 1. 近期回撤过滤：最近4周(20个交易日)跌幅不超过10%
+                    recent_high = df['close'].tail(20).max()
+                    current_price = df['close'].iloc[-1]
+                    recent_drawdown = (recent_high - current_price) / recent_high
+                    recent_drawdown_ok = recent_drawdown <= 0.10  # 近期回撤不超过10%
+
+                    # 2. 短期趋势过滤：5日均线 > 10日均线（避免短期死叉）
+                    close_prices = df['close'].tail(20)
+                    if len(close_prices) >= 10:
+                        ma5 = close_prices.tail(5).mean()
+                        ma10 = close_prices.tail(10).mean()
+                        short_term_trend_ok = ma5 > ma10 * 0.995  # 允许轻微偏差（0.5%容差）
+
+                    # 3. 距离高点回撤过滤：距离近60日最高价回撤不超过15%
+                    if len(df) >= 60:
+                        high_60d = df['close'].tail(60).max()
+                        high_point_drawdown = (high_60d - current_price) / high_60d
+                        high_point_drawdown_ok = high_point_drawdown <= 0.15  # 距离高点回撤不超过15%
+
+                # 更新debug信息
+                debug_info['recent_drawdown_ok'] = recent_drawdown_ok
+                debug_info['high_point_drawdown_ok'] = high_point_drawdown_ok
+                debug_info['short_term_trend_ok'] = short_term_trend_ok
+                if len(df) >= 20:
+                    debug_info['recent_drawdown'] = f"{recent_drawdown:.1%}"
+                    if len(close_prices) >= 10:
+                        debug_info['ma5_vs_ma10'] = f"{ma5:.2f}vs{ma10:.2f}"
+                if len(df) >= 60:
+                    debug_info['high_point_drawdown'] = f"{high_point_drawdown:.1%}"
+
+                # 技术条件过滤（增加回撤和短期趋势检查）
+                if (has_data and has_trend and has_rsi and vol_ok and recent_drawdown_ok and high_point_drawdown_ok and short_term_trend_ok):
+                    # 先放宽趋势条件：>= 0 而不是 == 1
+                    if df['trend_signal'].iloc[-1] >= 0:  # 修改：放宽趋势条件
+                        candidates.append(matched_stock)  # 使用匹配的股票代码
+
+        for info in debug_conditions[:10]:  # 只打印前10只
+            vol_str = f"{info['volatility']:.3f}" if isinstance(info['volatility'], (int, float)) else str(info['volatility'])
+            vol_ratio_str = f"{info['volatility_ratio']:.2f}" if isinstance(info['volatility_ratio'], (int, float)) else str(info['volatility_ratio'])
+            # 修正波动率比较逻辑，加入波动率比率
+            vol_comparison = f"{vol_str}<{info['vol_threshold']}&{vol_ratio_str}<1.5" if info['vol_ok'] else f"{vol_str}>={info['vol_threshold']}|{vol_ratio_str}>=1.5"
+
+            # 构建回撤和短期趋势信息
+            extra_info = ""
+            if info.get('recent_drawdown'):
+                extra_info += f" 近期回撤✓={info['recent_drawdown_ok']}({info['recent_drawdown']})"
+            if info.get('ma5_vs_ma10'):
+                extra_info += f" 短期趋势✓={info['short_term_trend_ok']}({info['ma5_vs_ma10']})"
+            if info.get('high_point_drawdown'):
+                extra_info += f" 高点回撤✓={info['high_point_drawdown_ok']}({info['high_point_drawdown']})"
+
+            print(f"  {info['stock']}: 数据✓={info['has_data']} 趋势✓={info['trend_up']}({info['trend_value']}) RSI✓={info['rsi_ok']}({info['rsi_value']}) 波动率✓={info['vol_ok']}({vol_comparison}){extra_info}")
+
+        # 动态阈值调整机制：当候选股票过少时，放宽波动率阈值
+        original_vol_threshold = self.strategy.volatility_threshold
+        if len(candidates) < 5:
+            # 放宽波动率阈值，从0.35提升到0.45或0.6（上限）
+            relaxed_vol_threshold = min(original_vol_threshold + 0.1, 0.6)
+            print(f"候选股票过少({len(candidates)})，放宽波动率阈值从{original_vol_threshold:.2f}到{relaxed_vol_threshold:.2f}")
+
+            # 重新筛选候选股票，使用放宽的波动率阈值
+            additional_candidates = []
+            for _, row in self.strategy.rs_scores.head(30).iterrows():  # 扩大搜索范围到前30只
+                stock = row['stock_code']
+
+                # 代码格式对齐
+                stock_variants = [
+                    stock,
+                    f"SH{stock}" if stock.startswith('6') else f"SZ{stock}",
+                    stock.replace('SH', '').replace('SZ', '') if stock.startswith(('SH', 'SZ')) else stock
+                ]
+
+                matched_stock = None
+                for variant in stock_variants:
+                    if variant in self.strategy.price_data:
+                        matched_stock = variant
+                        break
+
+                if matched_stock and matched_stock not in candidates:  # 避免重复
+                    df = self.strategy.price_data[matched_stock]
+                    metrics = self.strategy.risk_metrics.get(matched_stock, {})
+
+                    # 使用放宽的波动率阈值重新检查
+                    has_data = len(df) > 0
+                    has_trend = 'trend_signal' in df.columns
+                    has_rsi = 'RSI' in df.columns
+                    # 改进的放宽波动率检查
+                    base_volatility = metrics.get('volatility', 1)
+                    volatility_ratio = metrics.get('volatility_ratio', 1)
+                    vol_ok_relaxed = (base_volatility < relaxed_vol_threshold and
+                                    volatility_ratio < 1.8)  # 放宽时允许更高的波动率比
+
+                    # 回撤和短期趋势检查（即使在放宽阈值时也要保持）
+                    recent_drawdown_ok = True
+                    high_point_drawdown_ok = True
+                    short_term_trend_ok = True
+
+                    if len(df) >= 20:
+                        recent_high = df['close'].tail(20).max()
+                        current_price = df['close'].iloc[-1]
+                        recent_drawdown = (recent_high - current_price) / recent_high
+                        recent_drawdown_ok = recent_drawdown <= 0.10
+
+                        # 短期趋势检查
+                        close_prices = df['close'].tail(20)
+                        if len(close_prices) >= 10:
+                            ma5 = close_prices.tail(5).mean()
+                            ma10 = close_prices.tail(10).mean()
+                            short_term_trend_ok = ma5 > ma10 * 0.995
+
+                        if len(df) >= 60:
+                            high_60d = df['close'].tail(60).max()
+                            high_point_drawdown = (high_60d - current_price) / high_60d
+                            high_point_drawdown_ok = high_point_drawdown <= 0.15
+
+                    if (has_data and has_trend and has_rsi and vol_ok_relaxed and recent_drawdown_ok and high_point_drawdown_ok and short_term_trend_ok):
+                        if df['trend_signal'].iloc[-1] >= 0:
+                            additional_candidates.append(matched_stock)
+
+            candidates.extend(additional_candidates)
+            print(f"放宽波动率阈值后候选股票增至: {len(candidates)}")
 
         # 相关性过滤
         if len(candidates) > 1:
             candidates = self.strategy._filter_by_correlation(candidates)
-
         # 生成买入计划
-        for stock in candidates[:max_positions]:
-            position_info = self.calculate_precise_position_size(stock, capital)
+        for i, matched_stock in enumerate(candidates[:max_positions]):
+            # 找到原始股票代码（6位）用于RS查询
+            original_stock = matched_stock.replace('SH', '').replace('SZ', '')
+
+            position_info = self.calculate_precise_position_size(matched_stock, capital)
+
             if position_info is None:
                 continue
 
-            df = self.strategy.price_data[stock]
+            df = self.strategy.price_data[matched_stock]
             current_price = df['close'].iloc[-1]
 
             # 建议执行价格（开盘价或VWAP）
             entry_hint = "开盘价"  # 简化为开盘价，实际可加入VWAP逻辑
 
             # 检查涨跌停风险
-            limit_risk = self.check_price_limit_risk(stock, current_price, is_buy=True)
+            limit_risk = self.check_price_limit_risk(matched_stock, current_price, is_buy=True)
 
             # 流动性风险标记
             adv_risk = "流动性风险" if self._check_adv_constraint(
-                stock, position_info['shares'], current_price) else ""
+                matched_stock, position_info['shares'], current_price) else ""
 
             notes = [risk for risk in [limit_risk, adv_risk] if risk and risk != "正常"]
 
+            # 查找RS分数（使用原始6位代码）
+            rs_match = self.strategy.rs_scores[self.strategy.rs_scores['stock_code']==original_stock]
+            rs_score = rs_match['rs_score'].iloc[0] if not rs_match.empty else 0.0
+
             buy_list.append({
                 'date': self.trade_date,
-                'code': stock,
-                'name': self.strategy.get_stock_name(stock),
-                'signal': f"RS_{self.strategy.rs_scores[self.strategy.rs_scores['stock_code']==stock]['rs_score'].iloc[0]:.1f}",
+                'code': original_stock,  # 输出使用6位代码
+                'name': self.strategy.get_stock_name(matched_stock),
+                'signal': f"RS_{rs_score:.1f}",
                 'plan_action': 'buy',
                 'plan_shares': position_info['shares'],
                 'plan_weight': position_info['position_value'] / capital * 100,
                 'entry_hint': entry_hint,
+                'entry_price': current_price,  # 添加入场价格
                 'stop_loss': position_info['stop_loss'],
                 'atr': position_info['atr'],
                 'risk_used': position_info['risk_amount'],
@@ -4708,12 +5077,27 @@ class DailyTradingPlan:
 
         # 找到买入信号的阈值
         buy_candidates = set()
-        for _, row in self.strategy.rs_scores.head(10).iterrows():
+        for _, row in self.strategy.rs_scores.head(20).iterrows():  # 扩大搜索范围
             stock = row['stock_code']
-            if stock in self.strategy.price_data:
-                df = self.strategy.price_data[stock]
-                if ('trend_signal' in df.columns and
-                    df['trend_signal'].iloc[-1] == 1):
+            # 代码格式对齐：尝试多种格式
+            stock_variants = [
+                stock,  # 原始格式
+                f"SH{stock}" if stock.startswith('6') else f"SZ{stock}",  # 带前缀
+                stock.replace('SH', '').replace('SZ', '') if stock.startswith(('SH', 'SZ')) else stock  # 去前缀
+            ]
+
+            matched_stock = None
+            for variant in stock_variants:
+                if variant in self.strategy.price_data:
+                    matched_stock = variant
+                    break
+
+            if matched_stock:
+                df = self.strategy.price_data[matched_stock]
+                # 与买入信号生成保持一致：放宽趋势条件到 >= 0
+                if ('trend_signal' in df.columns and 'RSI' in df.columns and
+                    df['trend_signal'].iloc[-1] >= 0 and
+                    25 < df['RSI'].iloc[-1] < 75):
                     buy_candidates.add(stock)
 
         min_buy_score = min([self.strategy.rs_scores[
@@ -4873,6 +5257,178 @@ class DailyTradingPlan:
             print(f"观察清单已导出到: {watch_filepath}")
 
         return filepath
+
+    def export_invest_signals(self, capital=1000000, max_positions=20, filepath=None):
+        """导出符合invest.py schema的信号文件（Parquet格式）"""
+        if filepath is None:
+            if self.trade_date:
+                # 转换 YYYYMMDD 格式到 YYYY-MM-DD 格式
+                if len(self.trade_date) == 8 and self.trade_date.isdigit():
+                    date_str = f"{self.trade_date[:4]}-{self.trade_date[4:6]}-{self.trade_date[6:8]}"
+                else:
+                    date_str = self.trade_date  # 已经是正确格式
+            else:
+                date_str = datetime.now().strftime('%Y-%m-%d')
+            filepath = f"data/signals/{date_str}.parquet"
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+        signals = []
+
+        if not hasattr(self.strategy, 'rs_scores') or self.strategy.rs_scores.empty:
+            print("未找到相对强度评分数据，请先运行策略")
+            return filepath
+
+        # 生成买入信号（应用代码格式对齐修复）
+        candidates = []
+        for _, row in self.strategy.rs_scores.head(50).iterrows():  # 扩大候选范围
+            stock = row['stock_code']
+
+            # 代码格式对齐：尝试多种格式
+            stock_variants = [
+                stock,  # 原始格式
+                f"SH{stock}" if stock.startswith('6') else f"SZ{stock}",  # 带前缀
+                stock.replace('SH', '').replace('SZ', '') if stock.startswith(('SH', 'SZ')) else stock  # 去前缀
+            ]
+
+            matched_stock = None
+            for variant in stock_variants:
+                if variant in self.strategy.price_data:
+                    matched_stock = variant
+                    break
+
+            if matched_stock:
+                df = self.strategy.price_data[matched_stock]
+                metrics = self.strategy.risk_metrics.get(matched_stock, {})
+
+                # 技术条件过滤（与generate_buy_signals保持一致）
+                if (len(df) > 0 and
+                    'trend_signal' in df.columns and
+                    df['trend_signal'].iloc[-1] >= 0 and  # 放宽为中性或向上
+                    metrics.get('volatility', 1) < 0.5):  # 临时放宽波动率阈值
+
+                    current_price = df['close'].iloc[-1]
+                    rs_score = row['rs_score']
+
+                    # 计算目标权重（基于RS评分，等权重分配前max_positions只股票）
+                    # 使用归一化的评分作为权重
+                    candidates.append({
+                        'code': stock,  # 保持原始6位代码用于输出
+                        'matched_code': matched_stock,  # 实际匹配的代码用于数据访问
+                        'rs_score': rs_score,
+                        'current_price': current_price,
+                        'metrics': metrics
+                    })
+
+        if not candidates:
+            print("无符合条件的候选股票")
+            # 创建空文件
+            empty_df = pd.DataFrame(columns=['code', 'target_weight', 'score', 'risk_flags',
+                                           'stop_loss', 'take_profit', 'adv_20d', 'board'])
+            empty_df.to_parquet(filepath, index=False)
+            return filepath
+
+        # 相关性过滤（使用matched_code进行相关性计算）
+        if len(candidates) > 1:
+            filtered_codes = self.strategy._filter_by_correlation([c['matched_code'] for c in candidates])
+            candidates = [c for c in candidates if c['matched_code'] in filtered_codes]
+
+        # 取前max_positions只股票
+        candidates = sorted(candidates, key=lambda x: x['rs_score'], reverse=True)[:max_positions]
+
+        # 计算权重分配
+        total_score = sum(c['rs_score'] for c in candidates)
+        max_single_weight = 0.08  # 单票最大权重8%
+        total_weight_budget = min(0.95, len(candidates) * max_single_weight)  # 总权重预算
+
+        for candidate in candidates:
+            code = candidate['code']  # 6位原始代码
+            matched_code = candidate['matched_code']  # 实际匹配的代码
+            df = self.strategy.price_data[matched_code]
+
+            # 计算目标权重
+            if total_score > 0:
+                raw_weight = (candidate['rs_score'] / total_score) * total_weight_budget
+                target_weight = min(raw_weight, max_single_weight)
+            else:
+                target_weight = total_weight_budget / len(candidates)
+
+            # 风险标记（确保使用Python原生布尔类型）
+            risk_flags = {}
+            if self.strategy.filter_st and self.strategy._is_st_stock(code):
+                risk_flags['is_st'] = bool(True)
+            else:
+                risk_flags['is_st'] = bool(False)
+
+            risk_flags['volatility_high'] = bool(candidate['metrics'].get('volatility', 0) > self.strategy.volatility_threshold * 0.8)
+            risk_flags['drawdown_high'] = bool(candidate['metrics'].get('max_drawdown_60d', 0) > self.strategy.max_drawdown_threshold * 0.8)
+
+            # 计算止损位
+            atr = df.get('ATR', pd.Series([0])).iloc[-1] if 'ATR' in df.columns else 0
+            current_price = candidate['current_price']
+            stop_loss = current_price - (atr * self.strategy.atr_multiplier) if atr > 0 else current_price * 0.9
+
+            # 计算止盈位（简单的2:1风报比）
+            take_profit = current_price + (current_price - stop_loss) * 2
+
+            # 计算20日平均成交量（ADV）
+            volume_20d = df['volume'].iloc[-20:].mean() if len(df) >= 20 and 'volume' in df.columns else 0
+            adv_20d = volume_20d * df['close'].iloc[-20:].mean() if len(df) >= 20 else 0
+
+            # 判断板块（使用6位原始代码）
+            board = self._get_stock_board(code)
+
+            signals.append({
+                'code': code,
+                'target_weight': round(target_weight, 4),
+                'score': round(candidate['rs_score'], 4),
+                'risk_flags': risk_flags,
+                'stop_loss': round(stop_loss, 2),
+                'take_profit': round(take_profit, 2),
+                'adv_20d': round(adv_20d, 0),
+                'board': board
+            })
+
+        # 权重归一化（确保总和<=1）
+        total_weight = sum(s['target_weight'] for s in signals)
+        if total_weight > 0.95:
+            adjustment_factor = 0.95 / total_weight
+            for signal in signals:
+                signal['target_weight'] = round(signal['target_weight'] * adjustment_factor, 4)
+
+        # 转换为DataFrame并保存
+        signals_df = pd.DataFrame(signals)
+
+        if not signals_df.empty:
+            # 转换risk_flags为JSON字符串
+            signals_df['risk_flags'] = signals_df['risk_flags'].apply(json.dumps)
+            signals_df.to_parquet(filepath, index=False)
+
+            print(f"✅ 投资信号已导出: {filepath}")
+            print(f"📊 信号统计: {len(signals)} 只股票, 总权重 {signals_df['target_weight'].sum():.2%}")
+
+            # 显示前5只股票
+            if len(signals_df) > 0:
+                print("🔝 前5只股票:")
+                for i, row in signals_df.head(5).iterrows():
+                    name = self.strategy.get_stock_name(row['code'])
+                    print(f"  {row['code']} {name}: 权重{row['target_weight']:.2%}, 评分{row['score']:.1f}")
+        else:
+            print("⚠️  无符合条件的投资信号")
+
+        return filepath
+
+    def _get_stock_board(self, code: str) -> str:
+        """判断股票板块"""
+        if code.startswith('68'):
+            return 'STAR'  # 科创板
+        elif code.startswith('30'):
+            return 'ChiNext'  # 创业板
+        elif code.startswith('8') or code.startswith('4'):
+            return 'NEEQ'  # 北交所
+        else:
+            return 'Main'  # 主板
 
     def generate_complete_daily_plan(self, capital=1000000, current_holdings=None, max_positions=5):
         """生成完整的每日交易计划"""
