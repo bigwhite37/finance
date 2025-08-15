@@ -34,17 +34,14 @@ def _parse_fields_arg(fields_arg: str | None) -> list[str]:
 # Helper: fetch a single field safely, return DataFrame or None if fails
 def _safe_features_single(instruments, field: str, start_time, end_time, freq):
     """Try fetching a single field; return DataFrame or None if fails."""
-    try:
-        return D.features(
-            instruments=instruments,
-            fields=[field],
-            start_time=start_time,
-            end_time=end_time,
-            freq=freq,
-            disk_cache=0,
-        )
-    except Exception:
-        return None
+    return D.features(
+        instruments=instruments,
+        fields=[field],
+        start_time=start_time,
+        end_time=end_time,
+        freq=freq,
+        disk_cache=0,
+    )
 
 # Helper: compute vwap if possible from turnover/volume
 def _compute_vwap_if_possible(df: pd.DataFrame) -> pd.DataFrame:
@@ -65,6 +62,47 @@ def _normalize_instrument(code: str) -> str:
         elif c[0] in ('0', '3'):
             return 'SZ' + c
     return c
+
+def get_last_trading_date(stock_code: str, qlib_dir: str = "~/.qlib/qlib_data/cn_data", freq: str = 'day') -> str | None:
+    """Return the last available trading date (YYYY-MM-DD) for a single stock from local Qlib data.
+    不读取 day.txt；通过 Qlib 的 features API 取最小字段并求索引最大日期。
+    """
+    qlib_dir_expanded = os.path.expanduser(qlib_dir)
+    if not os.path.exists(qlib_dir_expanded):
+        print(f"错误：Qlib数据目录不存在于 '{qlib_dir_expanded}'")
+        return None
+
+    _init_qlib_once(qlib_dir_expanded)
+
+    inst = _normalize_instrument(stock_code)
+    # 只取一个最小字段以降低 I/O
+    df = D.features(
+        instruments=[inst],
+        fields=['$close'],
+        start_time='1900-01-01',
+        end_time=pd.Timestamp.today().strftime('%Y-%m-%d'),
+        freq=freq,
+        disk_cache=0,
+    )
+    if df is None or df.empty:
+        print(f"未找到 {inst} 的任何 {freq} 级别数据。可能代码无效或数据未准备。")
+        return None
+
+    # MultiIndex: level 0 = instrument, level 1 = datetime
+    try:
+        last_ts = df.index.get_level_values('datetime').max()
+    except (KeyError, AttributeError):
+        # 兜底：第二级作为日期，或直接转成时间戳
+        idx = df.index
+        last_ts = idx.levels[1].max() if hasattr(idx, 'levels') and len(idx.levels) > 1 else pd.to_datetime(df.index.max())
+
+    if pd.isna(last_ts):
+        print(f"{inst} 的索引无有效日期。")
+        return None
+
+    last_date_str = pd.to_datetime(last_ts).strftime('%Y-%m-%d')
+    print(f"{inst} 最后可用交易日: {last_date_str}")
+    return last_date_str
 
 # 仅初始化一次 Qlib
 _QINIT_DONE = False
@@ -103,29 +141,20 @@ def print_stock_details_for_day(stock_code: str, date: str, qlib_dir: str = "~/.
         return
 
     # --- 步骤 1: 初始化 Qlib ---
-    try:
-        qlib.init(provider_uri=qlib_dir_expanded, region="cn")
-        print(f"Qlib 初始化成功，数据路径: {qlib_dir_expanded}")
-    except Exception as e:
-        print(f"Qlib 初始化失败: {e}")
-        return
+    qlib.init(provider_uri=qlib_dir_expanded, region="cn")
+    print(f"Qlib 初始化成功，数据路径: {qlib_dir_expanded}")
 
     # 使用 Qlib 表达式字段（均为前复权/按因子调整后的字段）
     fields = ['$open', '$high', '$low', '$close', '$volume', '$amount', '$factor']
 
     # --- 步骤 3: 直接一次性获取所需字段（全部为表达式字段） ---
-    try:
-        data = D.features(
-            instruments=[stock_code],
-            start_time=date,
-            end_time=date,
-            fields=fields,
-            disk_cache=0,
-        )
-    except Exception as e:
-        print(f"\n从Qlib获取数据时出错: {e}")
-        print("请检查股票代码和日期是否正确。")
-        return
+    data = D.features(
+        instruments=[stock_code],
+        start_time=date,
+        end_time=date,
+        fields=fields,
+        disk_cache=0,
+    )
 
     # 规范列名：去掉 `$` 前缀，并把 amount 重命名为 turnover，随后计算未复权价格（raw = adjusted / factor）
     data = data.copy()
@@ -192,11 +221,7 @@ def print_stocks_details_for_range(
         print(f"错误：Qlib数据目录不存在于 '{qlib_dir_expanded}'")
         return
 
-    try:
-        _init_qlib_once(qlib_dir_expanded)
-    except Exception as e:
-        print(f"Qlib 初始化失败: {e}")
-        return
+    _init_qlib_once(qlib_dir_expanded)
 
     # 规范化代码
     instruments = [_normalize_instrument(s) for s in stocks]
@@ -234,19 +259,14 @@ def print_stocks_details_for_range(
         return
 
     # 一次性拉取所有已验证支持的字段
-    try:
-        df = D.features(
-            instruments=instruments,
-            fields=supported_fields,
-            start_time=start_date,
-            end_time=end_date,
-            freq=freq,
-            disk_cache=0,
-        )
-    except Exception as e:
-        print(f"\n从Qlib获取数据时出错: {e}")
-        print("请检查股票代码与时间范围是否正确（交易日、代码前缀 SH/SZ）。")
-        return
+    df = D.features(
+        instruments=instruments,
+        fields=supported_fields,
+        start_time=start_date,
+        end_time=end_date,
+        freq=freq,
+        disk_cache=0,
+    )
 
     if df.empty:
         print("未获取到任何数据；请确认时间区间内有交易日，且代码在本地数据集中可用。")
@@ -322,15 +342,24 @@ def print_stocks_details_for_range(
 
 def main():
     parser = argparse.ArgumentParser(description="CLI for qlib_tool: fetch details for multiple stocks over a date range")
-    parser.add_argument("--codes", "-c", nargs="+", help="股票代码列表 (支持带/不带前缀)", required=True)
-    parser.add_argument("--start", "-s", help="开始日期 (格式 YYYY-MM-DD)", required=True)
-    parser.add_argument("--end", "-e", help="结束日期 (格式 YYYY-MM-DD)", required=True)
+    parser.add_argument("--codes", "-c", nargs="+", help="股票代码列表 (支持带/不带前缀)", required=False)
+    parser.add_argument("--start", "-s", help="开始日期 (格式 YYYY-MM-DD)", required=False)
+    parser.add_argument("--end", "-e", help="结束日期 (格式 YYYY-MM-DD)", required=False)
     parser.add_argument("--save", help="可选，保存结果到 CSV 文件")
     parser.add_argument("--freq", default="day", choices=["day", "1min", "5min", "15min", "30min", "60min"], help="数据频率，默认 day")
     parser.add_argument("--fields", help="自定义字段列表，逗号分隔；建议不要写$以避免shell变量展开，如: open,close,volume,amount,factor,vwap；不传或写 ALL 则尽可能多地打印可用字段")
     parser.add_argument("--meta", action="store_true", help="打印每只股票的元信息/数据健康统计")
+    parser.add_argument(
+        "--last-date-code",
+        help="查询单只股票在本地Qlib数据中的最后交易日（不读取day.txt），例如 600519 或 SH600519；指定后仅执行该查询并退出。"
+    )
 
     args = parser.parse_args()
+
+    # Quick path: query last trading date for a single code and exit
+    if args.last_date_code:
+        get_last_trading_date(args.last_date_code, qlib_dir="~/.qlib/qlib_data/cn_data", freq="day")
+        return
 
     codes = args.codes
     start_date = args.start
