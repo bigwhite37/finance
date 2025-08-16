@@ -209,3 +209,8 @@ __marimo__/
 *.csv
 *.html
 st_stocks_akshare.json
+
+data/
+logs/
+models/
+delete/
