@@ -388,7 +388,7 @@ python claude.py --help
 # 最简单的交易模式启动
 python claude.py --mode trading
 
-# 最简单的分析模式启动  
+# 最简单的分析模式启动
 python claude.py --mode analysis
 ```
 
@@ -432,7 +432,7 @@ python claude.py --mode analysis --no-dashboard --no-backtest
 risk_per_trade = 0.01          # 降低单笔风险至1%
 atr_multiplier = 1.5           # 更紧的止损
 
-# 激进配置  
+# 激进配置
 risk_per_trade = 0.03          # 提高单笔风险至3%
 atr_multiplier = 2.5           # 更宽的止损
 ```
@@ -477,7 +477,7 @@ python claude.py --mode trading \
 ```bash
 # 生成的CSV文件可直接导入主流券商：
 # - 招商证券智远APP
-# - 华泰证券涨乐财富通  
+# - 华泰证券涨乐财富通
 # - 平安证券
 # - 中信建投
 
