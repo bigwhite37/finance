@@ -4,6 +4,11 @@ import qlib
 from qlib.data import D
 import pandas as pd
 import os
+try:
+    import akshare as ak
+    AKSHARE_AVAILABLE = True
+except ImportError:
+    AKSHARE_AVAILABLE = False
 
 
 # 默认字段（兼容 cn_data）：
@@ -52,6 +57,58 @@ def _compute_vwap_if_possible(df: pd.DataFrame) -> pd.DataFrame:
         with pd.option_context('mode.use_inf_as_na', True):
             df['vwap'] = (a / v).where(v > 0)
     return df
+
+def _fetch_akshare_data(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
+    """
+    使用 akshare 获取股票数据
+
+    参数:
+        stock_code: 股票代码，如 'SH600824' 或 '600824'
+        start_date: 开始日期 'YYYY-MM-DD'
+        end_date: 结束日期 'YYYY-MM-DD'
+
+    返回:
+        DataFrame 包含 open, high, low, close, volume 等字段，索引为日期
+        如果失败返回 None
+    """
+    # 转换股票代码格式：SH600824 -> 600824.SH
+    ak_code = stock_code[2:]
+    print(f"正在获取股票数据: {stock_code}, ak_code: {ak_code}")
+    df = ak.stock_zh_a_hist(symbol=ak_code, period="daily", start_date=start_date.replace('-', ''),
+                            end_date=end_date.replace('-', ''), adjust="")
+
+    # 重命名列以匹配 qlib 格式
+    column_mapping = {
+        '开盘': 'open',
+        '最高': 'high',
+        '最低': 'low',
+        '收盘': 'close',
+        '成交量': 'volume',
+        '成交额': 'turnover'
+    }
+
+    # 只保留需要的列
+    available_cols = [col for col in column_mapping.keys() if col in df.columns]
+    df = df[['日期'] + available_cols].copy()
+
+    # 重命名列
+    rename_dict = {'日期': 'date'}
+    rename_dict.update({k: v for k, v in column_mapping.items() if k in df.columns})
+    df = df.rename(columns=rename_dict)
+
+    # 设置日期索引
+    df['date'] = pd.to_datetime(df['date'])
+    df.set_index('date', inplace=True)
+    df.index.name = 'datetime'
+
+    # 确保数值类型
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'turnover']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    return df
+
 
 # 工具函数：规范股票代码为 Qlib 标准格式，如 600000->SH600000, 000001->SZ000001
 def _normalize_instrument(code: str) -> str:
@@ -103,6 +160,7 @@ def get_last_trading_date(stock_code: str, qlib_dir: str = "~/.qlib/qlib_data/cn
     last_date_str = pd.to_datetime(last_ts).strftime('%Y-%m-%d')
     print(f"{inst} 最后可用交易日: {last_date_str}")
     return last_date_str
+
 
 # 仅初始化一次 Qlib
 _QINIT_DONE = False
@@ -201,7 +259,8 @@ def print_stocks_details_for_range(
     save_csv: str | None = None,
     freq: str = 'day',
     fields_arg: str | None = None,
-    meta: bool = False
+    meta: bool = False,
+    compare_akshare: bool = False
 ):
     """
     使用 Qlib API 读取并打印【多只股票】在【指定时间段】的详细行情数据。
@@ -213,6 +272,7 @@ def print_stocks_details_for_range(
         freq: 数据频率，默认 'day'
         fields_arg: 字段参数（命令行 --fields），None 或 'ALL' 为默认字段
         meta: 是否打印元信息/数据健康
+        compare_akshare: 是否与 akshare 数据对比
     输出：
         在控制台按股票分组打印全量日期行；如需保存，写入 CSV 文件。
     """
@@ -272,20 +332,28 @@ def print_stocks_details_for_range(
         print("未获取到任何数据；请确认时间区间内有交易日，且代码在本地数据集中可用。")
         return
 
-    # 规范列名，并计算未复权价格（raw = adjusted / factor）
+    # 规范列名
     df = df.copy()
     df.columns = [c.replace('$', '') for c in df.columns]
     if 'amount' in df.columns:
         df = df.rename(columns={'amount': 'turnover'})
 
-    # Compute raw OHLC if possible
+    # 保存复权后的价格（原始 df 中的值）和 factor
     if all(col in df.columns for col in ['open', 'high', 'low', 'close', 'factor']):
+        # 先保存复权后的价格
+        df['adj_open'] = df['open'].copy()
+        df['adj_high'] = df['high'].copy()
+        df['adj_low'] = df['low'].copy()
+        df['adj_close'] = df['close'].copy()
+
+        # 计算未复权价格
         df['open']  = df['open']  / df['factor']
         df['high']  = df['high']  / df['factor']
         df['low']   = df['low']   / df['factor']
         df['close'] = df['close'] / df['factor']
-        # 只保留原始（未复权）价格列用于展示
-        df = df[['open', 'high', 'low', 'close']]
+
+        # 保留所有需要展示的列
+        df = df[['open', 'high', 'low', 'close', 'adj_open', 'adj_high', 'adj_low', 'adj_close', 'factor']]
     else:
         print("警告：缺少计算未复权价格所需的列（open/high/low/close/factor），将按现有列原样打印。")
 
@@ -314,14 +382,77 @@ def print_stocks_details_for_range(
     instruments_found = sorted(list({idx[0] for idx in df.index}))
     for code in instruments_found:
         sub = df.xs(code, level=0)
-        # 显示副本，避免 dtype 警告
+
+        # 如果启用 akshare 对比
+        akshare_df = None
+        if compare_akshare:
+            print(f"\n\033[1m=== 正在获取 {code} 的 akshare 数据进行对比 ===\033[0m")
+            akshare_df = _fetch_akshare_data(code, start_date, end_date)
+            if akshare_df is not None:
+                # 对齐日期索引
+                common_dates = sub.index.intersection(akshare_df.index)
+                if len(common_dates) > 0:
+                    sub_aligned = sub.loc[common_dates]
+                    ak_aligned = akshare_df.loc[common_dates]
+
+                    # 创建对比数据框
+                    comparison_data = pd.DataFrame(index=common_dates)
+
+                    # 添加 qlib 数据（未复权价格）
+                    price_fields = ['open', 'high', 'low', 'close']
+                    for field in price_fields:
+                        if field in sub_aligned.columns:
+                            comparison_data[f'qlib_{field}'] = sub_aligned[field]
+                        if field in ak_aligned.columns:
+                            comparison_data[f'ak_{field}'] = ak_aligned[field]
+                            # 计算差值
+                            if field in sub_aligned.columns:
+                                comparison_data[f'diff_{field}'] = sub_aligned[field] - ak_aligned[field]
+
+                    # 添加成交量对比
+                    if 'volume' in sub_aligned.columns and 'volume' in ak_aligned.columns:
+                        comparison_data['qlib_volume'] = sub_aligned['volume']
+                        comparison_data['ak_volume'] = ak_aligned['volume']
+                        comparison_data['diff_volume'] = sub_aligned['volume'] - ak_aligned['volume']
+
+                    # 显示对比结果
+                    disp_comp = comparison_data.copy().astype('object')
+                    for col in disp_comp.columns:
+                        if col.startswith(('qlib_', 'ak_')) and any(field in col for field in price_fields):
+                            disp_comp[col] = disp_comp[col].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+                        elif col.startswith('diff_') and any(field in col for field in price_fields):
+                            disp_comp[col] = disp_comp[col].map(lambda x: f"{float(x):+.4f}" if pd.notna(x) else "")
+                        elif 'volume' in col:
+                            if col.startswith('diff_'):
+                                disp_comp[col] = disp_comp[col].map(lambda x: f"{float(x):+,.0f}" if pd.notna(x) else "")
+                            else:
+                                disp_comp[col] = disp_comp[col].map(lambda x: f"{float(x):,.0f}" if pd.notna(x) else "")
+
+                    print(f"\n\033[1m=== {code} Qlib vs Akshare 数据对比 [{start_date} ~ {end_date}] ===\033[0m")
+                    print(disp_comp.to_string())
+                    print("\n\033[1m--- 对比说明 ---\033[0m")
+                    print("qlib_*: Qlib 未复权价格")
+                    print("ak_*: Akshare 未复权价格")
+                    print("diff_*: 差值 (Qlib - Akshare，正值表示 Qlib 更高)")
+                else:
+                    print(f"警告：{code} 的 Qlib 和 Akshare 数据没有重叠的交易日")
+            else:
+                print(f"获取 {code} 的 akshare 数据失败")
+
+        # 显示原始 qlib 数据
         disp = sub.copy().astype('object')
         if 'open' in disp:   disp['open']   = disp['open'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
         if 'high' in disp:   disp['high']   = disp['high'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
         if 'low' in disp:    disp['low']    = disp['low'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
         if 'close' in disp:  disp['close']  = disp['close'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+        if 'adj_open' in disp:   disp['adj_open']   = disp['adj_open'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+        if 'adj_high' in disp:   disp['adj_high']   = disp['adj_high'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+        if 'adj_low' in disp:    disp['adj_low']    = disp['adj_low'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+        if 'adj_close' in disp:  disp['adj_close']  = disp['adj_close'].map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "")
+        if 'factor' in disp:     disp['factor']     = disp['factor'].map(lambda x: f"{float(x):.6f}" if pd.notna(x) else "")
         if 'volume' in disp: disp['volume'] = disp['volume'].map(lambda x: f"{float(x):,.0f}" if pd.notna(x) else "")
         if 'turnover' in disp: disp['turnover'] = disp['turnover'].map(lambda x: f"{float(x):,.2f}" if pd.notna(x) else "")
+
         print(f"\n\033[1m=== {code} @ [{start_date} ~ {end_date}] 共 {len(disp)} 个交易日 ===\033[0m")
         if meta:
             # 与交易日历对齐，统计缺失
@@ -338,6 +469,8 @@ def print_stocks_details_for_range(
 
     print("\n\033[1m--- 字段含义说明 ---\033[0m")
     print("open, high, low, close:  \033[35m未复权\033[0m价格（依据 Qlib 规范：raw = adjusted / factor，即 open = $open / $factor 等）。")
+    print("adj_open, adj_high, adj_low, adj_close:  \033[36m复权后\033[0m价格（前复权价格，已调整除权除息）。")
+    print("factor:  复权因子，未复权价格 = 复权后价格 / factor。")
 
 
 def main():
@@ -349,6 +482,7 @@ def main():
     parser.add_argument("--freq", default="day", choices=["day", "1min", "5min", "15min", "30min", "60min"], help="数据频率，默认 day")
     parser.add_argument("--fields", help="自定义字段列表，逗号分隔；建议不要写$以避免shell变量展开，如: open,close,volume,amount,factor,vwap；不传或写 ALL 则尽可能多地打印可用字段")
     parser.add_argument("--meta", action="store_true", help="打印每只股票的元信息/数据健康统计")
+    parser.add_argument("--compare-akshare", action="store_true", help="与 akshare 数据进行对比，显示差值")
     parser.add_argument(
         "--last-date-code",
         help="查询单只股票在本地Qlib数据中的最后交易日（不读取day.txt），例如 600519 或 SH600519；指定后仅执行该查询并退出。"
@@ -375,6 +509,7 @@ def main():
         freq=args.freq,
         fields_arg=args.fields,
         meta=args.meta,
+        compare_akshare=args.compare_akshare,
     )
 
 # --- 主程序入口 ---

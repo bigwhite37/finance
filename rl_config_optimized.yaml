@@ -1,0 +1,224 @@
+claude:
+  capital: 1000000  # 初始资金，单位元
+  current_holdings: null  # 当前持仓，null表示空仓开始
+  enable_multifactor: true  # 启用多因子模式，使用calculate_multifactor_alpha而非简化相对强度
+  enable_periodic_reconstitution: true  # 启用定期重构
+  index_code: '000300'  # 基准指数代码（沪深300）
+  mode: backtest  # 运行模式：analysis/backtest/live
+  pool_mode: auto  # 股票池模式：auto/manual/index
+  qlib_dir: ~/.qlib/qlib_data/cn_data  # Qlib数据目录
+  rebalance_freq_days: 7  # 调仓频率（天）- 周频轮动
+  reconstitution_freq_days: 7  # 重构频率（天）- 周频轮动
+  run_backtest: true  # 是否运行回测
+  show_dashboard: true  # 是否显示仪表板
+  stocks: null  # 指定股票列表，null表示从指数或其他方式获取
+  trade_date: null  # 指定交易日期，null表示使用当前日期
+command_defaults:  # 命令默认参数
+  infer:  # 推理命令
+    date: auto  # 自动检测日期
+    model_path: auto  # 自动模型路径
+    panel_path: auto  # 自动面板数据路径
+  plan:  # 计划命令
+    date: auto  # 自动检测日期
+    portfolio_path: auto  # 自动组合路径
+    weights_path: auto  # 自动权重路径
+  select:  # 选股命令
+    date: auto  # 自动检测日期
+  train:  # 训练命令
+    algo: PPO  # 算法类型（Proximal Policy Optimization）
+    baseline_path: auto  # 自动基线路径
+    panel_path: auto  # 自动面板数据路径
+cpu_config:  # CPU配置
+  auto_detect_cores: true  # 自动检测CPU核心数
+  data_fetch_max_workers: 8  # 数据获取最大工作线程数
+  eval_max_workers: 4  # 评估最大工作线程数
+  hpo_max_workers: 4  # 超参数优化最大工作线程数
+  max_cpu_cores: 5  # 最大使用CPU核心数
+backtest:  # 回测时间配置
+  start_date: '2025-07-11'  # 回测开始日期（策略实际运行的开始时间）
+  end_date: '2025-08-17'  # 回测结束日期（策略实际运行的结束时间，延长至确保20个交易日）
+
+selection:  # 选股策略配置
+  # selection_date: '2025-08-17'  # 选股日期（使用该日期前的数据进行选股）
+  # 如果设置了selection_date，将在该日期进行一次性选股，然后固定使用这些股票进行回测
+  # 如果不设置，则按照rebalance_freq_days定期重新选股
+
+data_loading:  # 数据加载配置
+  preload_days: 410  # 数据预加载天数（用于因子计算，会自动在回测开始日期前加载这么多天的数据）
+  # 实际数据加载开始日期 = backtest.start_date - preload_days
+  # 例如：回测从2025-06-17开始，则数据从2024-05-03开始加载（提前410天）
+
+factor_calculation:  # 因子计算配置
+  momentum_lookback: 252  # 动量因子回看天数
+  volatility_lookback: 60  # 波动率因子回看天数
+  min_history_days: 120  # 股票最小历史数据要求（天）
+
+data_fetching:  # 数据获取配置
+  rate_limit_delay: 0.15  # 速率限制延迟（秒）
+  retry_count: 5  # 重试次数
+  retry_delay: 1.5  # 重试延迟（秒）
+defaults:  # 默认配置
+  debug_frequency: 100  # 调试输出频率
+  effective_lookback_limit: 5  # 有效回看限制（天）
+  equal_weight_fallback: true  # 等权重回退策略
+  max_loop_protection: 2000  # 最大循环保护次数
+  min_episode_length: 30  # 最小回合长度（天）
+  mock_daily_return: 0.0005  # 模拟日收益率
+  mock_daily_volatility: 0.025  # 模拟日波动率
+  mock_data_assets: 15  # 模拟数据资产数量
+  neutral_score: 50.0  # 中性评分
+environment:  # 环境配置
+  beta: 0.4  # 风险偏好系数
+  enable_reward_normalization: true  # 启用奖励标准化
+  lookback_days: 10  # 回看天数
+  observation_normalization: true  # 观测值标准化
+  reward_noise_factor: 0.01  # 奖励噪声因子
+  reward_scaling: 1  # 奖励缩放系数
+  temperature: 1.2  # 温度参数（探索vs利用）
+  temperature_annealing: true  # 温度退火
+  temperature_final: 1.0  # 最终温度
+logging:  # 日志配置
+  enable_anomaly_warnings: true  # 启用异常警告
+  health_thresholds:  # 健康状态阈值
+    approx_kl:  # 近似KL散度阈值
+      critical_threshold: 0.08  # 危险阈值
+      optimal_max: 0.03  # 最优最大值
+      optimal_min: 0.01  # 最优最小值
+      warning_threshold: 0.05  # 警告阈值
+    clip_fraction:  # 裁剪分数阈值
+      critical_threshold: 0.5  # 危险阈值
+      optimal_max: 0.3  # 最优最大值
+      optimal_min: 0.05  # 最优最小值
+      warning_threshold: 0.35  # 警告阈值
+    explained_variance:  # 解释方差阈值
+      minimum_acceptable: 0.3  # 最小可接受值
+      target_value: 0.6  # 目标值
+  level: INFO  # 日志级别
+  monitor_training: true  # 监控训练过程
+  save_training_logs: true  # 保存训练日志
+  tensorboard_log: true  # 启用TensorBoard日志
+paths:  # 路径配置
+  base_dir: .  # 基础目录
+  baseline_path: data/signals/baseline_{date}.parquet  # 基线信号路径
+  model_path: rl_logs/{study}/{trial_id}/{window_id}/best.zip  # 模型保存路径
+  panel_path: data/panel/panel_{start}_{end}.parquet  # 面板数据路径
+  portfolio_path: data/portfolio/portfolio_{date}.csv  # 组合数据路径
+  weights_path: data/signals/rl_weights_{date}.parquet  # 权重数据路径
+performance:  # 性能目标
+  benchmark: 000300.SH  # 基准指数（沙深300）
+  max_drawdown: -0.2  # 最大回撤限制
+  max_turnover: 0.4  # 最大换手率限制
+  target_sharpe: 1.2  # 目标夏普比率
+risk_management:  # 风险管理配置
+  correlation_high_threshold: 0.6  # 高相关性阈值
+  correlation_lookback: 60  # 相关性回看天数
+  correlation_medium_threshold: 0.4  # 中相关性阈值
+  drawdown_penalty: 0.0  # 回撤惩罚系数
+  enable_correlation_gate: true  # 启用相关性门控
+  enable_dynamic_position: true  # 启用动态仓位管理
+  enable_stop_loss: true  # 启用止损
+  enable_take_profit: true  # 启用止盈
+  max_position_increase: 0.05  # 最大仓位增加比例
+  max_position_pct: 0.8  # 单个股票最大仓位比例
+  max_sector_pct: 0.35  # 单个行业最大仓位比例
+  max_total_weight: 0.95  # 最大总仓位比例
+  min_position_decrease: 0.03  # 最小仓位减少比例
+  position_adjust_threshold: 0.03  # 仓位调整阈值
+  stop_loss_pct: -0.10  # 止损比例
+  take_profit_pct: 0.8  # 止盈比例
+  turnover_penalty: 0.0  # 换手率惩罚系数
+  volatility_penalty: 0.0  # 波动率惩罚系数
+  weight_method: risk_budgeted  # 权重计算方法（风险预算）
+
+stock_selection:
+  # —— 两阶段选股：先门槛过滤，再全量打分排序，最后仅保留Top-K ——
+  mode: gate_then_rank           # ← 新增：明确采用“先过滤后排序”的流程
+  max_stocks: 6000               #     扫描/评估上限（覆盖A股可设6000）
+  rank_top_k: 6000               # ← 新增：排序后保留Top-K（与max_stocks解耦）
+  shuffle_seed: 20250817         # ← 新增：进入主循环前固定随机洗牌，降低顺序偏置
+  min_adv_rmb: 5000000           # 调低：近20日平均成交额≥500万，先排查数据口径再收紧
+  min_price: 2.0                 # 调低：先避免误杀（小票或复权口径差异）。
+  filter_st: true                # （保留）
+  max_positions: 30               # （保留）
+  auto_relax: true               # 若筛完为0，自动逐步放宽门槛（仅当空集合时启用）
+  relax_steps:                   # 顺序尝试（只在集合为0时生效）
+    - { min_adv_rmb: 3000000, min_price: 1.5 }
+    - { min_adv_rmb: 1000000, min_price: 1.0 }
+    - { min_adv_rmb: 0,        min_price: 0.0 }
+  fallback_pick_top_k_by_adv: 100  # 若仍为0，则按ADV从大到小选Top-100作为候选
+
+training:  # 训练配置
+  checkpoint_freq: 20000  # 检查点保存频率
+  default_steps: 150000  # 默认训练步数
+  enable_hyperopt: true  # 启用超参数优化
+  eval_freq: 2000  # 评估频率
+  hyperopt_config:  # 超参数优化配置
+    direction: maximize  # 优化方向（最大化）
+    n_startup_trials: 15  # 启动试验次数
+    n_warmup_steps: 5000  # 预热步数
+    param_ranges:  # 参数范围
+      clip_range:  # 裁剪范围
+        high: 0.25  # 最大值
+        low: 0.15  # 最小值
+      ent_coef:  # 熵系数
+        high: 0.002  # 最大值
+        low: 0.0001  # 最小值
+      gae_lambda:  # GAE Lambda参数
+        high: 0.98  # 最大值
+        low: 0.8  # 最小值
+      gamma:  # 折扣因子
+        high: 0.97  # 最大值
+        low: 0.94  # 最小值
+      learning_rate:  # 学习率
+        high: 0.0003  # 最大值
+        low: 3.0e-05  # 最小值
+      vf_coef:  # 价值函数系数
+        high: 1.0  # 最大值
+        low: 0.4  # 最小值
+    pruner: MedianPruner  # 剪枝器类型
+    sampler: TPE  # 采样器类型
+    study_name: rl_trading_optimized_{timestamp}  # 研究名称
+  lambda: 0.25  # Lambda参数
+  learning_rate: 0.0001  # 学习率
+  mu: 0.06  # Mu参数
+  optuna_timeout: 36000  # Optuna超时时间（秒）
+  optuna_trials: 120  # Optuna试验次数
+  patience: 25  # 早停耐心值
+  seed: 20250817  # 随机种子
+  training_steps: 150000  # 训练步数
+  volatility_penalty: 0.008  # 波动率惩罚
+  walk_forward: rolling_windows  # 滚动窗口模式
+transaction_cost:  # 交易成本配置
+  liquidity:  # 流动性成本
+    adv_multiplier: 1.0  # 平均日成交量乘数
+    bid_ask_spread_max: 0.002  # 最大买卖价差
+    bid_ask_spread_min: 0.0002  # 最小买卖价差
+  market_impact:  # 市场冲击成本
+    buy_multiplier: 1.1  # 买入冲击乘数
+    enable: true  # 启用市场冲击
+    linear_rate: 0.0001  # 线性冲击率
+    permanent_ratio: 0.4  # 永久冲击比例
+    sell_multiplier: 0.9  # 卖出冲击乘数
+    sqrt_rate: 0.0005  # 平方根冲击率
+    temporary_ratio: 0.6  # 临时冲击比例
+  slippage:  # 滑点成本
+    base_rate: 0.0005  # 基础滑点率
+    enable_dynamic: true  # 启用动态滑点
+    max_rate: 0.01  # 最大滑点率
+    small_cap_multiplier: 1.3  # 小盘股乘数
+    small_cap_threshold: 50e8  # 小盘股阈值（元）
+    volatility_multiplier: 1.5  # 波动率乘数
+    volatility_threshold: 0.03  # 波动率阈值
+    volume_threshold: 0.1  # 成交量阈值
+validation:  # 验证配置
+  min_test_days: 120  # 最小测试天数
+  min_train_days: 500  # 最小训练天数
+  min_valid_days: 120  # 最小验证天数
+  test_ratio: 0.1  # 测试集比例
+  train_ratio: 0.7  # 训练集比例
+  ts_cv_config:  # 时间序列交叉验证配置
+    n_windows: 4  # 窗口数量
+    step_months: 3  # 步长（月）
+    train_window_months: 18  # 训练窗口长度（月）
+    valid_window_months: 6  # 验证窗口长度（月）
+  valid_ratio: 0.2  # 验证集比例
