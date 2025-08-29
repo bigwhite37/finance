@@ -15,6 +15,8 @@ from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import warnings
+import colorama
+from colorama import Fore, Style
 warnings.filterwarnings('ignore')
 
 # Import akshare for stock data fetching
@@ -23,11 +25,39 @@ try:
 except ImportError:
     ak = None
 
-# 配置日志
+# Initialize colorama for cross-platform colored output
+colorama.init(autoreset=True)
+
+# Custom colored formatter
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for different log levels"""
+    
+    COLORS = {
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.CRITICAL: Fore.MAGENTA + Style.BRIGHT
+    }
+    
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelno, '')
+        record.levelname = f"{log_color}{record.levelname}{Style.RESET_ALL}"
+        return super().format(record)
+
+# Configure logging with colors
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
+
+# Apply colored formatter to all handlers
+for handler in logging.root.handlers:
+    handler.setFormatter(ColoredFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 logger = logging.getLogger(__name__)
 
 
@@ -912,17 +942,25 @@ class Planner:
         
         # 成交量过滤
         if 'volume' in merged.columns:
-            merged = merged[merged['volume'] >= min_volume]
+            # 对于缺少市场数据的股票（volume为NaN），保留它们
+            volume_valid = merged['volume'] >= min_volume
+            volume_missing = merged['volume'].isna()
+            merged = merged[volume_valid | volume_missing]
             
         # 成交额过滤 (close * volume)
         if 'volume' in merged.columns and 'close' in merged.columns:
             merged['turnover'] = merged['close'] * merged['volume']
-            merged = merged[merged['turnover'] >= min_turnover]
+            # 对于缺少市场数据的股票（turnover为NaN），保留它们
+            turnover_valid = merged['turnover'] >= min_turnover
+            turnover_missing = merged['turnover'].isna()
+            merged = merged[turnover_valid | turnover_missing]
             
         # 价格有效性过滤（排除价格为0或异常的股票）
         if 'close' in merged.columns:
-            merged = merged[merged['close'] > 0]
-            merged = merged[merged['close'] < 1000]  # 排除价格异常高的股票
+            # 对于缺少市场数据的股票（close为NaN），保留它们，不进行价格过滤
+            price_valid = (merged['close'] > 0) & (merged['close'] < 1000)
+            price_missing = merged['close'].isna()
+            merged = merged[price_valid | price_missing]
             
         filtered_count = len(merged)
         if filtered_count < original_count:
@@ -1043,12 +1081,12 @@ def cmd_plan(args):
     if market.empty:
         logger.error(f"No reliable market data available for {args.date}")
         logger.error("Cannot generate safe trading plan without real market prices")
-        print(f"\n❌ 无法生成交易计划")
-        print(f"原因: 缺少 {args.date} 的真实市场数据")
-        print(f"解决方案:")
-        print(f"  1. 检查 data/market/eod_{args.date}.parquet 是否存在")
-        print(f"  2. 确保qlib数据源可用")
-        print(f"  3. 或使用有市场数据的交易日期")
+        logger.error(f"\n❌ 无法生成交易计划")
+        logger.error(f"原因: 缺少 {args.date} 的真实市场数据")
+        logger.info(f"解决方案:")
+        logger.info(f"  1. 检查 data/market/eod_{args.date}.parquet 是否存在")
+        logger.info(f"  2. 确保qlib数据源可用")
+        logger.info(f"  3. 或使用有市场数据的交易日期")
         return
     
     # 计算涨跌停价格
@@ -1077,12 +1115,12 @@ def cmd_plan(args):
         logger.info(f"Generated {len(trades)} orders, saved to {output_path}")
         
         # 打印摘要
-        print(f"\n=== 交易计划摘要 ({args.date}) ===")
-        print(f"总订单数: {len(trades)}")
-        print(f"买入订单: {len(trades[trades['side'] == 'buy'])}")
-        print(f"卖出订单: {len(trades[trades['side'] == 'sell'])}")
-        print(f"预估费用: {trades['expected_fees'].sum():.2f}")
-        print(f"详细计划已保存至: {report_path}")
+        logger.info(f"\n=== 交易计划摘要 ({args.date}) ===")
+        logger.info(f"总订单数: {len(trades)}")
+        logger.info(f"买入订单: {len(trades[trades['side'] == 'buy'])}")
+        logger.info(f"卖出订单: {len(trades[trades['side'] == 'sell'])}")
+        logger.info(f"预估费用: {trades['expected_fees'].sum():.2f}")
+        logger.info(f"详细计划已保存至: {report_path}")
     else:
         logger.info("No trades generated")
 
@@ -1092,20 +1130,20 @@ def cmd_status(args):
     portfolio = Portfolio.load('data/state/portfolio.json')
     positions = portfolio.get_positions()
     
-    print("\n=== 投资组合状态 ===")
-    print(f"现金余额: {portfolio.cash_free:,.2f}")
-    print(f"预留资金: {portfolio.cash_reserved:,.2f}")
-    print(f"净值: {portfolio.nav:,.2f}")
-    print(f"持仓品种: {len(positions)}")
-    print(f"分笔数量: {len(portfolio.lots)}")
+    logger.info("\n=== 投资组合状态 ===")
+    logger.info(f"现金余额: {portfolio.cash_free:,.2f}")
+    logger.info(f"预留资金: {portfolio.cash_reserved:,.2f}")
+    logger.info(f"净值: {portfolio.nav:,.2f}")
+    logger.info(f"持仓品种: {len(positions)}")
+    logger.info(f"分笔数量: {len(portfolio.lots)}")
     
     if not positions.empty:
-        print(f"\n前10大持仓:")
+        logger.info(f"\n前10大持仓:")
         top10 = positions.nlargest(10, 'shares')
         for _, pos in top10.iterrows():
             market_value = pos['shares'] * pos['avg_cost']  # 使用成本价估算
             weight = market_value / portfolio.nav
-            print(f"{pos['code']}: {pos['shares']:,}股 "
+            logger.info(f"{pos['code']}: {pos['shares']:,}股 "
                  f"@{pos['avg_cost']:.2f} "
                  f"权重{weight:.2%}")
 
@@ -1135,12 +1173,12 @@ def cmd_reconcile(args):
     portfolio.save('data/state/portfolio.json')
     
     # 生成对账报告
-    print(f"\n=== 对账报告 ({trade_date}) ===")
-    print(f"总订单数: {report.total_orders}")
-    print(f"成交订单数: {report.filled_orders}")
-    print(f"成交率: {report.fill_rate:.1%}")
-    print(f"总费用: {report.total_fees:.2f}")
-    print(f"净资金流: {report.net_cash_flow:,.2f}")
+    logger.info(f"\n=== 对账报告 ({trade_date}) ===")
+    logger.info(f"总订单数: {report.total_orders}")
+    logger.info(f"成交订单数: {report.filled_orders}")
+    logger.info(f"成交率: {report.fill_rate:.1%}")
+    logger.info(f"总费用: {report.total_fees:.2f}")
+    logger.info(f"净资金流: {report.net_cash_flow:,.2f}")
     
     logger.info("Reconciliation completed")
 
@@ -1237,14 +1275,14 @@ def cmd_generate_fills(args):
     total_fees = fills_df['actual_fees'].sum()
     avg_slippage = fills_df['slippage'].mean()
     
-    print(f"\n=== 模拟成交摘要 ===")
-    print(f"成交订单数: {len(fills_df)}")
-    print(f"买入订单: {len(fills_df[fills_df['side'] == 'buy'])}")
-    print(f"卖出订单: {len(fills_df[fills_df['side'] == 'sell'])}")
-    print(f"总成交金额: {total_amount:,.2f}")
-    print(f"总费用: {total_fees:.2f}")
-    print(f"平均滑点: {avg_slippage:.4f}")
-    print(f"成交文件已保存至: {output_path}")
+    logger.info(f"\n=== 模拟成交摘要 ===")
+    logger.info(f"成交订单数: {len(fills_df)}")
+    logger.info(f"买入订单: {len(fills_df[fills_df['side'] == 'buy'])}")
+    logger.info(f"卖出订单: {len(fills_df[fills_df['side'] == 'sell'])}")
+    logger.info(f"总成交金额: {total_amount:,.2f}")
+    logger.info(f"总费用: {total_fees:.2f}")
+    logger.info(f"平均滑点: {avg_slippage:.4f}")
+    logger.info(f"成交文件已保存至: {output_path}")
     
     return output_path
 
@@ -1327,13 +1365,13 @@ def cmd_audit(args):
     from_date = pd.to_datetime(args.from_date)
     to_date = pd.to_datetime(args.to)
     
-    print(f"\n=== 审计报告 ({args.from_date} ~ {args.to}) ===")
+    logger.info(f"\n=== 审计报告 ({args.from_date} ~ {args.to}) ===")
     
     # 1. 收集填充数据（实际成交）
     fills_data = _load_fills_data(from_date, to_date)
     
     if fills_data.empty:
-        print("在指定日期范围内未找到任何交易记录")
+        logger.warning("在指定日期范围内未找到任何交易记录")
         return
     
     # 2. 收集计划数据
@@ -1407,16 +1445,16 @@ def _load_plans_data(from_date: pd.Timestamp, to_date: pd.Timestamp) -> pd.DataF
 
 def _generate_audit_analysis(fills_data: pd.DataFrame, plans_data: pd.DataFrame, from_date: str, to_date: str):
     """生成审计分析报告"""
-    print(f"\n📊 **交易概览**")
-    print(f"- 成交订单数: {len(fills_data)}")
-    print(f"- 计划订单数: {len(plans_data)}")
+    logger.info(f"\n📊 **交易概览**")
+    logger.info(f"- 成交订单数: {len(fills_data)}")
+    logger.info(f"- 计划订单数: {len(plans_data)}")
     
     # 交易方向分析
     if not fills_data.empty:
         buy_orders = len(fills_data[fills_data['side'] == 'buy'])
         sell_orders = len(fills_data[fills_data['side'] == 'sell'])
-        print(f"- 买入订单: {buy_orders}")
-        print(f"- 卖出订单: {sell_orders}")
+        logger.info(f"- 买入订单: {buy_orders}")
+        logger.info(f"- 卖出订单: {sell_orders}")
         
         # 成交金额统计
         fills_data['fill_amount'] = fills_data['fill_qty'] * fills_data['fill_price']
@@ -1424,47 +1462,47 @@ def _generate_audit_analysis(fills_data: pd.DataFrame, plans_data: pd.DataFrame,
         buy_amount = fills_data[fills_data['side'] == 'buy']['fill_amount'].sum()
         sell_amount = fills_data[fills_data['side'] == 'sell']['fill_amount'].sum()
         
-        print(f"\n💰 **资金流动**")
-        print(f"- 总成交金额: ¥{total_amount:,.2f}")
-        print(f"- 买入金额: ¥{buy_amount:,.2f}")
-        print(f"- 卖出金额: ¥{sell_amount:,.2f}")
-        print(f"- 净流入: ¥{sell_amount - buy_amount:,.2f}")
+        logger.info(f"\n💰 **资金流动**")
+        logger.info(f"- 总成交金额: ¥{total_amount:,.2f}")
+        logger.info(f"- 买入金额: ¥{buy_amount:,.2f}")
+        logger.info(f"- 卖出金额: ¥{sell_amount:,.2f}")
+        logger.info(f"- 净流入: ¥{sell_amount - buy_amount:,.2f}")
         
         # 费用分析
         total_expected_fees = fills_data['expected_fees'].sum()
         total_actual_fees = fills_data['actual_fees'].sum()
         fee_variance = total_actual_fees - total_expected_fees
         
-        print(f"\n💸 **费用分析**")
-        print(f"- 预期费用: ¥{total_expected_fees:,.2f}")
-        print(f"- 实际费用: ¥{total_actual_fees:,.2f}")
-        print(f"- 费用偏差: ¥{fee_variance:,.2f} ({fee_variance/total_expected_fees*100:+.1f}%)")
+        logger.info(f"\n💸 **费用分析**")
+        logger.info(f"- 预期费用: ¥{total_expected_fees:,.2f}")
+        logger.info(f"- 实际费用: ¥{total_actual_fees:,.2f}")
+        logger.info(f"- 费用偏差: ¥{fee_variance:,.2f} ({fee_variance/total_expected_fees*100:+.1f}%)")
         
         # 滑点分析
         avg_slippage = fills_data['slippage'].mean()
         max_slippage = fills_data['slippage'].max()
         total_slippage_cost = fills_data['slippage'].sum()
         
-        print(f"\n📉 **滑点分析**")
-        print(f"- 平均滑点: ¥{avg_slippage:.4f}")
-        print(f"- 最大滑点: ¥{max_slippage:.4f}")
-        print(f"- 滑点成本: ¥{total_slippage_cost:,.2f}")
+        logger.info(f"\n📉 **滑点分析**")
+        logger.info(f"- 平均滑点: ¥{avg_slippage:.4f}")
+        logger.info(f"- 最大滑点: ¥{max_slippage:.4f}")
+        logger.info(f"- 滑点成本: ¥{total_slippage_cost:,.2f}")
         
         # 执行效率分析
         if not plans_data.empty:
-            print(f"\n⚡ **执行效率**")
+            logger.info(f"\n⚡ **执行效率**")
             plan_codes = set(plans_data['code'].unique()) if 'code' in plans_data.columns else set()
             filled_codes = set(fills_data['code'].unique())
             
             execution_rate = len(filled_codes & plan_codes) / len(plan_codes) if plan_codes else 0
-            print(f"- 计划执行率: {execution_rate:.1%}")
+            logger.info(f"- 计划执行率: {execution_rate:.1%}")
             
             unexecuted_codes = plan_codes - filled_codes
             if unexecuted_codes:
-                print(f"- 未执行代码: {', '.join(sorted(unexecuted_codes)[:5])}{'...' if len(unexecuted_codes) > 5 else ''}")
+                logger.info(f"- 未执行代码: {', '.join(sorted(unexecuted_codes)[:5])}{'...' if len(unexecuted_codes) > 5 else ''}")
         
         # 持仓分析
-        print(f"\n📈 **持仓分析**")
+        logger.info(f"\n📈 **持仓分析**")
         position_changes = fills_data.groupby(['code', 'name']).agg({
             'fill_qty': lambda x: (x * fills_data.loc[x.index, 'side'].map({'buy': 1, 'sell': -1})).sum(),
             'fill_amount': lambda x: (x * fills_data.loc[x.index, 'side'].map({'buy': 1, 'sell': -1})).sum(),
@@ -1473,15 +1511,15 @@ def _generate_audit_analysis(fills_data: pd.DataFrame, plans_data: pd.DataFrame,
         position_changes = position_changes[position_changes['fill_qty'] != 0]
         position_changes = position_changes.sort_values('fill_amount', key=abs, ascending=False)
         
-        print(f"- 仓位变动股票数: {len(position_changes)}")
+        logger.info(f"- 仓位变动股票数: {len(position_changes)}")
         if not position_changes.empty:
-            print(f"\n**主要仓位变动 (Top 10):**")
+            logger.info(f"\n**主要仓位变动 (Top 10):**")
             for (code, name), row in position_changes.head(10).iterrows():
                 direction = "增持" if row['fill_qty'] > 0 else "减持"
-                print(f"  • {code} {name}: {direction} {abs(row['fill_qty']):,}股, ¥{abs(row['fill_amount']):,.2f}")
+                logger.info(f"  • {code} {name}: {direction} {abs(row['fill_qty']):,}股, ¥{abs(row['fill_amount']):,.2f}")
         
         # 板块分布分析
-        print(f"\n🏢 **板块分布**")
+        logger.info(f"\n🏢 **板块分布**")
         def get_board(code):
             code = str(code).zfill(6)  # 确保6位数字
             if code.startswith('688'):
@@ -1507,10 +1545,10 @@ def _generate_audit_analysis(fills_data: pd.DataFrame, plans_data: pd.DataFrame,
         }).round(2)
         
         for board, stats in board_stats.iterrows():
-            print(f"  • {board}: {stats['fill_qty']}单, ¥{stats['fill_amount']:,.2f}")
+            logger.info(f"  • {board}: {stats['fill_qty']}单, ¥{stats['fill_amount']:,.2f}")
     
     else:
-        print("暂无成交数据进行分析")
+        logger.warning("暂无成交数据进行分析")
 
 
 def _generate_trade_report(trades: pd.DataFrame, output_path: str, date: str):

@@ -1,5 +1,5 @@
 claude:
-  capital: 1000000  # 初始资金，单位元
+  capital: 200000  # 初始资金，单位元
   current_holdings: null  # 当前持仓，null表示空仓开始
   enable_multifactor: true  # 启用多因子模式，使用calculate_multifactor_alpha而非简化相对强度
   enable_periodic_reconstitution: true  # 启用定期重构
@@ -23,20 +23,21 @@ command_defaults:  # 命令默认参数
     portfolio_path: auto  # 自动组合路径
     weights_path: auto  # 自动权重路径
   select:  # 选股命令
-    date: auto  # 自动检测日期
+    date: '2025-08-27'  # 自动检测日期
   train:  # 训练命令
     algo: PPO  # 算法类型（Proximal Policy Optimization）
     baseline_path: auto  # 自动基线路径
     panel_path: auto  # 自动面板数据路径
 cpu_config:  # CPU配置
-  auto_detect_cores: true  # 自动检测CPU核心数
-  data_fetch_max_workers: 8  # 数据获取最大工作线程数
+  auto_detect_cores: false  # 自动检测CPU核心数
+  data_fetch_max_workers: 4  # 数据获取最大工作线程数
   eval_max_workers: 4  # 评估最大工作线程数
   hpo_max_workers: 4  # 超参数优化最大工作线程数
   max_cpu_cores: 5  # 最大使用CPU核心数
+
 backtest:  # 回测时间配置
-  start_date: '2025-07-11'  # 回测开始日期（策略实际运行的开始时间）
-  end_date: '2025-08-17'  # 回测结束日期（策略实际运行的结束时间，延长至确保20个交易日）
+  start_date: '2025-07-01'  # 回测开始日期（策略实际运行的开始时间）
+  end_date: '2025-08-27'  # 回测结束日期（策略实际运行的结束时间，延长至确保20个交易日）
 
 selection:  # 选股策略配置
   # selection_date: '2025-08-17'  # 选股日期（使用该日期前的数据进行选股）
@@ -52,6 +53,20 @@ factor_calculation:  # 因子计算配置
   momentum_lookback: 252  # 动量因子回看天数
   volatility_lookback: 60  # 波动率因子回看天数
   min_history_days: 120  # 股票最小历史数据要求（天）
+  skip_recent_days: 3  # 跳过最近N天（周频轮动用3-5天，避免微结构噪声）
+
+  # 下行风险/波动率计算配置
+  risk_free_rate: 0.025  # 年化无风险利率（3月期国债/央行逆回购利率）
+  benchmark_return: 0.08  # 年化基准收益率（可动态调整为指数历史收益）
+  volatility_weights:  # 波动率组合权重（支持时间滚动调整）
+    total_vol_weight: 0.6  # 总波动率权重
+    downside_vol_weight: 0.4  # 下行波动率权重
+    rolling_window: 252  # 权重滚动调整窗口
+
+  sortino_config:  # Sortino比率配置
+    mar_mode: 'dynamic_benchmark'  # MAR模式：'fixed', 'risk_free', 'dynamic_benchmark'
+    lookback_days: 180  # Sortino计算回看期
+    min_periods: 60  # 最小计算周期
 
 data_fetching:  # 数据获取配置
   rate_limit_delay: 0.15  # 速率限制延迟（秒）
@@ -124,28 +139,29 @@ risk_management:  # 风险管理配置
   max_total_weight: 0.95  # 最大总仓位比例
   min_position_decrease: 0.03  # 最小仓位减少比例
   position_adjust_threshold: 0.03  # 仓位调整阈值
-  stop_loss_pct: -0.10  # 止损比例
-  take_profit_pct: 0.8  # 止盈比例
+  stop_loss_pct: -0.05  # 止损比例
+  take_profit_pct: 0.3  # 止盈比例
   turnover_penalty: 0.0  # 换手率惩罚系数
   volatility_penalty: 0.0  # 波动率惩罚系数
   weight_method: risk_budgeted  # 权重计算方法（风险预算）
 
 stock_selection:
   # —— 两阶段选股：先门槛过滤，再全量打分排序，最后仅保留Top-K ——
-  mode: gate_then_rank           # ← 新增：明确采用“先过滤后排序”的流程
-  max_stocks: 6000               #     扫描/评估上限（覆盖A股可设6000）
-  rank_top_k: 6000               # ← 新增：排序后保留Top-K（与max_stocks解耦）
+  mode: gate_then_rank           # ← 新增：明确采用"先过滤后排序"的流程
+  max_stocks: 6000
+  rank_top_k: 6000               # ← 新增：排序后保留Top-200（与max_stocks解耦）
   shuffle_seed: 20250817         # ← 新增：进入主循环前固定随机洗牌，降低顺序偏置
-  min_adv_rmb: 5000000           # 调低：近20日平均成交额≥500万，先排查数据口径再收紧
+  min_adtv_shares: 1000000       # 近20日平均成交量≥100万股（ADTV - Average Daily Trading Volume）
+  min_adtv_shares_bj: 2000000    # 北交所ADTV阈值≥200万股（流动性要求更高）
   min_price: 2.0                 # 调低：先避免误杀（小票或复权口径差异）。
   filter_st: true                # （保留）
-  max_positions: 30               # （保留）
+  max_positions: 21               # （保留）
   auto_relax: true               # 若筛完为0，自动逐步放宽门槛（仅当空集合时启用）
   relax_steps:                   # 顺序尝试（只在集合为0时生效）
-    - { min_adv_rmb: 3000000, min_price: 1.5 }
-    - { min_adv_rmb: 1000000, min_price: 1.0 }
-    - { min_adv_rmb: 0,        min_price: 0.0 }
-  fallback_pick_top_k_by_adv: 100  # 若仍为0，则按ADV从大到小选Top-100作为候选
+    - { min_adtv_shares: 500000, min_price: 1.5 }
+    - { min_adtv_shares: 100000, min_price: 1.0 }
+    - { min_adtv_shares: 0,      min_price: 0.0 }
+  fallback_pick_top_k_by_adv: 100  # 若仍为0，则按ADTV从大到小选Top-100作为候选
 
 training:  # 训练配置
   checkpoint_freq: 20000  # 检查点保存频率
@@ -190,16 +206,18 @@ training:  # 训练配置
   walk_forward: rolling_windows  # 滚动窗口模式
 transaction_cost:  # 交易成本配置
   liquidity:  # 流动性成本
-    adv_multiplier: 1.0  # 平均日成交量乘数
+    adv_multiplier: 1.0  # 平均日成交量(ADTV)乘数
     bid_ask_spread_max: 0.002  # 最大买卖价差
     bid_ask_spread_min: 0.0002  # 最小买卖价差
   market_impact:  # 市场冲击成本
+    # 冲击模型现在基于 q = trade_shares / ADTV_shares（股数口径）
+    # 不再使用"元"口径的 ADV，而是基于股数的相对交易规模
     buy_multiplier: 1.1  # 买入冲击乘数
     enable: true  # 启用市场冲击
-    linear_rate: 0.0001  # 线性冲击率
+    linear_rate: 0.0001  # 线性冲击率：impact = linear_rate * q
     permanent_ratio: 0.4  # 永久冲击比例
     sell_multiplier: 0.9  # 卖出冲击乘数
-    sqrt_rate: 0.0005  # 平方根冲击率
+    sqrt_rate: 0.0005  # 平方根冲击率：impact = sqrt_rate * q^0.5
     temporary_ratio: 0.6  # 临时冲击比例
   slippage:  # 滑点成本
     base_rate: 0.0005  # 基础滑点率

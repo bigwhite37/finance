@@ -8032,37 +8032,30 @@ class RiskSensitiveTrendStrategy:
                 continue
 
             # 调仓日：重新计算信号和目标权重
-            # 判断是否为重构日（周频）vs 普通调仓日
-            is_reconstitution_day = self._is_reconstitution_day_for_backtest(i, rebalance_freq_days, trading_dates)
+            # 方案3修改：每个调仓日都进行完整的股票池重新筛选和多因子重新计算
 
             if rebalance_freq_days == 7:
                 # 周频轮动
                 current_weekday = pd.to_datetime(date_t).weekday()
                 weekday_names = ['周一', '周二', '周三', '周四', '周五']
-                if is_reconstitution_day:
-                    logger.info(f"🔄 {date_t}: 重构日（{weekday_names[current_weekday]}，本周最后交易日）- 启用完整多因子计算")
-                else:
-                    logger.info(f"📊 {date_t}: 调仓日（{weekday_names[current_weekday]}，本周最后交易日）- 权重再平衡")
+                logger.info(f"🔄 {date_t}: 调仓日（{weekday_names[current_weekday]}，本周最后交易日）- 完整多因子计算")
             else:
-                if is_reconstitution_day:
-                    logger.info(f"🔄 {date_t}: 重构日（第{i+1}个交易日）- 启用完整多因子计算")
-                else:
-                    logger.info(f"📊 {date_t}: 调仓日（第{i+1}个交易日，每{rebalance_freq_days}天调仓）- 权重再平衡")
+                logger.info(f"🔄 {date_t}: 调仓日（第{i+1}个交易日，每{rebalance_freq_days}天调仓）- 完整多因子计算")
+
+            # 调仓日开始前：显示当前持仓盈亏情况
+            if backtest_results['current_holdings'] and i > 0:
+                self._print_current_holdings_pnl(
+                    backtest_results['current_holdings'], 
+                    date_t
+                )
 
             # Step 1: T日收盘后计算信号并选择Top-K股票
-            if is_reconstitution_day:
-                # 重构日：使用完整多因子计算
-                all_signals = self._calculate_signals_with_multifactor(
-                    date_t,
-                    top_k=top_k,
-                    lookback_days=252
-                )
-            else:
-                # 普通调仓日：使用缓存的多因子结果进行权重再平衡
-                all_signals = self._rebalance_with_cached_factors(
-                    date_t,
-                    top_k=top_k
-                )
+            # 每个调仓日都使用完整多因子计算，重新筛选股票池并重新计算因子
+            all_signals = self._calculate_signals_with_multifactor(
+                date_t,
+                top_k=top_k,
+                lookback_days=252
+            )
 
             # 处理信号结果并生成交易决策
             if all_signals:
@@ -8070,10 +8063,8 @@ class RiskSensitiveTrendStrategy:
 
                 if i == 0:
                     logger.info(f"📊 {date_t} 初始建仓：选中Top-{len(daily_signals)}只股票")
-                elif is_reconstitution_day:
-                    logger.info(f"🔄 {date_t} 重构选股：选中Top-{len(daily_signals)}只股票")
                 else:
-                    logger.info(f"⚖️ {date_t} 权重再平衡：维持Top-{len(daily_signals)}只股票")
+                    logger.info(f"🔄 {date_t} 调仓选股：选中Top-{len(daily_signals)}只股票")
                 logger.info(f"   选中股票: {list(daily_signals.keys())}")
                 logger.info(f"   信号范围: {min(daily_signals.values()):.3f} ~ {max(daily_signals.values()):.3f}")
             else:
@@ -8121,19 +8112,82 @@ class RiskSensitiveTrendStrategy:
                             zero_weight_stocks = [stock for stock, weight in adjusted_weights.items() if weight == 0]
                             if zero_weight_stocks:
                                 logger.info(f"🔄 {date_t} 止盈止损执行：清仓{len(zero_weight_stocks)}只股票")
+                                
+                                # 立即更新持仓和权重状态，确保止损清仓完全生效
+                                cleared_stocks = []
+                                for stock in zero_weight_stocks:
+                                    # 记录清仓前的持仓信息用于日志
+                                    holding_info = backtest_results['current_holdings'].get(stock, {})
+                                    if isinstance(holding_info, dict):
+                                        shares = holding_info.get('shares', 0)
+                                        entry_price = holding_info.get('entry_price', 0)
+                                    else:
+                                        shares = holding_info
+                                        entry_price = 0
+                                    
+                                    # 从持仓中完全移除该股票
+                                    if stock in backtest_results['current_holdings']:
+                                        del backtest_results['current_holdings'][stock]
+                                        cleared_stocks.append(stock)
+                                        logger.info(f"   ✅ {stock}: 已清仓 {shares:,.1f}股 (成本价￥{entry_price:.2f})")
+                                    
+                                    # 同时从当前权重中移除
+                                    if stock in backtest_results['current_weights']:
+                                        old_weight = backtest_results['current_weights'][stock]
+                                        del backtest_results['current_weights'][stock]
+                                        logger.debug(f"       权重清零: {stock} {old_weight:.3f} → 0.000")
+                                
+                                # 验证清仓是否完成
+                                remaining_zero_weight = [s for s in zero_weight_stocks if s in backtest_results['current_holdings']]
+                                if remaining_zero_weight:
+                                    logger.error(f"   ❌ 清仓不完整：{remaining_zero_weight} 仍在持仓中")
+                                else:
+                                    logger.info(f"   ✅ 清仓验证通过：{len(cleared_stocks)}只股票已完全移除")
 
                                 # 重新计算信号，排除已清仓的股票
                                 if daily_signals:
+                                    removed_from_signals = []
                                     for stock in zero_weight_stocks:
                                         if stock in daily_signals:
                                             del daily_signals[stock]
-                                    logger.info(f"   剩余信号股票：{len(daily_signals)}只")
+                                            removed_from_signals.append(stock)
+                                    logger.info(f"   信号更新: 移除{len(removed_from_signals)}只，剩余{len(daily_signals)}只")
+                                    
+                                # 估算清仓释放的资金（用于日志显示，不实际更新现金）
+                                released_cash = 0.0
+                                for stock in cleared_stocks:
+                                    # 获取清仓时的价格
+                                    if stock in current_prices:
+                                        current_price = current_prices[stock]
+                                        # 从 adjusted_weights 获取原来的权重
+                                        original_weight = 0
+                                        # 找到原来的权重（在被清零之前）
+                                        for stock_code, holding_info in backtest_results['current_holdings'].items():
+                                            if stock_code == stock and isinstance(holding_info, dict):
+                                                shares = holding_info.get('shares', 0)
+                                                stock_value = shares * current_price
+                                                released_cash += stock_value
+                                                break
+                                
+                                # 更新统计信息
+                                current_holdings_count = len(backtest_results['current_holdings'])
+                                current_weights_count = len(backtest_results['current_weights'])
+                                logger.info(
+                                    f"   ⚠️  止损清仓已立即生效 | "
+                                    f"持仓: {current_holdings_count}只 | 权重: {current_weights_count}只 | "
+                                    f"估算释放资金: ￥{released_cash:,.0f}"
+                                )
 
                 except Exception as e:
-                    logger.warning(f"止盈止损检查失败: {e}")
+                    logger.error(f"止盈止损检查发生异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 不能吓下异常，但要确保回测继续运行
+                    # 设置空的adjusted_weights以便继续正常流程
                     adjusted_weights = {}
+                    logger.warning("止盈止损功能在此调仓日跳过，继续执行正常调仓")
 
-            # Step 2: 生成目标权重
+            # Step 2: 生成目标权重（此时止损股票已从 daily_signals 和 current_holdings 中移除）
             target_weights = self._generate_target_weights(
                 daily_signals,
                 date_t,
@@ -8653,28 +8707,44 @@ class RiskSensitiveTrendStrategy:
             'impact_cost': 0.0,    # 冲击成本
             'spread_cost': 0.0     # 价差成本
         }
+        
+        # 交易细节打印开始
+        if orders:
+            logger.info(f"📈 {date} 交易执行开始：处理 {len(orders)} 个订单")
+            logger.info("=" * 80)
 
         for stock, weight_change in orders.items():
             norm_code = self._normalize_instrument(stock)
+            stock_name = self.get_stock_name(stock)
+            direction = "买入" if weight_change > 0 else "卖出"
+            
+            logger.info(f"\n🔄 处理订单: {stock} ({stock_name}) {direction} 权重变化: {weight_change:+.4f}")
 
             # 获取T+1日数据
             price_data = self._get_price_at_date(norm_code, date)
             if price_data is None:
                 fills['rejected'][stock] = '无价格数据'
+                logger.warning(f"   ❌ 订单被拒绝: 无价格数据")
                 continue
 
             open_price = price_data.get('open')
             close_yesterday = price_data.get('close_yesterday')
             volume = price_data.get('volume', 0)
+            
+            logger.info(f"   📊 市场数据: 开盘价￥{open_price:.2f} | 昨收￥{close_yesterday:.2f} | 成交量{volume:,.0f}股")
 
             # 检查涨跌停
             upper_limit, lower_limit = self._get_price_limits(close_yesterday, stock)
+            change_pct = (open_price - close_yesterday) / close_yesterday * 100
+            logger.info(f"   📈 涨跌幅: {change_pct:+.2f}% | 涨停￥{upper_limit:.2f} | 跌停￥{lower_limit:.2f}")
 
             if weight_change > 0 and open_price >= upper_limit:
                 fills['rejected'][stock] = '涨停无法买入'
+                logger.warning(f"   ❌ 订单被拒绝: 涨停无法买入 (开盘价￥{open_price:.2f} ≥ 涨停价￥{upper_limit:.2f})")
                 continue
             elif weight_change < 0 and open_price <= lower_limit:
                 fills['rejected'][stock] = '跌停无法卖出'
+                logger.warning(f"   ❌ 订单被拒绝: 跌停无法卖出 (开盘价￥{open_price:.2f} ≤ 跌停价￥{lower_limit:.2f})")
                 continue
 
             # 成交量约束
@@ -8688,6 +8758,8 @@ class RiskSensitiveTrendStrategy:
                 volume_participation_rate = min(trade_shares / volume, 1.0)
             else:
                 volume_participation_rate = 0.5  # 默认中等参与率
+                
+            logger.info(f"   💰 交易规模: 金额￥{trade_value:,.0f} | 股数{trade_shares:,.0f}股 | 成交量参与率{volume_participation_rate:.1%}")
 
             # 计算动态滑点
             dynamic_slippage_rate = self._calculate_dynamic_slippage(
@@ -8699,6 +8771,8 @@ class RiskSensitiveTrendStrategy:
                 exec_price = open_price * (1 + dynamic_slippage_rate)
             else:
                 exec_price = open_price * (1 - dynamic_slippage_rate)
+                
+            logger.info(f"   🎯 执行价格: 开盘￥{open_price:.2f} → 成交￥{exec_price:.2f} | 滑点{dynamic_slippage_rate:.2%}")
 
             # 计算基础交易成本：佣金、印花税、过户费
             cost_details = self._calculate_transaction_costs(trade_value, is_buy=(weight_change > 0))
@@ -8719,7 +8793,22 @@ class RiskSensitiveTrendStrategy:
 
             # 滑点成本（已体现在价格中）
             slippage_cost = trade_value * dynamic_slippage_rate
+            
+            # 打印成本明细
+            logger.info(f"   💸 交易成本明细:")
+            logger.info(f"     基础成本: ￥{base_cost:.2f} (佣金￥{cost_details.get('commission', 0):.2f} + 印花税￥{cost_details.get('stamp_tax', 0):.2f} + 过户费￥{cost_details.get('transfer_fee', 0):.2f})")
+            logger.info(f"     冲击成本: ￥{impact_details['total_impact']:.2f}")
+            logger.info(f"     价差成本: ￥{spread_cost:.2f}")
+            logger.info(f"     滑点成本: ￥{slippage_cost:.2f}")
+            logger.info(f"     总成本: ￥{total_cost:.2f} ({total_cost/trade_value:.3%})")
 
+            # A股交易规则：计算实际成交股数（100股整数倍）
+            theoretical_shares = trade_value / exec_price
+            actual_shares = int(theoretical_shares // 100) * 100
+            if actual_shares < 100:
+                actual_shares = 100
+            actual_trade_value = actual_shares * exec_price
+            
             fills['executed'][stock] = {
                 'weight_change': weight_change,
                 'price': exec_price,
@@ -8729,12 +8818,33 @@ class RiskSensitiveTrendStrategy:
                 'spread_cost': spread_cost,
                 'volume_participation': volume_participation_rate
             }
+            
+            # 成交确认
+            logger.info(f"   ✅ 订单成交: {actual_shares:,.0f}股 × ￥{exec_price:.2f} = ￥{actual_trade_value:,.0f}")
 
             # 记录详细成本
             fills['costs'] += total_cost
             fills['slippage_cost'] = fills.get('slippage_cost', 0) + slippage_cost
             fills['impact_cost'] = fills.get('impact_cost', 0) + impact_details['total_impact']
             fills['spread_cost'] = fills.get('spread_cost', 0) + spread_cost
+
+        # 交易汇总
+        if orders:
+            logger.info("\n" + "=" * 80)
+            executed_count = len(fills['executed'])
+            rejected_count = len(fills['rejected'])
+            total_cost = fills['costs']
+            total_slippage = fills['slippage_cost']
+            total_impact = fills['impact_cost']
+            total_spread = fills['spread_cost']
+            
+            logger.info(f"📊 {date} 交易执行完成汇总:")
+            logger.info(f"   成交订单: {executed_count}个")
+            logger.info(f"   拒绝订单: {rejected_count}个")
+            if rejected_count > 0:
+                logger.info(f"   拒绝原因: {list(fills['rejected'].values())}")
+            logger.info(f"   总成本: ￥{total_cost:.2f} (基础￥{total_cost-total_slippage-total_impact-total_spread:.2f} + 滑点￥{total_slippage:.2f} + 冲击￥{total_impact:.2f} + 价差￥{total_spread:.2f})")
+            logger.info("=" * 80)
 
         return fills
 
@@ -8748,7 +8858,13 @@ class RiskSensitiveTrendStrategy:
 
             # 计算实际买卖的股份数 - 修复：使用固定基准资金
             trade_value = abs(weight_change) * initial_capital
-            shares_change = trade_value / price
+            theoretical_shares = trade_value / price
+            
+            # A股交易规则：必须为100股的整数倍
+            shares_change = int(theoretical_shares // 100) * 100
+            if shares_change < 100:
+                # 少于100股按100股处理（最小交易单位）
+                shares_change = 100
 
             if weight_change > 0:
                 # 买入：增加股份
@@ -8768,7 +8884,9 @@ class RiskSensitiveTrendStrategy:
 
                     # 计算加权平均入场价格
                     total_shares = old_shares + shares_change
-                    if total_shares > 0:
+                    # 确保总股数符合100股整数倍规则
+                    total_shares = int(total_shares // 100) * 100
+                    if total_shares >= 100:
                         avg_entry_price = (old_shares * old_entry_price + shares_change * price) / total_shares
                         new_weight = old_weight + weight_change  # 累加权重变化得到新权重
                         backtest_results['current_holdings'][stock].update({
@@ -8782,8 +8900,10 @@ class RiskSensitiveTrendStrategy:
                     old_shares = backtest_results['current_holdings'][stock].get('shares', 0)
                     old_weight = backtest_results['current_holdings'][stock].get('weight', 0)
                     new_shares = old_shares - shares_change
+                    # 确保剩余股数符合100股整数倍规则
+                    new_shares = int(new_shares // 100) * 100
 
-                    if new_shares <= 1:  # 少于1股清空
+                    if new_shares < 100:  # 少于100股清空（A股最小交易单位）
                         del backtest_results['current_holdings'][stock]
                     else:
                         # 部分减仓，保持入场价格不变
@@ -8945,6 +9065,125 @@ class RiskSensitiveTrendStrategy:
 
         return backtest_results
 
+    def _print_current_holdings_pnl(self, current_holdings, date_t):
+        """
+        打印当前持仓盈亏情况
+        
+        Parameters:
+        -----------
+        current_holdings : dict
+            当前持仓 {stock: holding_info}
+        date_t : str
+            当前日期
+        """
+        if not current_holdings:
+            logger.info(f"💰 {date_t} 当前持仓：空仓")
+            return
+        
+        logger.info(f"💰 {date_t} 当前持仓盈亏情况：")
+        
+        total_pnl = 0.0
+        total_market_value = 0.0
+        holding_details = []
+        
+        for stock, holding_info in current_holdings.items():
+            try:
+                # 处理两种持仓数据结构：简单数字或复杂字典
+                if isinstance(holding_info, dict):
+                    shares = holding_info.get('shares', 0)
+                    entry_price = holding_info.get('entry_price', 0)
+                else:
+                    shares = holding_info  # 兼容旧的简单结构
+                    entry_price = 0  # 无法获取入场价格
+                
+                if shares <= 0:
+                    continue
+                
+                # 获取当前价格
+                norm_code = self._normalize_instrument(stock)
+                price_data = self._get_price_at_date(norm_code, date_t)
+                
+                if not price_data or 'close' not in price_data:
+                    # 无法获取价格，跳过
+                    continue
+                
+                current_price = price_data['close']
+                market_value = shares * current_price
+                total_market_value += market_value
+                
+                if entry_price > 0:
+                    # 计算盈亏
+                    cost = shares * entry_price
+                    pnl = market_value - cost
+                    pnl_pct = (pnl / cost) * 100 if cost > 0 else 0
+                    total_pnl += pnl
+                    
+                    # 盈亏颜色显示
+                    color = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
+                    
+                    holding_details.append({
+                        'stock': stock,
+                        'shares': shares,
+                        'entry_price': entry_price,
+                        'current_price': current_price,
+                        'market_value': market_value,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'color': color
+                    })
+                else:
+                    # 无入场价格信息
+                    holding_details.append({
+                        'stock': stock,
+                        'shares': shares,
+                        'entry_price': 0,
+                        'current_price': current_price,
+                        'market_value': market_value,
+                        'pnl': 0,
+                        'pnl_pct': 0,
+                        'color': "🟡"
+                    })
+                    
+            except Exception as e:
+                logger.warning(f"计算{stock}盈亏时发生异常: {e}")
+                continue
+        
+        # 按盈亏率排序（从高到低）
+        holding_details.sort(key=lambda x: x['pnl_pct'], reverse=True)
+        
+        # 打印每只股票的盈亏情况
+        for detail in holding_details:
+            if detail['entry_price'] > 0:
+                logger.info(
+                    f"   {detail['color']} {detail['stock']}: "
+                    f"{detail['shares']:,}股 | "
+                    f"成本价￥{detail['entry_price']:.2f} → 现价￥{detail['current_price']:.2f} | "
+                    f"市值￥{detail['market_value']:,.0f} | "
+                    f"盈亏￥{detail['pnl']:,.0f} ({detail['pnl_pct']:+.1f}%)"
+                )
+            else:
+                logger.info(
+                    f"   {detail['color']} {detail['stock']}: "
+                    f"{detail['shares']:,}股 | "
+                    f"现价￥{detail['current_price']:.2f} | "
+                    f"市值￥{detail['market_value']:,.0f} | "
+                    f"盈亏：无法计算（缺少成本价）"
+                )
+        
+        # 打印总计
+        if total_pnl != 0 and len([d for d in holding_details if d['entry_price'] > 0]) > 0:
+            total_cost = sum(d['shares'] * d['entry_price'] for d in holding_details if d['entry_price'] > 0)
+            total_pnl_pct = (total_pnl / total_cost) * 100 if total_cost > 0 else 0
+            pnl_color = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "🟡"
+            
+            logger.info(
+                f"   {pnl_color} 总计: 市值￥{total_market_value:,.0f} | "
+                f"盈亏￥{total_pnl:,.0f} ({total_pnl_pct:+.1f}%) | "
+                f"持仓{len(holding_details)}只"
+            )
+        else:
+            logger.info(f"   🟡 总计: 市值￥{total_market_value:,.0f} | 持仓{len(holding_details)}只")
+            
     def _update_holdings_no_trade(self, backtest_results, date):
         """无交易时更新持仓市值 - read.md修复：正确的非交易日收益计算"""
         # 非交易日：使用昨收→今收的收益率
@@ -13753,7 +13992,7 @@ class RiskSensitiveTrendStrategy:
         --------
         dict : {stock: alpha_score} 股票alpha评分字典
         """
-        logger.info(f"🔄 重构日多因子计算开始: {date_t}")
+        logger.info(f"🔄 调仓日多因子计算开始: {date_t}")
 
         # 1. 强制重构股票池（使用现有逻辑）
         candidate_stocks = self._get_candidate_stocks_at_date(date_t, force_reconstitution=True)
@@ -16251,11 +16490,41 @@ def main():
         strategy.auto_detect_cores = config.get('auto_detect_cores', True)
         logger.info(f"🔧 CPU配置: 并行={strategy.use_concurrent}, 核心数={strategy.max_cpu_cores}, 自动检测={strategy.auto_detect_cores}")
 
-        # 运行周频轮动回测
-        selected_stocks, position_sizes = strategy.run_strategy(
-            use_concurrent=config['use_concurrent'],
-            max_workers=config['max_workers']
+        # 直接运行动态选股回测，不依赖预设股票池
+        logger.info(f"🚀 启动完全动态选股回测（每个调仓日重新筛选股票池和计算因子）")
+        
+        # 从配置获取回测参数
+        rebalance_freq_days = config.get('rebalance_freq_days', 7)
+        max_positions = config.get('max_positions', 30)
+        
+        backtest_result = strategy.run_daily_rolling_backtest(
+            top_k=max_positions,
+            rebalance_freq=None,  # 使用配置文件中的调仓频率
+            commission=0.0003,
+            slippage=0.0005,
+            min_holding_days=1,
+            turnover_threshold=0.01,
+            volume_limit_pct=0.05,
+            initial_stocks=None  # 不使用预设股票池，完全动态选股
         )
+        
+        # 显示回测结果
+        if backtest_result and 'nav_curve' in backtest_result:
+            nav_curve = backtest_result['nav_curve']
+            final_nav = nav_curve.iloc[-1] if len(nav_curve) > 0 else 1.0
+            logger.info(f"📊 回测完成 - 最终净值: {final_nav:.4f}")
+            
+            if 'performance' in backtest_result:
+                perf = backtest_result['performance']
+                logger.info(f"   年化收益率: {perf.get('annualized_return', 0):.2%}")
+                logger.info(f"   最大回撤: {perf.get('max_drawdown', 0):.2%}")
+                logger.info(f"   夏普比率: {perf.get('sharpe_ratio', 0):.3f}")
+        else:
+            logger.error("回测执行失败")
+        
+        # 为了兼容后续代码，设置空的selected_stocks和position_sizes
+        selected_stocks = []
+        position_sizes = {}
     else:
         # 策略分析模式
         logger.info(f"\n=== 策略分析模式 ===")
