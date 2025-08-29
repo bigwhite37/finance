@@ -352,8 +352,13 @@ def print_stocks_details_for_range(
         df['low']   = df['low']   / df['factor']
         df['close'] = df['close'] / df['factor']
 
-        # 保留所有需要展示的列
-        df = df[['open', 'high', 'low', 'close', 'adj_open', 'adj_high', 'adj_low', 'adj_close', 'factor']]
+        # 保留所有需要展示的列（包括 turnover 和 volume）
+        display_cols = ['open', 'high', 'low', 'close', 'adj_open', 'adj_high', 'adj_low', 'adj_close', 'factor']
+        # 添加存在的 turnover 和 volume 列
+        for col in ['turnover', 'volume']:
+            if col in df.columns:
+                display_cols.append(col)
+        df = df[display_cols]
     else:
         print("警告：缺少计算未复权价格所需的列（open/high/low/close/factor），将按现有列原样打印。")
 

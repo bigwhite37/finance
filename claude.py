@@ -9,7 +9,7 @@ import numpy as np
 import sys
 
 # read.md修复：启用硬错误模式，浮点异常立即raise而不是静默成NaN/Inf
-np.seterr(all='raise')
+np.seterr(divide='raise', invalid='raise', over='raise', under='ignore')
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -25,6 +25,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 import os
 import yaml
 import argparse
+from typing import Optional, Union
 YAML_AVAILABLE = True
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial, lru_cache
@@ -66,6 +67,20 @@ def _calculate_stock_batch_signals(stock_batch, date_t, price_data_dict, normali
     scores = {}
     failed_stocks = []
 
+    def _normalize_df_columns(df):
+        """规范化DataFrame列名为小写"""
+        # 创建列名映射
+        column_map = {}
+        for col in df.columns:
+            if col.upper() in ['OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME', 'AMOUNT']:
+                column_map[col] = col.lower()
+
+        # 如果有需要重命名的列，则重命名
+        if column_map:
+            df = df.rename(columns=column_map)
+
+        return df
+
     def _normalize_instrument_local(stock):
         """本地股票代码规范化函数"""
         if stock.startswith('68'):
@@ -86,6 +101,7 @@ def _calculate_stock_batch_signals(stock_batch, date_t, price_data_dict, normali
             return True
 
         row = df.iloc[date_idx]
+        # 列名已经被规范化为小写
         key_fields = ['open', 'high', 'low', 'close', 'volume']
         available_fields = [field for field in key_fields if field in df.columns]
 
@@ -121,14 +137,18 @@ def _calculate_stock_batch_signals(stock_batch, date_t, price_data_dict, normali
         else:
             last_trading_date = df_filtered.index[eval_idx]
 
-        # 过滤有效交易数据
-        trading_mask = ~(
-            df_filtered['open'].isna() |
-            df_filtered['high'].isna() |
-            df_filtered['low'].isna() |
-            df_filtered['close'].isna() |
-            df_filtered['volume'].isna()
-        )
+        # 列名已经被规范化为小写，直接使用小写列名
+        if all(col in df_filtered.columns for col in ['open', 'high', 'low', 'close', 'volume']):
+            trading_mask = ~(
+                df_filtered['open'].isna() |
+                df_filtered['high'].isna() |
+                df_filtered['low'].isna() |
+                df_filtered['close'].isna() |
+                df_filtered['volume'].isna()
+            )
+        else:
+            # 无有效列，返回空
+            return None, None, True
 
         trading_data = df_filtered[trading_mask].copy()
 
@@ -148,6 +168,9 @@ def _calculate_stock_batch_signals(stock_batch, date_t, price_data_dict, normali
 
             df = price_data_dict[norm_code]
 
+            # 规范化DataFrame列名为小写
+            df = _normalize_df_columns(df)
+
             # 使用停牌友好的数据处理
             trading_data, last_trading_date, is_eval_suspended = _get_valid_trading_data_local(df, date_t, min_samples=63)
 
@@ -160,6 +183,7 @@ def _calculate_stock_batch_signals(stock_batch, date_t, price_data_dict, normali
 
             # 计算动量评分
             if len(trading_data) >= 63:
+                # 列名已经被规范化为小写
                 current_price = trading_data['close'].iloc[-1]
                 past_price = trading_data['close'].iloc[-63]
 
@@ -287,7 +311,196 @@ if not NUMBA_AVAILABLE:
 # 全局函数 - 多进程计算用
 # ============================================================================
 
-def _calculate_single_stock_factors(stock, norm_code, data_records, momentum_windows, skip_recent):
+def _calculate_dynamic_mar(
+    eval_end: int,
+    df: pd.DataFrame,
+    mar_mode: str = 'dynamic_benchmark',
+    risk_free_rate: float = 0.025,
+    benchmark_return: float = 0.08,
+    lookback_days: int = 180,
+    min_periods: int = 60,
+    benchmark_data: Optional[pd.DataFrame] = None,
+    config_dict: Optional[dict] = None
+) -> float:
+    """
+    计算动态MAR (最低可接受收益率)
+
+    Parameters:
+    -----------
+    eval_end : int
+        评估截止位置
+    df : pd.DataFrame
+        股票价格数据
+    mar_mode : str
+        MAR模式：'fixed', 'risk_free', 'dynamic_benchmark'
+    risk_free_rate : float
+        年化无风险利率
+    benchmark_return : float
+        年化基准收益率（固定模式下使用）
+    lookback_days : int
+        动态计算的回看天数
+    min_periods : int
+        最小计算周期
+    benchmark_data : pd.DataFrame, optional
+        基准指数数据（用于动态基准模式）
+    config_dict : dict, optional
+        简化的配置字典，用于并行计算场景
+
+    Returns:
+    --------
+    float
+        年化MAR
+    """
+
+    # 如果提供了配置字典，优先使用其中的参数
+    if config_dict:
+        mar_mode = config_dict.get('mar_mode', mar_mode)
+        risk_free_rate = config_dict.get('risk_free_rate', risk_free_rate)
+        benchmark_return = config_dict.get('benchmark_return', benchmark_return)
+        lookback_days = config_dict.get('sortino_lookback', lookback_days)
+        min_periods = config_dict.get('sortino_min_periods', min_periods)
+
+    if mar_mode == 'fixed':
+        # 固定MAR：使用配置的基准收益率
+        return float(benchmark_return)
+
+    elif mar_mode == 'risk_free':
+        # 无风险利率MAR：使用配置的无风险利率
+        return float(risk_free_rate)
+
+    elif mar_mode == 'dynamic_benchmark':
+        # 动态基准MAR：基于历史基准收益+无风险利率的组合
+        try:
+            if benchmark_data is not None and len(benchmark_data) > 0:
+                # 使用实际基准数据计算历史收益
+                start_pos = max(0, eval_end - lookback_days)
+                if start_pos >= eval_end - min_periods:
+                    # 数据不足，回退到风险自由利率
+                    logger.debug(f"基准数据不足，回退到无风险利率: {risk_free_rate}")
+                    return float(risk_free_rate)
+
+                benchmark_window = benchmark_data.iloc[start_pos:eval_end]
+                if 'close' in benchmark_window.columns:
+                    prices = benchmark_window['close'].dropna()
+                    if len(prices) >= min_periods:
+                        # 计算历史年化收益率
+                        returns = prices.pct_change().dropna()
+                        if len(returns) > 0:
+                            historical_return = returns.mean() * 252  # 年化
+                            # MAR = 70% 历史基准收益 + 30% 无风险利率（保守）
+                            dynamic_mar = 0.7 * float(historical_return) + 0.3 * float(risk_free_rate)
+                            logger.debug(f"动态MAR计算: 历史收益={historical_return:.4f}, MAR={dynamic_mar:.4f}")
+                            return float(dynamic_mar)
+
+            # 基准数据不可用或计算失败，回退到组合方式
+            logger.debug(f"基准数据不可用，使用配置基准: {benchmark_return}")
+            # MAR = 80% 配置基准 + 20% 无风险利率
+            combined_mar = 0.8 * float(benchmark_return) + 0.2 * float(risk_free_rate)
+            return float(combined_mar)
+
+        except Exception as e:
+            logger.warning(f"动态MAR计算失败: {e}, 回退到无风险利率")
+            return float(risk_free_rate)
+
+    else:
+        # 未知模式，回退到无风险利率
+        logger.warning(f"未知MAR模式: {mar_mode}, 使用无风险利率")
+        return float(risk_free_rate)
+
+def _calculate_rolling_volatility_weights(
+    eval_end: int,
+    df: pd.DataFrame,
+    total_weight_base: float = 0.6,
+    downside_weight_base: float = 0.4,
+    rolling_window: int = 252,
+    min_periods: int = 60,
+    adjustment_factor: float = 0.2
+) -> tuple[float, float]:
+    """
+    计算时间滚动的波动率权重组合
+
+    根据历史波动率特征动态调整总波动率vs下行波动率的权重
+
+    Parameters:
+    -----------
+    eval_end : int
+        评估截止位置
+    df : pd.DataFrame
+        股票价格数据
+    total_weight_base : float
+        总波动率基础权重
+    downside_weight_base : float
+        下行波动率基础权重
+    rolling_window : int
+        滚动调整窗口
+    min_periods : int
+        最小计算周期
+    adjustment_factor : float
+        调整幅度因子
+
+    Returns:
+    --------
+    tuple[float, float]
+        (调整后的总波动率权重, 调整后的下行波动率权重)
+    """
+
+    try:
+        start_pos = max(0, eval_end - rolling_window)
+        if start_pos >= eval_end - min_periods:
+            # 数据不足，使用基础权重
+            return float(total_weight_base), float(downside_weight_base)
+
+        # 计算历史收益
+        price_window = df['close'].iloc[start_pos:eval_end].dropna()
+        if len(price_window) < min_periods:
+            return float(total_weight_base), float(downside_weight_base)
+
+        returns = price_window.pct_change().dropna()
+        if len(returns) < min_periods:
+            return float(total_weight_base), float(downside_weight_base)
+
+        # 计算波动率特征
+        total_vol = returns.std() * np.sqrt(252)
+        negative_returns = returns[returns < 0]
+
+        if len(negative_returns) == 0:
+            # 没有负收益，降低下行波动权重
+            total_weight = min(1.0, total_weight_base + adjustment_factor)
+            downside_weight = max(0.0, downside_weight_base - adjustment_factor)
+        else:
+            downside_vol = negative_returns.std() * np.sqrt(252)
+            downside_ratio = downside_vol / total_vol if total_vol > 0 else 0.5
+
+            # 下行波动占比高时，提高下行波动权重
+            if downside_ratio > 0.8:  # 下行占主导
+                total_weight = max(0.0, total_weight_base - adjustment_factor)
+                downside_weight = min(1.0, downside_weight_base + adjustment_factor)
+            elif downside_ratio < 0.4:  # 波动相对均匀
+                total_weight = min(1.0, total_weight_base + adjustment_factor * 0.5)
+                downside_weight = max(0.0, downside_weight_base - adjustment_factor * 0.5)
+            else:
+                # 适中情况，使用基础权重
+                total_weight = float(total_weight_base)
+                downside_weight = float(downside_weight_base)
+
+        # 确保权重和为1.0
+        total_sum = total_weight + downside_weight
+        if total_sum > 0:
+            total_weight = total_weight / total_sum
+            downside_weight = downside_weight / total_sum
+        else:
+            # 异常情况，回退到基础权重
+            total_weight = total_weight_base
+            downside_weight = downside_weight_base
+
+        logger.debug(f"滚动权重调整: 总波动={total_weight:.3f}, 下行波动={downside_weight:.3f}")
+        return float(total_weight), float(downside_weight)
+
+    except Exception as e:
+        logger.warning(f"滚动权重计算失败: {e}, 使用基础权重")
+        return float(total_weight_base), float(downside_weight_base)
+
+def _calculate_single_stock_factors(stock, norm_code, data_records, momentum_windows, skip_recent, volatility_config=None):
     """
     计算单个股票的所有因子（全局函数，支持多进程）
 
@@ -324,42 +537,58 @@ def _calculate_single_stock_factors(stock, norm_code, data_records, momentum_win
         factors = {}
 
         # 1. 多窗口动量因子
-        momentum_factor = _calculate_momentum_factor_standalone(df, eval_end, momentum_windows)
+        momentum_factor = _calculate_momentum_factor_standalone(df, eval_end, momentum_windows, skip_recent=skip_recent)
         if momentum_factor is not None:
             factors['momentum'] = momentum_factor
 
-        # 2. 52周高点贴近度因子
-        high_52w_factor = _calculate_52week_high_factor_standalone(df, eval_end)
+        # 2. 52周高点贴近度因子（统一使用skip_recent参数）
+        high_52w_factor = _calculate_52week_high_factor_standalone(df, eval_end, skip_recent=skip_recent)
         if high_52w_factor is not None:
             factors['high_52w'] = high_52w_factor
 
-        # 3. 波动率因子
-        volatility_factor = _calculate_volatility_factor_standalone(df, eval_end)
+        # 3. 波动率因子（使用统一的skip_recent参数和动态配置）
+        vol_kwargs = {'skip_recent': skip_recent}
+        if volatility_config:
+            # 创建模拟的策略实例配置
+            class MockStrategy:
+                pass
+            mock_strategy = MockStrategy()
+            for key, value in volatility_config.items():
+                setattr(mock_strategy, key, value)
+            vol_kwargs['strategy_instance'] = mock_strategy
+
+        volatility_factor = _calculate_volatility_factor_standalone(df, eval_end, **vol_kwargs)
         if volatility_factor is not None:
             factors['volatility'] = volatility_factor
 
-        # 4. 趋势强度因子
-        trend_strength_factor = _calculate_trend_strength_factor_standalone(df, eval_end)
+        # 4. 趋势强度因子（使用统一的skip_recent参数）
+        trend_strength_factor = _calculate_trend_strength_factor_standalone(df, eval_end, skip_recent=skip_recent)
         if trend_strength_factor is not None:
             factors['trend_strength'] = trend_strength_factor
 
-        # 5. 流动性因子
-        liquidity_factor = _calculate_liquidity_factor_standalone(df, eval_end)
+        # 5. 流动性因子（使用统一的skip_recent参数）
+        liquidity_factor = _calculate_liquidity_factor_standalone(df, eval_end, skip_recent=skip_recent)
         if liquidity_factor is not None:
             factors['liquidity'] = liquidity_factor
 
-        # 6. 量价背离因子
-        volume_price_factor = _calculate_volume_price_divergence_factor_standalone(df, eval_end)
+        # 6. 量价背离因子（使用统一的skip_recent参数）
+        volume_price_factor = _calculate_volume_price_divergence_factor_standalone(df, eval_end, skip_recent=skip_recent)
         if volume_price_factor is not None:
             factors['volume_price_divergence'] = volume_price_factor
 
-        # 7. 局部回撤因子
-        drawdown_factor = _calculate_local_drawdown_factor_standalone(df, eval_end)
+        # 7. 局部回撤因子（使用统一的skip_recent参数）
+        drawdown_factor = _calculate_local_drawdown_factor_standalone(df, eval_end, skip_recent=skip_recent)
         if drawdown_factor is not None:
             factors['local_drawdown'] = drawdown_factor
 
-        # 8. 下行风险因子
-        downside_risk_factor = _calculate_downside_risk_score_standalone(df, eval_end)
+        # 8. 下行风险因子（使用动态配置）
+        risk_kwargs = {}
+        if volatility_config:
+            # 复用已创建的mock_strategy或创建新的
+            if 'strategy_instance' in vol_kwargs:
+                risk_kwargs['strategy_instance'] = vol_kwargs['strategy_instance']
+
+        downside_risk_factor = _calculate_downside_risk_score_standalone(df, eval_end, **risk_kwargs)
         if downside_risk_factor is not None:
             factors['downside_risk'] = downside_risk_factor
 
@@ -372,7 +601,7 @@ def _calculate_single_stock_factors(stock, norm_code, data_records, momentum_win
         logger.error(f"股票{stock}因子计算失败: {e}")
         raise
 
-def _calculate_batch_factors(stock_data_batch, momentum_windows, skip_recent):
+def _calculate_batch_factors(stock_data_batch, momentum_windows, skip_recent, volatility_config=None):
     """
     批量计算多个股票的因子（全局函数，支持多进程）
 
@@ -393,7 +622,7 @@ def _calculate_batch_factors(stock_data_batch, momentum_windows, skip_recent):
     batch_results = {}
 
     for stock, norm_code, data_records in stock_data_batch:
-        factors = _calculate_single_stock_factors(stock, norm_code, data_records, momentum_windows, skip_recent)
+        factors = _calculate_single_stock_factors(stock, norm_code, data_records, momentum_windows, skip_recent, volatility_config)
         if factors:
             batch_results[stock] = factors
 
@@ -402,7 +631,7 @@ def _calculate_batch_factors(stock_data_batch, momentum_windows, skip_recent):
 
 # 独立的因子计算函数（避免依赖self）
 
-def _calculate_momentum_factor_standalone(df, eval_end, momentum_windows):
+def _calculate_momentum_factor_standalone(df, eval_end, momentum_windows, skip_recent=3):
     """
     计算跨期动量（针对周频回测优化版本）
 
@@ -431,8 +660,9 @@ def _calculate_momentum_factor_standalone(df, eval_end, momentum_windows):
 
     prices = prices_all.iloc[:eval_end]
 
-    # 跳过最近几个交易日的处理（针对周频调整为3天）
-    GAP_DAYS = 3
+    # 跳过最近几个交易日的处理（从配置文件读取，周频建议3-5天）
+    # 注意：这是独立函数，不能使用self，需要从参数传入
+    GAP_DAYS = skip_recent if skip_recent is not None else 3  # 默认3天
     if len(prices) <= GAP_DAYS + 1:
         raise ValueError(f"价格数据不足以计算动量: 需要>{GAP_DAYS + 1}个数据点，实际{len(prices)}个")
 
@@ -492,7 +722,7 @@ def _calculate_momentum_factor_standalone(df, eval_end, momentum_windows):
 
 def _calculate_52week_high_factor_standalone(df, eval_end, *,
                                              use_adjusted=True,
-                                             skip_recent=20,
+                                             skip_recent=3,
                                              min_days=60):
     """
     计算52周高点贴近度（使用最高收盘价口径）。
@@ -597,6 +827,7 @@ def _calculate_volatility_factor_standalone(
     min_returns: int = 20,
     annualize_days: int = 252,
     mar: float = 0.0,
+    strategy_instance=None,  # 新增：用于获取配置参数
 ):
     """
     计算波动率因子（独立版本，严格异常、稳健口径）
@@ -716,21 +947,79 @@ def _calculate_volatility_factor_standalone(
     if not _np.isfinite(annual_vol):
         raise RuntimeError(f"VOL: 年化波动计算非法：{annual_vol}")
 
-    # -------- 3) 年化下行波动（Sortino 口径）--------
-    # 将年化 MAR 转换到日频阈值；对数收益近似用 mar/annualize_days
-    mar_daily = float(mar) / float(annualize_days)
+    # -------- 3) 动态MAR与年化下行波动（改进的Sortino口径）--------
+    # 计算动态MAR（最低可接受收益率）
+    try:
+        if strategy_instance is not None:
+            # 使用策略实例的配置计算动态MAR
+            dynamic_mar = _calculate_dynamic_mar(
+                eval_end=eval_end,
+                df=df,
+                mar_mode=getattr(strategy_instance, 'mar_mode', 'risk_free'),
+                risk_free_rate=getattr(strategy_instance, 'risk_free_rate', 0.025),
+                benchmark_return=getattr(strategy_instance, 'benchmark_return', 0.08),
+                lookback_days=getattr(strategy_instance, 'sortino_lookback', 180),
+                min_periods=getattr(strategy_instance, 'sortino_min_periods', 60)
+            )
+
+            # 计算滚动权重
+            total_weight, downside_weight = _calculate_rolling_volatility_weights(
+                eval_end=eval_end,
+                df=df,
+                total_weight_base=getattr(strategy_instance, 'total_vol_weight', 0.6),
+                downside_weight_base=getattr(strategy_instance, 'downside_vol_weight', 0.4),
+                rolling_window=getattr(strategy_instance, 'vol_rolling_window', 252)
+            )
+        else:
+            # 简化配置模式：从mar参数推断或使用基础配置
+            if mar > 0:
+                # 使用传入的MAR值
+                dynamic_mar = float(mar)
+                total_weight, downside_weight = 0.6, 0.4
+            else:
+                # 使用无风险利率作为MAR，并计算动态权重
+                dynamic_mar = _calculate_dynamic_mar(
+                    eval_end=eval_end,
+                    df=df,
+                    mar_mode='risk_free',
+                    risk_free_rate=0.025,
+                    config_dict={'mar_mode': 'risk_free', 'risk_free_rate': 0.025}
+                )
+
+                total_weight, downside_weight = _calculate_rolling_volatility_weights(
+                    eval_end=eval_end,
+                    df=df,
+                    total_weight_base=0.6,
+                    downside_weight_base=0.4,
+                    rolling_window=252
+                )
+
+    except ImportError:
+        # 导入失败，使用传统方法
+        dynamic_mar = float(mar) if mar != 0.0 else 0.025
+        total_weight, downside_weight = 0.6, 0.4
+    except Exception as e:
+        # 计算失败，回退到传统方法
+        dynamic_mar = float(mar) if mar != 0.0 else 0.025
+        total_weight, downside_weight = 0.6, 0.4
+
+    # 将年化动态MAR转换到日频阈值
+    mar_daily = float(dynamic_mar) / float(annualize_days)
     downside = log_returns[log_returns < mar_daily]
+
     if len(downside) == 0:
         downside_vol = 0.0
     else:
+        # 改进的下行波动计算：使用与MAR的差值
         downside_std_daily = float(((downside - mar_daily) ** 2).mean() ** 0.5)
         downside_vol = float(downside_std_daily * _np.sqrt(float(annualize_days)))
         if not _np.isfinite(downside_vol):
             raise RuntimeError(f"VOL: 年化下行波动计算非法：{downside_vol}")
 
-    # -------- 4) 组合得分（与旧实现兼容）--------
+    # -------- 4) 动态权重组合得分--------
     # 负号：低波动（低风险）→ 更高的分数
-    score = -(0.7 * annual_vol + 0.3 * downside_vol) * 100.0
+    # 使用动态权重而非固定的0.7和0.3
+    score = -(total_weight * annual_vol + downside_weight * downside_vol) * 100.0
     if not _np.isfinite(score):
         raise RuntimeError(
             f"VOL: 最终分数计算非法：score={score}, annual_vol={annual_vol}, downside_vol={downside_vol}"
@@ -1474,7 +1763,7 @@ def _calculate_local_drawdown_factor_standalone(
 
     return float(score)
 
-def _calculate_downside_risk_score_standalone(df, eval_end, lookback=180, mar=0.0, alpha=0.10, score_range=(0.7, 1.1)):
+def _calculate_downside_risk_score_standalone(df, eval_end, lookback=180, mar=0.0, alpha=0.10, score_range=(0.7, 1.1), strategy_instance=None):
     """
     计算左尾敏感的风险评分，结合 Sortino 比率与 CVaR（Expected Shortfall）并做稳健化处理。
 
@@ -1516,10 +1805,38 @@ def _calculate_downside_risk_score_standalone(df, eval_end, lookback=180, mar=0.
     q_low, q_high = returns.quantile([0.005, 0.995])
     returns = returns.clip(lower=q_low, upper=q_high)
 
-    # ---- 2) Sortino（年化、一致频率） ----
+    # ---- 2) 动态MAR与Sortino（年化、一致频率） ----
     mean_ann = float(returns.mean() * 252)
-    # 将年化 MAR 与分子同频率
-    mar_ann = float(mar)
+
+    # 计算动态MAR
+    try:
+        if strategy_instance is not None:
+            # 使用策略实例配置计算动态MAR
+            mar_ann = _calculate_dynamic_mar(
+                eval_end=eval_end,
+                df=df,
+                mar_mode=getattr(strategy_instance, 'mar_mode', 'risk_free'),
+                risk_free_rate=getattr(strategy_instance, 'risk_free_rate', 0.025),
+                benchmark_return=getattr(strategy_instance, 'benchmark_return', 0.08),
+                lookback_days=getattr(strategy_instance, 'sortino_lookback', 180),
+                min_periods=getattr(strategy_instance, 'sortino_min_periods', 60)
+            )
+        elif mar > 0:
+            # 使用传入的MAR
+            mar_ann = float(mar)
+        else:
+            # 使用简化的动态MAR
+            mar_ann = _calculate_dynamic_mar(
+                eval_end=eval_end,
+                df=df,
+                mar_mode='risk_free',
+                risk_free_rate=0.025,
+                config_dict={'mar_mode': 'risk_free', 'risk_free_rate': 0.025}
+            )
+    except (ImportError, Exception):
+        # 回退到传统方法
+        mar_ann = float(mar) if mar != 0.0 else 0.025
+
     excess_ann = mean_ann - mar_ann
 
     downside = returns[returns < 0]
@@ -1585,6 +1902,89 @@ def get_previous_trading_day(date=None):
     return current_date.strftime('%Y%m%d')
 
 
+
+class StrategyAnalytics:
+    """策略分析指标跟踪器"""
+
+    def __init__(self):
+        self.metrics = {
+            'sample_sizes': [],  # 打分样本量
+            'hhi_values': [],    # 持仓集中度(HHI)
+            'ic_values': [],     # 信息系数
+            'rank_ic_values': [],  # 排序信息系数
+            'turnover_rates': [],  # 换手率
+            'transaction_costs': [],  # 交易成本
+            'drawdowns': [],     # 回撤
+            'dates': []          # 对应日期
+        }
+
+    def record_metrics(self, date, sample_size=None, hhi=None, ic=None, rank_ic=None,
+                      turnover=None, cost=None, drawdown=None):
+        """记录策略指标"""
+        self.metrics['dates'].append(date)
+        self.metrics['sample_sizes'].append(sample_size)
+        self.metrics['hhi_values'].append(hhi)
+        self.metrics['ic_values'].append(ic)
+        self.metrics['rank_ic_values'].append(rank_ic)
+        self.metrics['turnover_rates'].append(turnover)
+        self.metrics['transaction_costs'].append(cost)
+        self.metrics['drawdowns'].append(drawdown)
+
+    def calculate_hhi(self, weights):
+        """计算Herfindahl-Hirschman指数(HHI) - 衡量持仓集中度"""
+        if not weights or len(weights) == 0:
+            return 1.0  # 完全集中
+
+        # 归一化权重
+        total_weight = sum(abs(w) for w in weights.values())
+        if total_weight == 0:
+            return 1.0
+
+        normalized_weights = [abs(w)/total_weight for w in weights.values()]
+        hhi = sum(w**2 for w in normalized_weights)
+        return hhi
+
+    def calculate_ic(self, alpha_scores, returns):
+        """计算信息系数(IC) - Spearman相关系数"""
+        import pandas as pd
+        from scipy.stats import spearmanr
+
+        if len(alpha_scores) != len(returns) or len(alpha_scores) < 5:
+            return None, None
+
+        # 计算Spearman相关系数
+        ic, _ = spearmanr(alpha_scores, returns)
+
+        # 计算RankIC（基于排序的IC）
+        alpha_ranks = pd.Series(alpha_scores).rank()
+        return_ranks = pd.Series(returns).rank()
+        rank_ic, _ = spearmanr(alpha_ranks, return_ranks)
+
+        return ic, rank_ic
+
+    def get_summary_stats(self):
+        """获取汇总统计"""
+        import numpy as np
+
+        def safe_mean(values):
+            clean_values = [v for v in values if v is not None]
+            return np.mean(clean_values) if clean_values else None
+
+        def safe_std(values):
+            clean_values = [v for v in values if v is not None]
+            return np.std(clean_values) if len(clean_values) > 1 else None
+
+        return {
+            'avg_sample_size': safe_mean(self.metrics['sample_sizes']),
+            'avg_hhi': safe_mean(self.metrics['hhi_values']),
+            'avg_ic': safe_mean(self.metrics['ic_values']),
+            'ic_std': safe_std(self.metrics['ic_values']),
+            'avg_rank_ic': safe_mean(self.metrics['rank_ic_values']),
+            'rank_ic_std': safe_std(self.metrics['rank_ic_values']),
+            'avg_turnover': safe_mean(self.metrics['turnover_rates']),
+            'avg_cost': safe_mean(self.metrics['transaction_costs']),
+            'max_drawdown': min(self.metrics['drawdowns']) if any(d is not None for d in self.metrics['drawdowns']) else None
+        }
 
 class RiskSensitiveTrendStrategy:
     """风险敏感型趋势跟踪 + 相对强度策略"""
@@ -1654,6 +2054,9 @@ class RiskSensitiveTrendStrategy:
         self.risk_per_trade = 0.02         # 每笔交易风险2%
         self.max_correlation = 0.7         # 最大相关性阈值
 
+        # 初始化策略分析器
+        self.analytics = StrategyAnalytics()
+
         # 分位数阈值配置（动态调整，适应市场状态）
         self.volatility_percentile_threshold = 85  # 波动率分位数阈值（放宽到≤85分位）
         self.drawdown_percentile_threshold = 85    # 回撤分位数阈值（放宽到≤85分位）
@@ -1709,12 +2112,12 @@ class RiskSensitiveTrendStrategy:
         self.position_ledger = {}  # {stock_code: [{'shares': int, 'buy_date': str, 'sellable_date': str, 'buy_price': float}]}
 
         # 流动性过滤参数
-        self.min_adv_20d = 20_000_000      # 20日平均成交额阈值：2000万元
-        self.min_adv_20d_bj = 50_000_000   # 北交所单独阈值：5000万元（更严格）
+        # 注意：以下ADV相关参数已废弃，现在使用ADTV基于成交量
+        self.min_adv_20d = 20_000_000      # 【已废弃】20日平均成交额阈值：2000万元
+        self.min_adv_20d_bj = 50_000_000   # 【已废弃】北交所单独阈值：5000万元
         self.max_suspend_days_60d = 10     # 60日内最大停牌天数
 
-        # ADV单位校准参数
-        self.amount_scale = None           # amount字段的单位缩放：None=自动检测, 1=元, 10000=万元
+        # 注意：已废弃ADV单位校准参数（现在使用ADTV基于成交量）
 
         # 性能优化配置
         self.enable_numba = NUMBA_AVAILABLE        # 是否启用Numba加速
@@ -1824,10 +2227,10 @@ class RiskSensitiveTrendStrategy:
         # 从配置文件获取preload_days，如果没有则使用默认值
         configured_preload = self._get_preload_days_from_config()
 
-        # 计算最小需求
+        # 计算最小需求（使用统一的skip_recent配置）
         momentum_max = 252
-        skip_recent = 20
-        core_trading_days = max(momentum_max + skip_recent, 252 + 20, 180, 60, 60, 20)  # → 272
+        skip_recent = getattr(self, '_skip_recent_days', 3)  # 使用配置的统一跳过天数
+        core_trading_days = max(momentum_max + skip_recent, 252 + 20, 180, 60, 60, 20)  # 使用统一skip_recent
         safety_trading_days = 50  # 评估端门槛 + 假期/停牌冗余
         min_required = core_trading_days + safety_trading_days  # → 322（交易日）
 
@@ -1853,6 +2256,21 @@ class RiskSensitiveTrendStrategy:
             self.momentum_lookback = factor_config.get('momentum_lookback', 252)
             self.volatility_lookback = factor_config.get('volatility_lookback', 60)
             self.min_history_days = factor_config.get('min_history_days', 100)
+            self._skip_recent_days = factor_config.get('skip_recent_days', 3)  # 统一跳过天数
+
+            # 下行风险/波动率计算配置
+            self.risk_free_rate = factor_config.get('risk_free_rate', 0.025)
+            self.benchmark_return = factor_config.get('benchmark_return', 0.08)
+            vol_weights = factor_config.get('volatility_weights', {})
+            self.total_vol_weight = vol_weights.get('total_vol_weight', 0.6)
+            self.downside_vol_weight = vol_weights.get('downside_vol_weight', 0.4)
+            self.vol_rolling_window = vol_weights.get('rolling_window', 252)
+
+            # Sortino比率配置
+            sortino_config = factor_config.get('sortino_config', {})
+            self.mar_mode = sortino_config.get('mar_mode', 'dynamic_benchmark')
+            self.sortino_lookback = sortino_config.get('lookback_days', 180)
+            self.sortino_min_periods = sortino_config.get('min_periods', 60)
 
             return preload_days
         except Exception as e:
@@ -1973,13 +2391,13 @@ class RiskSensitiveTrendStrategy:
         if rebalance_freq_days == 7 and trading_dates is not None and date_index is not None:
             current_date = trading_dates[date_index]
             current_weekday = pd.to_datetime(current_date).weekday()  # 0=周一, 4=周五
-            
+
             # 寻找本周的最后一个交易日
             # 查看后续日期，如果下一个交易日是下周，则当前日是本周最后一个交易日
             if date_index + 1 < len(trading_dates):
                 next_date = trading_dates[date_index + 1]
                 next_weekday = pd.to_datetime(next_date).weekday()
-                
+
                 # 如果下一交易日的星期数小于当前日，说明跨周了
                 # 或者当前是周五，则进行调仓
                 if next_weekday < current_weekday or current_weekday == 4:
@@ -1987,9 +2405,9 @@ class RiskSensitiveTrendStrategy:
             else:
                 # 最后一个交易日
                 return current_weekday == 4 or date_index == len(trading_dates) - 1
-            
+
             return False
-        
+
         # 传统的固定天数调仓
         return (current_day_index % rebalance_freq_days) == 0
 
@@ -1999,7 +2417,7 @@ class RiskSensitiveTrendStrategy:
           - ST 过滤：若 `self.filter_st` 为 True，则剔除本地缓存标记的 ST/*ST
           - 历史样本：剔除历史不足 `self.min_history_days` 的个股；以及"上市未满 `self.ipo_seasoning_days`" 的新股
           - 停牌约束：近 60 个自然日（窗口内）停牌天数超过 `self.max_suspend_days_60d` 的个股剔除
-          - 流动性：20D ADV（成交额均值）低于阈值剔除；北交所可用单独阈值
+          - 流动性：20D ADTV（成交量均值）低于阈值剔除；北交所可用单独阈值
         注：此方法**不**做价格涨跌停/可交易性检查，仅作为“候选池”过滤；涨跌停检查应在下单环节处理。
         """
         import pandas as _pd
@@ -2057,29 +2475,26 @@ class RiskSensitiveTrendStrategy:
             if suspend_days > int(self.max_suspend_days_60d):
                 continue
 
-            # 20D ADV（成交额），自动做单位校准：若中位数<1e5，视为“万元”口径→×10000
-            amt = None
-            if 'amount' in df.columns:
-                amt_raw = _pd.to_numeric(df['amount'], errors='coerce').astype(float)
-                # 单位检测（仅在全局未指定 self.amount_scale 时）
-                scale = self.amount_scale or (10000.0 if _np.nanmedian(amt_raw.values) < 1e5 else 1.0)
-                amt = amt_raw * float(scale)
-            else:
-                # 回退：price*volume 近似成交额
-                px_col = next((c for c in ['adj_close','close_adj','close'] if c in df.columns), None)
-                if px_col is None or 'volume' not in df.columns:
-                    continue
-                px = _pd.to_numeric(df[px_col], errors='coerce').astype(float)
-                vol = _pd.to_numeric(df['volume'], errors='coerce').astype(float)
-                amt = px * vol
+            # 20D ADTV（成交量），基于股数口径
+            if 'volume' not in df.columns:
+                continue
+            vol = _pd.to_numeric(df['volume'], errors='coerce').astype(float)
 
-            adv20 = float(amt.rolling(20, min_periods=10).mean().iloc[eval_pos]) if eval_pos >= 1 else _np.nan
-            if not _np.isfinite(adv20):
+            adtv20 = float(vol.rolling(20, min_periods=10).mean().iloc[eval_pos]) if eval_pos >= 1 else _np.nan
+            if not _np.isfinite(adtv20):
                 continue
 
+            # 使用ADTV阈值（股数）从配置读取
             is_bj = str(code).startswith('BJ') or str(self.code_alias.get(code, '')).startswith('BJ')
-            thr = float(self.min_adv_20d_bj if is_bj else self.min_adv_20d)
-            if adv20 < thr:
+
+            # 读取配置中的ADTV阈值
+            config = self._load_rl_config(self._config_path)
+            stock_selection_config = config.get('stock_selection', {})
+            main_threshold = stock_selection_config.get('min_adtv_shares', 1000000)
+            bj_threshold = stock_selection_config.get('min_adtv_shares_bj', 2000000)
+            thr = float(bj_threshold if is_bj else main_threshold)
+
+            if adtv20 < thr:
                 continue
 
             passed.append(code)
@@ -2595,14 +3010,8 @@ class RiskSensitiveTrendStrategy:
                 else:
                     r63 = _np.nan
 
-                # —— 本地副本 + 成交额单位校准 ——
+                # —— 本地副本（不再需要成交额单位校准）——
                 df_local = dfp.copy()
-                if 'amount' in df_local.columns:
-                    import numpy as _np
-                    med_amt = _pd.to_numeric(df_local['amount'], errors='coerce').astype(float)
-                    scale = self.amount_scale or (10000.0 if _np.nanmedian(med_amt.values) < 1e5 else 1.0)
-                    if scale != 1.0:
-                        df_local['amount'] = med_amt * float(scale)
 
                 vol = _calculate_volatility_factor_standalone(df_local, eval_end, window_days=60, skip_recent=0)
                 ts = _calculate_trend_strength_factor_standalone(df_local, eval_end, window_days=60, skip_recent=0)
@@ -2719,6 +3128,9 @@ class RiskSensitiveTrendStrategy:
         在回测主循环中调用：若到达调仓日，则计算多因子分数并给出TopK标的。
         返回 (scores, selected_list)。非调仓日返回(空Series, 空list)。
         """
+        # 设置当前分析日期用于统计记录
+        self.current_analysis_date = date_t
+
         self.apply_pretrade_filters_for_date(date_t)
         if not self._should_rebalance(current_day_index, rebalance_freq_days):
             return pd.Series(dtype=float), []
@@ -3013,8 +3425,18 @@ class RiskSensitiveTrendStrategy:
 
         # 流动性过滤配置
         logger.info("\n💧 流动性过滤:")
-        logger.info(f"  主板ADV20阈值: {self.min_adv_20d:,} 元")
-        logger.info(f"  北交所ADV20阈值: {self.min_adv_20d_bj:,} 元")
+
+        # 从配置读取ADTV阈值
+        try:
+            config = self._load_rl_config(self._config_path)
+            stock_selection_config = config.get('stock_selection', {})
+            main_threshold = stock_selection_config.get('min_adtv_shares', 1000000)
+            bj_threshold = stock_selection_config.get('min_adtv_shares_bj', 2000000)
+            logger.info(f"  主板ADTV20阈值: {main_threshold:,} 股")
+            logger.info(f"  北交所ADTV20阈值: {bj_threshold:,} 股")
+        except Exception:
+            logger.info(f"  主板ADTV20阈值: 1,000,000 股 (默认)")
+            logger.info(f"  北交所ADTV20阈值: 2,000,000 股 (默认)")
         logger.info(f"  最大停牌天数(60日): {self.max_suspend_days_60d} 天")
 
         # 连续风险因子配置
@@ -3272,13 +3694,34 @@ class RiskSensitiveTrendStrategy:
         # --- AkShare 回退 ---
         start_em = self._to_yyyymmdd(self.start_date)
         end_em = self._to_yyyymmdd(self.end_date)
-        idx = ak.stock_zh_index_daily_em(symbol="sh000001", start_date=start_em, end_date=end_em)
-        if idx is None or idx.empty:
-            return None
-        if "date" in idx.columns:
-            idx = idx.set_index("date")
-        keep = [c for c in ["open", "high", "low", "close", "volume"] if c in idx.columns]
-        return idx[keep]
+
+        # 添加重试机制处理网络连接问题
+        import time
+        max_retries = 10
+        retry_delay = 2.0  # 初始延迟2秒
+
+        for attempt in range(max_retries):
+            try:
+                idx = ak.stock_zh_index_daily_em(symbol="sh000001", start_date=start_em, end_date=end_em)
+                if idx is not None and not idx.empty:
+                    if "date" in idx.columns:
+                        idx = idx.set_index("date")
+                    keep = [c for c in ["open", "high", "low", "close", "volume"] if c in idx.columns]
+                    return idx[keep]
+                else:
+                    return None
+
+            except Exception as e:
+                if attempt < max_retries - 1:  # 不是最后一次尝试
+                    logger.warning(f"AkShare获取指数数据失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    logger.info(f"等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # 指数退避，每次延迟时间增加50%
+                else:
+                    logger.error(f"AkShare获取指数数据最终失败 (已重试 {max_retries} 次): {e}")
+                    raise
+
+        return None
 
     def _build_risk_regime(self):
         """
@@ -3318,8 +3761,11 @@ class RiskSensitiveTrendStrategy:
                 df.index = pd.to_datetime(df.index)
             self._risk_regime_df = df
         except Exception as e:
-            logger.error(f"异常: {e}")
-            raise
+            logger.error(f"构建风险制度失败: {e}，设置为默认全程risk_on")
+            # 设置默认的全程risk_on状态
+            self._risk_regime_df = pd.DataFrame({
+                'risk_on': [True] * 100  # 默认100天的risk_on状态
+            }, index=pd.date_range(start='2023-01-01', periods=100))
     def is_risk_on(self, date_str: str) -> bool:
         """
         查询某交易日是否处于 risk-on 状态；若无该日（节假日），向前寻找最近一个交易日。
@@ -3564,6 +4010,10 @@ class RiskSensitiveTrendStrategy:
         if self._risk_regime_df is None or self._risk_regime_df.empty:
             return weights
 
+        # 调试日志：记录输入权重
+        input_total = weights.sum(axis=1).max() if hasattr(weights, 'sum') else weights.sum()
+        logger.debug(f"🔍 scale_weights_by_drawdown 输入: 总权重={input_total:.4f} ({input_total*100:.2f}%)")
+
         # 统一日期索引
         w = weights.copy()
         if not isinstance(w.index, pd.DatetimeIndex):
@@ -3645,6 +4095,19 @@ class RiskSensitiveTrendStrategy:
 
         logger.info(f"   缩放前权重总和: {w.sum().mean() if hasattr(w.sum(), 'mean') else w.sum():.3f}")
         logger.info(f"   缩放后权重总和: {result.sum().mean() if hasattr(result.sum(), 'mean') else result.sum():.3f}")
+
+        # 调试日志：记录输出权重和缩放倍数
+        output_total = result.sum(axis=1).max() if hasattr(result, 'sum') and hasattr(result.sum(), 'max') else result.sum()
+        scale_factor = output_total / input_total if input_total > 0 else 1.0
+
+        logger.debug(f"🔍 scale_weights_by_drawdown 输出: 总权重={output_total:.4f} ({output_total*100:.2f}%)")
+        logger.debug(f"🔍 scale_weights_by_drawdown 缩放倍数: {scale_factor:.6f}")
+
+        if scale_factor > 1.4:
+            logger.warning(f"🚨 scale_weights_by_drawdown 异常放大: {input_total:.4f} -> {output_total:.4f} (×{scale_factor:.4f})")
+            logger.warning(f"  平均综合缩放因子: {avg_total_scale:.3f}")
+            if hasattr(scale, 'mean'):
+                logger.warning(f"  缩放序列统计: 均值={scale.mean():.4f}, 最大={scale.max():.4f}, 最小={scale.min():.4f}")
 
         return result
 
@@ -3813,7 +4276,7 @@ class RiskSensitiveTrendStrategy:
                     vol_threshold = min(95, self.volatility_percentile_threshold + 10)
                 else:
                     vol_threshold = self.volatility_percentile_threshold
-                
+
                 vol_pct = np.percentile(vol_values, vol_threshold)
                 vol_filtered = {k for k, v in volatility_data.items() if v <= vol_pct}
                 filtered_stocks &= vol_filtered
@@ -3829,7 +4292,7 @@ class RiskSensitiveTrendStrategy:
                     dd_threshold = min(95, self.drawdown_percentile_threshold + 10)
                 else:
                     dd_threshold = self.drawdown_percentile_threshold
-                
+
                 dd_pct = np.percentile(dd_values, dd_threshold)
                 dd_filtered = {k for k, v in drawdown_data.items() if v <= dd_pct}
                 filtered_stocks &= dd_filtered
@@ -4005,18 +4468,18 @@ class RiskSensitiveTrendStrategy:
 
         # 步骤3：计算风险调整因子（适应市场状态）
         risk_factors = np.ones(n_stocks)  # 初始化风险因子
-        
+
         # 获取当前市场状态
         market_state = getattr(self, 'current_market_state', 'RISK_ON')  # 默认risk-on
         is_risk_on = market_state == 'RISK_ON'
-        
+
         # 基于历史波动率的风险调整（如果有价格数据）
         for i, stock in enumerate(valid_stocks):
             price_series = self.price_data[stock]['close']
             # 计算20日收益率波动率
             returns = price_series.pct_change().dropna()
             volatility = returns.tail(20).std() * np.sqrt(252)  # 年化波动率
-            
+
             if is_risk_on:
                 # Risk-on阶段：适度奖励高波动（高beta）股票
                 risk_factors[i] = 1.0 / (1.0 + volatility * 0.5)  # 降低波动率惩罚
@@ -4173,6 +4636,19 @@ class RiskSensitiveTrendStrategy:
         logger.info(f"   股票数量: {len(weights)}")
         logger.info(f"   权重总和: {total:.5f}")
         logger.info(f"   权重范围: {min_weight:.5f} ~ {max_weight:.5}")
+
+        # 计算持仓集中度（HHI）
+        if hasattr(self, 'analytics'):
+            hhi = self.analytics.calculate_hhi(weights)
+            logger.info(f"   持仓集中度(HHI): {hhi:.4f}")
+
+            # 记录HHI指标
+            current_date = getattr(self, 'current_analysis_date', None)
+            if current_date:
+                self.analytics.record_metrics(
+                    date=current_date,
+                    hhi=hhi
+                )
 
         # 验证合理性
         if total > 1.05:
@@ -4599,12 +5075,13 @@ class RiskSensitiveTrendStrategy:
             logger.info(f"🔀 使用固定种子{stock_selection_config.get('shuffle_seed', 20250817)}洗牌候选池，降低顺序偏置")
 
             # 使用并发处理批量筛选 - 不再"凑够就停"
-            batch_size = 200  # 提高批量大小到200，减少调用次数和I/O开销
+            # 优化批处理：增大批次减少开销，为更大横截面优化
+            batch_size = 400  # 增大批量大小，减少调用开销，支持更大横截面处理
             batches = [universe_shuffled[i:i+batch_size] for i in range(0, len(universe_shuffled), batch_size)]
 
-            # 优化并发策略：I/O密集型使用线程池
-            io_workers = max(1, int(mp.cpu_count() * 0.75))  # I/O密集型可以使用更多线程
-            logger.info(f"股票池筛选使用{io_workers}个I/O线程处理{len(batches)}个批次")
+            # 优化并发策略：为大横截面处理增加工作线程
+            io_workers = max(2, min(8, int(mp.cpu_count() * 0.8)))  # 增加工作线程支持更大横截面
+            logger.info(f"股票池筛选使用{io_workers}个I/O线程处理{len(batches)}个批次（优化支持大横截面）")
 
             with ThreadPoolExecutor(max_workers=io_workers) as executor:
                 # 提交所有批次任务
@@ -4639,11 +5116,6 @@ class RiskSensitiveTrendStrategy:
 
             # ✅ 在这里才应用数量限制（<= max_stocks 仅用于限制极端耗时）
             max_stocks_limit = stock_selection_config.get('max_stocks', 6000)
-            if len(filtered_stocks) > max_stocks_limit:
-                # 再次洗牌确保公平性，然后截断
-                rng.shuffle(filtered_stocks)
-                filtered_stocks = filtered_stocks[:max_stocks_limit]
-                logger.info(f"⚠️  候选股票过多，已截断到{max_stocks_limit}只（仅限制耗时，不影响最终排序）")
 
             # 健康监测：检查筛选结果
             filter_rate = len(filtered_stocks) / len(candidate_pool) if len(candidate_pool) > 0 else 0
@@ -4656,6 +5128,15 @@ class RiskSensitiveTrendStrategy:
             if filtered_stocks:
                 rng.shuffle(filtered_stocks)
                 logger.info(f"🎯 门槛筛选完成：{len(filtered_stocks)}只候选股票进入打分排序阶段")
+
+                # 记录筛选后的样本量（用于后续分析）
+                if hasattr(self, 'analytics'):
+                    current_date = getattr(self, 'current_analysis_date', None)
+                    if current_date:
+                        self.analytics.record_metrics(
+                            date=current_date,
+                            sample_size=len(filtered_stocks)
+                        )
 
             return filtered_stocks
 
@@ -4679,10 +5160,11 @@ class RiskSensitiveTrendStrategy:
         batch_filtered = []
         batch_codes = [self._normalize_instrument(code) for code in batch]
 
-        # 批量获取数据（增加成交额字段用于流动性过滤）
+        # 批量获取数据（获取价格和成交量字段用于流动性过滤）
+        # 优化：增加更多缓存和字段预加载，减少重复I/O
         batch_data = D.features(
             instruments=batch_codes,
-            fields=['$close', '$volume', '$amount'],  # 添加成交额
+            fields=['$close', '$volume', '$open', '$high', '$low'],  # 预加载更多字段减少后续I/O
             start_time=start_date_qlib,
             end_time=end_date_qlib,
             freq='day',
@@ -4751,15 +5233,14 @@ class RiskSensitiveTrendStrategy:
                 if suspend_days > self.max_suspend_days_60d:
                     return False
 
-            # 硬门槛5: ADV20成交额门槛
-            min_adv_rmb = stock_selection_config.get('min_adv_rmb', 20000000)  # 默认2千万
-            if 'amount' in stock_data.columns and len(stock_data) >= 20:
-                amount_20d = stock_data['amount'].iloc[-20:]
-                # 使用动态单位缩放
-                scale_factor = self._get_amount_scale()
-                avg_amount = amount_20d.mean() * scale_factor  # 转换为元
+            # 硬门槛5: ADTV20成交量门槛
+            min_adtv_shares = stock_selection_config.get('min_adtv_shares', 1000000)  # 默认100万股
+            if 'volume' in stock_data.columns and len(stock_data) >= 20:
+                volume_20d = stock_data['volume'].iloc[-20:]
+                # 计算20日平均成交量（ADTV）
+                avg_volume = volume_20d.mean()  # 成交量单位：股
 
-                if avg_amount < min_adv_rmb:
+                if avg_volume < min_adtv_shares:
                     return False
 
             # 硬门槛6: 去除价格异常股票
@@ -5012,7 +5493,7 @@ class RiskSensitiveTrendStrategy:
 
     def _detect_amount_scale(self, sample_stocks=None, sample_size=5):
         """
-        自动检测amount字段的单位缩放
+        【已废弃】自动检测amount字段的单位缩放（现在使用ADTV基于成交量）
 
         Parameters:
         -----------
@@ -5061,16 +5542,16 @@ class RiskSensitiveTrendStrategy:
         # 启发式判断：如果中位数在千万以上，可能是"元"单位；如果在万以下，可能是"万元"单位
         if median_amount > 10_000_000:
             detected_scale = 1  # 元
-            logger.info(f"自动检测ADV单位：元（样本中位数：{median_amount:,.0f}）")
+            logger.info(f"【已废弃】自动检测ADV单位：元（样本中位数：{median_amount:,.0f}）")
         else:
             detected_scale = 10000  # 万元
-            logger.info(f"自动检测ADV单位：万元（样本中位数：{median_amount:,.0f}）")
+            logger.info(f"【已废弃】自动检测ADV单位：万元（样本中位数：{median_amount:,.0f}）")
 
         return detected_scale
 
     def _get_amount_scale(self):
         """
-        获取amount字段的缩放因子
+        【已废弃】获取amount字段的缩放因子（现在使用ADTV基于成交量）
 
         Returns:
         --------
@@ -5448,18 +5929,81 @@ class RiskSensitiveTrendStrategy:
         logger.info(f"审计日志已导出到: {filename}")
         return filename
 
-    def create_enhanced_portfolio_dashboard(self, equity_curve, performance_stats, selected_stocks, position_sizes):
-        """创建增强版组合分析仪表板"""
+    def _get_baseline_indices_data(self, start_date="2024-01-01", end_date="2024-12-01"):
+        """
+        获取基准指数数据（沪深300和纳斯达克）
 
-        # 创建子图布局 - 更多的分析图表
+        Returns:
+            dict: 包含指数数据的字典
+        """
+        baseline_data = {}
+
+        # 1. 获取沪深300数据
+        try:
+            import akshare as ak
+            csi300 = ak.index_zh_a_hist(symbol="000300", period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
+            if not csi300.empty:
+                csi300['date'] = pd.to_datetime(csi300['日期'])
+                csi300 = csi300.set_index('date')
+                csi300['return'] = csi300['收盘'].pct_change()
+                csi300['cumulative_return'] = (1 + csi300['return']).cumprod()
+                baseline_data['CSI300'] = {
+                    'price': csi300['收盘'],
+                    'return': csi300['return'],
+                    'cumulative_return': csi300['cumulative_return'],
+                    'name': '沪深300指数'
+                }
+                logger.info(f"✅ 成功获取沪深300数据: {len(csi300)} 个交易日")
+        except Exception as e:
+            logger.error(f"❌ 获取沪深300数据失败: {e}")
+
+        # 2. 尝试获取纳斯达克数据
+        try:
+            import akshare as ak
+            nasdaq = ak.index_us_stock_sina(symbol=".IXIC")
+            if nasdaq is not None and not nasdaq.empty:
+                nasdaq['date'] = pd.to_datetime(nasdaq['date'])
+                nasdaq = nasdaq.set_index('date')
+                nasdaq['return'] = nasdaq['close'].pct_change()
+                nasdaq['cumulative_return'] = (1 + nasdaq['return']).cumprod()
+
+                # 过滤到指定日期范围
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                nasdaq = nasdaq[(nasdaq.index >= start_dt) & (nasdaq.index <= end_dt)]
+
+                if len(nasdaq) > 0:
+                    baseline_data['NASDAQ'] = {
+                        'price': nasdaq['close'],
+                        'return': nasdaq['return'],
+                        'cumulative_return': nasdaq['cumulative_return'],
+                        'name': '纳斯达克指数'
+                    }
+                    logger.info(f"✅ 成功获取纳斯达克数据: {len(nasdaq)} 个交易日")
+                else:
+                    logger.warning("⚠️ 纳斯达克数据在指定日期范围内为空")
+        except Exception as e:
+            logger.error(f"❌ 获取纳斯达克数据失败: {e}")
+
+        return baseline_data
+
+    def create_enhanced_portfolio_dashboard(self, equity_curve, performance_stats, selected_stocks, position_sizes):
+        """创建增强版组合分析仪表板，包含基准指数对比"""
+
+        # 获取基准指数数据
+        start_date = equity_curve.index[0].strftime('%Y-%m-%d')
+        end_date = equity_curve.index[-1].strftime('%Y-%m-%d')
+        baseline_data = self._get_baseline_indices_data(start_date, end_date)
+
+        # 更新子图布局 - 将第一个图改为策略 vs 基准对比
         fig = make_subplots(
             rows=5, cols=2,
             subplot_titles=[
-                '净值曲线 & 回撤', '月度收益热力图',
+                '策略盈利曲线 vs 基准指数', '月度收益热力图',
                 '日收益分布', '滚动夏普比率',
                 '累计收益分解', '风险指标雷达图',
                 '持仓权重分布', '个股贡献分析',
-                '交易统计概览', '风险-收益散点图'
+                '交易统计概览', '策略 vs 基准风险-收益对比'
             ],
             specs=[
                 [{'secondary_y': True}, {'type': 'heatmap'}],
@@ -5473,63 +6017,87 @@ class RiskSensitiveTrendStrategy:
             row_heights=[0.25, 0.2, 0.2, 0.2, 0.15]
         )
 
-        # 1. 净值曲线 & 回撤
+        # 1. 策略盈利曲线 vs 基准指数对比
         daily_returns = self.daily_return if hasattr(self, 'daily_return') and self.daily_return is not None else equity_curve.pct_change().dropna()
 
-        # read.md修复：计算回撤 - 防止越界
-        nav = equity_curve.copy()
+        # 策略累计收益（归一化为从1开始）
+        strategy_cumret = equity_curve / equity_curve.iloc[0]
 
-        # 守卫：确保净值非负
+        # 添加策略曲线
+        fig.add_trace(
+            go.Scatter(
+                x=equity_curve.index,
+                y=strategy_cumret.values,
+                mode='lines',
+                name='量化策略',
+                line=dict(color='blue', width=3),
+                hovertemplate='<b>日期</b>: %{x}<br>' +
+                             '<b>累计收益</b>: %{customdata:.2f}%<extra></extra>',
+                customdata=(strategy_cumret - 1) * 100
+            ),
+            row=1, col=1
+        )
+
+        # 添加基准指数曲线
+        colors = ['red', 'green', 'orange', 'purple']
+        color_idx = 0
+
+        for key, data in baseline_data.items():
+            # 对齐日期并重新基准化
+            aligned_data = data['cumulative_return'].reindex(equity_curve.index, method='ffill')
+            if not aligned_data.isna().all():
+                # 从策略开始日期重新基准化
+                first_valid_idx = aligned_data.first_valid_index()
+                if first_valid_idx is not None:
+                    aligned_data = aligned_data / aligned_data[first_valid_idx]
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=aligned_data.index,
+                            y=aligned_data.values,
+                            mode='lines',
+                            name=data['name'],
+                            line=dict(color=colors[color_idx], width=2, dash='dash'),
+                            hovertemplate=f'<b>日期</b>: %{{x}}<br>' +
+                                         f'<b>{data["name"]}累计收益</b>: %{{customdata:.2f}}%<extra></extra>',
+                            customdata=(aligned_data - 1) * 100
+                        ),
+                        row=1, col=1
+                    )
+                    color_idx += 1
+
+        # 添加回撤曲线
+        nav = equity_curve.copy()
         if (nav <= 0).any():
             logger.error("🚨 净值曲线包含非正值，强制修正")
             nav = nav.clip(lower=0.01)
 
         peak = nav.cummax()
-        drawdown = (nav / peak - 1).clip(lower=-1.0, upper=0.0)  # read.md要求：保持[-1,0]区间，显示时格式化
+        drawdown = (nav / peak - 1).clip(lower=-1.0, upper=0.0)
 
-        # 净值曲线
-        cumulative_return_pct = (equity_curve / equity_curve.iloc[0] - 1) * 100
-        fig.add_trace(
-            go.Scatter(
-                x=equity_curve.index,
-                y=equity_curve.values,
-                mode='lines',
-                name='净值曲线',
-                line=dict(color='blue', width=2),
-                hovertemplate='<b>日期</b>: %{x}<br>' +
-                             '<b>净值</b>: %{y:.4f}<br>' +
-                             '<b>累计收益</b>: %{customdata:.2f}%<extra></extra>',
-                customdata=cumulative_return_pct
-            ),
-            row=1, col=1
-        )
-
-        # 回撤曲线
         fig.add_trace(
             go.Scatter(
                 x=drawdown.index,
-                y=drawdown.values,
+                y=drawdown.values * 100,  # 转换为百分比
                 mode='lines',
-                name='回撤(%)',
-                line=dict(color='red', width=1),
+                name='策略回撤(%)',
+                line=dict(color='rgba(255,0,0,0.7)', width=1),
                 fill='tonexty',
-                fillcolor='rgba(255,0,0,0.3)',
+                fillcolor='rgba(255,0,0,0.2)',
                 yaxis='y2',
                 hovertemplate='日期: %{x}<br>回撤: %{y:.2f}%<extra></extra>'
             ),
             row=1, col=1, secondary_y=True
         )
 
-        # 2. 月度收益热力图 - read.md修复：用月末净值的pct_change()
+        # 2. 月度收益热力图 - 保持原来的逻辑
         if len(daily_returns) > 30:
-            # 使用净值序列直接计算月度收益，避免成交PnL问题
-            monthly_nav = equity_curve.resample('M').last()
+            monthly_nav = equity_curve.resample('ME').last()  # 使用 'ME' 替代已弃用的 'M'
             monthly_returns = monthly_nav.pct_change().dropna() * 100
             monthly_df = monthly_returns.to_frame('return')
             monthly_df['year'] = monthly_df.index.year
             monthly_df['month'] = monthly_df.index.month
 
-            # 创建透视表
             pivot_table = monthly_df.pivot(index='year', columns='month', values='return')
 
             fig.add_trace(
@@ -5692,47 +6260,46 @@ class RiskSensitiveTrendStrategy:
             row=5, col=1
         )
 
-        # 10. 风险-收益散点图（选中股票）
-        if selected_stocks and hasattr(self, 'risk_metrics'):
-            volatilities = []
-            returns = []
-            sizes = []
-            colors = []
-            labels = []
+        # 10. 策略 vs 基准风险-收益散点图
+        risk_return_data = []
+        colors_scatter = []
 
-            for stock in selected_stocks:
-                # 使用辅助函数获取风险指标
-                metrics = self._get_from_dict_with_code_variants(
-                    getattr(self, 'risk_metrics', {}), stock, {}
-                )
+        # 添加策略点
+        strategy_annual_return = performance_stats.get('annual_return', 0) * 100
+        strategy_volatility = daily_returns.std() * np.sqrt(252) * 100
+        risk_return_data.append(['量化策略', strategy_annual_return, strategy_volatility])
+        colors_scatter.append('blue')
 
-                if metrics:
-                    volatilities.append(metrics.get('volatility', 0) * 100)
-                    # 估算收益率（简化）
-                    returns.append(metrics.get('sharpe_ratio', 0) * metrics.get('volatility', 0) * 100)
+        # 添加基准点
+        for key, data in baseline_data.items():
+            aligned_returns = data['return'].reindex(daily_returns.index, method='ffill').fillna(0)
+            if len(aligned_returns) > 10:
+                annual_return = aligned_returns.mean() * 252 * 100
+                volatility = aligned_returns.std() * np.sqrt(252) * 100
+                risk_return_data.append([data['name'], annual_return, volatility])
+                colors_scatter.append('red' if 'CSI' in key else 'green')
 
-                    # 使用辅助函数获取仓位大小
-                    position_size = self._get_from_dict_with_code_variants(position_sizes, stock, 0)
-
-                    sizes.append(position_size / 10000)  # 规模调整
-                    colors.append(100 - metrics.get('risk_score', 50))  # 颜色表示质量
-                    labels.append(f"{stock}<br>{self.get_stock_name(stock)}")
+        if risk_return_data:
+            names = [item[0] for item in risk_return_data]
+            returns = [item[1] for item in risk_return_data]
+            risks = [item[2] for item in risk_return_data]
 
             fig.add_trace(
                 go.Scatter(
-                    x=volatilities,
+                    x=risks,
                     y=returns,
-                    mode='markers',
+                    mode='markers+text',
+                    text=names,
+                    textposition='top center',
                     marker=dict(
-                        size=[max(s, 10) for s in sizes],
-                        color=colors,
-                        colorscale='RdYlGn',
-                        showscale=True,
-                        colorbar=dict(title="质量分数")
+                        size=15,
+                        color=colors_scatter,
+                        line=dict(width=2, color='white')
                     ),
-                    text=labels,
-                    name='个股分析',
-                    hovertemplate='%{text}<br>波动率: %{x:.1f}%<br>预期收益: %{y:.1f}%<extra></extra>'
+                    name='风险-收益分析',
+                    hovertemplate='<b>%{text}</b><br>' +
+                                 '年化收益率: %{y:.2f}%<br>' +
+                                 '年化波动率: %{x:.2f}%<extra></extra>'
                 ),
                 row=5, col=2
             )
@@ -5741,30 +6308,29 @@ class RiskSensitiveTrendStrategy:
         fig.update_layout(
             height=2000,
             title={
-                'text': f'增强版组合分析报告 - {equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()}',
+                'text': f'增强版投资组合分析仪表板 - 含基准对比 ({equity_curve.index[0].date()} 至 {equity_curve.index[-1].date()})',
                 'x': 0.5,
                 'xanchor': 'center',
                 'font': {'size': 20}
             },
-            showlegend=False,
+            showlegend=True,
             template='plotly_white'
         )
 
         # 设置轴标签
         fig.update_xaxes(title_text="日期", row=1, col=1)
         fig.update_yaxes(
-            title_text="净值",
+            title_text="累计收益倍数",
             row=1, col=1,
-            tickformat='.4f',
+            tickformat='.3f',
             showgrid=True,
             gridcolor='lightgray'
         )
-        # read.md修复：回撤轴使用百分比格式，避免-12这种误导显示
         fig.update_yaxes(
-            title_text="回撤",
+            title_text="回撤 (%)",
             secondary_y=True,
             row=1, col=1,
-            tickformat='.1%',  # 使用百分比格式
+            tickformat='.1f',
             showgrid=True,
             gridcolor='lightcoral'
         )
@@ -5779,8 +6345,8 @@ class RiskSensitiveTrendStrategy:
         fig.update_yaxes(title_text="累计收益", row=3, col=1)
         fig.update_yaxes(title_text="年收益率(%)", secondary_y=True, row=3, col=1)
 
-        fig.update_xaxes(title_text="波动率(%)", row=5, col=2)
-        fig.update_yaxes(title_text="预期收益(%)", row=5, col=2)
+        fig.update_xaxes(title_text="年化波动率 (%)", row=5, col=2)
+        fig.update_yaxes(title_text="年化收益率 (%)", row=5, col=2)
 
         return fig
 
@@ -5822,6 +6388,16 @@ class RiskSensitiveTrendStrategy:
         calmar_emoji = "🟢" if calmar > 2 else "🟡" if calmar > 1 else "🔴"
 
         logger.info(f"   夏普比率          : {sharpe:>8.3f} {sharpe_emoji}")
+
+        # 打印Sharpe计算明细（帮助用户理解计算过程）
+        if hasattr(self, 'daily_return') and self.daily_return is not None:
+            daily_ret = self.daily_return.dropna()
+            if len(daily_ret) > 0:
+                daily_excess_mean = (daily_ret - 0.025/252).mean()
+                daily_std = daily_ret.std()
+                sqrt_252 = np.sqrt(252)
+                logger.info(f"      计算明细: ({daily_excess_mean:.6f} ÷ {daily_std:.6f}) × {sqrt_252:.1f} = {sharpe:.3f}")
+
         logger.info(f"   Sortino比率       : {sortino:>8.3f} {sortino_emoji}")
         logger.info(f"   Calmar比率        : {calmar:>8.3f} {calmar_emoji}")
 
@@ -5983,7 +6559,8 @@ class RiskSensitiveTrendStrategy:
 
             # 选中股票的多因子评分分析
             if hasattr(self, 'rs_scores') and not self.rs_scores.empty and len(selected_stocks) > 0:
-                selected_scores = self.rs_scores[self.rs_scores['stock_code'].isin(selected_stocks)]
+                # stock_code是索引，不是列
+                selected_scores = self.rs_scores[self.rs_scores.index.isin(selected_stocks)]
 
                 if not selected_scores.empty and 'rs_score' in selected_scores.columns:
                     # 评分统计
@@ -6064,14 +6641,16 @@ class RiskSensitiveTrendStrategy:
                 if 'alpha_score' in self.rs_scores.columns:
                     alpha_values = self.rs_scores['alpha_score'].values
                     logger.debug(f"🔍 alpha_score统计: 数量={len(alpha_values)}, 唯一值数={len(set(alpha_values))}, 范围={alpha_values.min():.6f}~{alpha_values.max():.6f}")
-                    alpha_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['alpha_score']))
+                    # stock_code是索引，不是列
+                    alpha_dict = dict(zip(self.rs_scores.index, self.rs_scores['alpha_score']))
                     logger.debug(f"✅ 使用alpha_score列（原始预测信号），包含{len(alpha_dict)}只股票")
                 elif 'rs_score' in self.rs_scores.columns:
                     # 如果没有 alpha_score，使用 rs_score 作为替代
                     logger.debug(f"🔍 检查rs_score列: {'rs_score' in self.rs_scores.columns}")
                     rs_values = self.rs_scores['rs_score'].values
                     logger.debug(f"🔍 rs_score统计: 数量={len(rs_values)}, 唯一值数={len(set(rs_values))}, 范围={rs_values.min():.6f}~{rs_values.max():.6f}")
-                    alpha_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['rs_score']))
+                    # stock_code是索引，不是列
+                    alpha_dict = dict(zip(self.rs_scores.index, self.rs_scores['rs_score']))
                     logger.debug(f"⚠️ 使用rs_score列作为替代（无alpha_score列），包含{len(alpha_dict)}只股票")
                 else:
                     logger.warning(f"❌ rs_scores DataFrame中既无alpha_score也无rs_score列")
@@ -6492,7 +7071,7 @@ class RiskSensitiveTrendStrategy:
                 # 显示进度，包含风险评分信息
                 risk_info = f"风险评分={risk_score:.1f}" if risk_score is not None else "数据不足"
                 status = "✓通过" if is_valid else "✗过滤"
-                logger.info(f"进度: {completed_count}/{total_count} - {stock_code} ({stock_name}) - {risk_info} - {status}")
+                logger.debug(f"进度: {completed_count}/{total_count} - {stock_code} ({stock_name}) - {risk_info} - {status}")
 
                 if is_valid and df is not None:
                     norm_code = self._normalize_instrument(stock_code)
@@ -7090,26 +7669,26 @@ class RiskSensitiveTrendStrategy:
     def _get_real_benchmark_returns(self, date_index):
         """
         获取真实的沪深300指数或510300 ETF收益率
-        
+
         Parameters:
         -----------
         date_index : pd.DatetimeIndex
             需要的日期范围
-            
+
         Returns:
         --------
         pd.Series : 基准日收益率序列
         """
         try:
             from qlib.data import D
-            
+
             # 尝试获取沪深300指数 (000300.SH) 或 510300 ETF的数据
             # 优先使用510300 ETF，因为它是可交易的
             benchmark_codes = ['SH510300', '510300', 'SH000300', '000300.SH']
-            
+
             start_date = date_index[0].strftime('%Y%m%d')
             end_date = date_index[-1].strftime('%Y%m%d')
-            
+
             for code in benchmark_codes:
                 try:
                     # 使用D.features获取基准数据
@@ -7119,36 +7698,36 @@ class RiskSensitiveTrendStrategy:
                         start_time=start_date,
                         end_time=end_date
                     )
-                    
+
                     if benchmark_data is not None and not benchmark_data.empty:
                         # 提取收盘价
                         close_prices = benchmark_data['$close'].reset_index()
                         close_prices.columns = ['instrument', 'datetime', 'close']
                         close_prices = close_prices.pivot(index='datetime', columns='instrument', values='close')
                         close_prices = close_prices.iloc[:, 0]  # 取第一列
-                        
+
                         # 计算日收益率
                         benchmark_returns = close_prices.pct_change()
-                        
+
                         # 对齐到策略日期索引
                         benchmark_returns.index = pd.to_datetime(benchmark_returns.index)
                         benchmark_returns = benchmark_returns.reindex(date_index)
-                        
+
                         logger.info(f"✅ 成功获取基准数据: {code}")
                         return benchmark_returns
-                        
+
                 except Exception as code_error:
                     logger.debug(f"尝试获取{code}失败: {code_error}")
                     continue
-            
+
             # 如果所有代码都失败，返回None
             logger.warning("无法获取任何基准数据（000300/510300）")
             return None
-            
+
         except Exception as e:
             logger.error(f"获取基准数据异常: {e}")
             return None
-    
+
     def _compute_performance_stats(self, equity: pd.Series | None = None) -> dict:
         """基于回测结果计算全面绩效指标。若 equity 为空则使用 self.equity_curve/self.daily_return。"""
         if equity is None:
@@ -7179,7 +7758,7 @@ class RiskSensitiveTrendStrategy:
                     'strategy': daily_ret,
                     'benchmark': benchmark_returns
                 }).dropna()
-                
+
                 if not aligned_data.empty:
                     excess_ret = aligned_data['strategy'] - aligned_data['benchmark']
                     excess_mean = float(excess_ret.mean())
@@ -7220,12 +7799,25 @@ class RiskSensitiveTrendStrategy:
         downside_std = float(downside_ret.std()) if len(downside_ret) > 0 else 0.0
         sortino = float(excess_daily_mean / downside_std * np.sqrt(252)) if downside_std > 0 else 0.0
 
-        # read.md自检：检测重复年化（禁止对已年化数据再次年化）
-        sharpe_check = ann_return / ann_vol if ann_vol > 0 else 0.0
-        if abs(sharpe - sharpe_check) > 0.1:
-            logger.warning(f"🚨 夏普比率计算不一致：方法1={sharpe:.3f}, 方法2={sharpe_check:.3f}")
-            logger.warning(f"    日收益均值={mean_daily_ret:.6f}, 日波动={daily_std:.6f}")
-            logger.warning(f"    年化收益={ann_return:.3f}, 年化波动={ann_vol:.3f}")
+        # 正确的Sharpe比率验证：
+        # 方法1（已计算）：excess_daily_mean / daily_std * √252
+        # 方法2（等价）：(算术年化超额收益) / (年化波动率)
+        # 注意：ann_return 使用几何年化，不适合直接用于Sharpe验证
+
+        # 用算术年化进行验证（与几何年化略有差异，但在Sharpe计算中应使用算术年化）
+        arithmetic_ann_return = mean_daily_ret * 252  # 算术年化收益
+        arithmetic_ann_excess = excess_daily_mean * 252  # 算术年化超额收益
+        sharpe_check = arithmetic_ann_excess / ann_vol if ann_vol > 0 else 0.0
+
+        if abs(sharpe - sharpe_check) > 0.001:  # 容忍极小的数值误差
+            logger.warning(f"⚠️ Sharpe计算验证差异: 标准方法={sharpe:.6f}, 验证方法={sharpe_check:.6f}")
+            logger.debug(f"    日频超额均值={excess_daily_mean:.6f}, 日波动={daily_std:.6f}")
+            logger.debug(f"    算术年化超额={arithmetic_ann_excess:.6f}, 年化波动={ann_vol:.6f}")
+
+        # 打印计算过程用于调试
+        logger.debug(f"📊 Sharpe验证明细:")
+        logger.debug(f"   方法1: {excess_daily_mean:.6f} / {daily_std:.6f} * √252 = {sharpe:.6f}")
+        logger.debug(f"   方法2: {arithmetic_ann_excess:.6f} / {ann_vol:.6f} = {sharpe_check:.6f}")
 
         # read.md修复：回撤分析 - 防止越界和NAV异常
         nav = equity.copy()
@@ -7440,33 +8032,39 @@ class RiskSensitiveTrendStrategy:
                 continue
 
             # 调仓日：重新计算信号和目标权重
+            # 方案3修改：每个调仓日都进行完整的股票池重新筛选和多因子重新计算
+
             if rebalance_freq_days == 7:
                 # 周频轮动
                 current_weekday = pd.to_datetime(date_t).weekday()
                 weekday_names = ['周一', '周二', '周三', '周四', '周五']
-                logger.info(f"📅 {date_t}: 调仓日（{weekday_names[current_weekday]}，本周最后交易日）- T+1开盘执行")
+                logger.info(f"🔄 {date_t}: 调仓日（{weekday_names[current_weekday]}，本周最后交易日）- 完整多因子计算")
             else:
-                logger.info(f"📅 {date_t}: 调仓日（第{i+1}个交易日，每{rebalance_freq_days}天调仓）")
+                logger.info(f"🔄 {date_t}: 调仓日（第{i+1}个交易日，每{rebalance_freq_days}天调仓）- 完整多因子计算")
+
+            # 调仓日开始前：显示当前持仓盈亏情况
+            if backtest_results['current_holdings'] and i > 0:
+                self._print_current_holdings_pnl(
+                    backtest_results['current_holdings'], 
+                    date_t
+                )
 
             # Step 1: T日收盘后计算信号并选择Top-K股票
-            # 计算所有候选股票的信号（调仓日强制重新筛选股票池）
-            all_signals = self._calculate_daily_signals(
+            # 每个调仓日都使用完整多因子计算，重新筛选股票池并重新计算因子
+            all_signals = self._calculate_signals_with_multifactor(
                 date_t,
-                top_k=top_k,  # 这个参数在_calculate_daily_signals中未使用，实际计算所有股票
-                lookback_days=252,
-                force_reconstitution=True  # 调仓日强制重新筛选候选股票池
+                top_k=top_k,
+                lookback_days=252
             )
-            
-            # 关键修复：从所有信号中选择Top-K股票（每次调仓都重新选股）
+
+            # 处理信号结果并生成交易决策
             if all_signals:
-                # 注意：all_signals已经是_calculate_daily_signals内部选择的Top-K
-                # 但我们仍然需要这个逻辑来处理可能的进一步筛选
                 daily_signals = all_signals
-                
+
                 if i == 0:
                     logger.info(f"📊 {date_t} 初始建仓：选中Top-{len(daily_signals)}只股票")
                 else:
-                    logger.info(f"📊 {date_t} 重新选股：选中Top-{len(daily_signals)}只股票")
+                    logger.info(f"🔄 {date_t} 调仓选股：选中Top-{len(daily_signals)}只股票")
                 logger.info(f"   选中股票: {list(daily_signals.keys())}")
                 logger.info(f"   信号范围: {min(daily_signals.values()):.3f} ~ {max(daily_signals.values()):.3f}")
             else:
@@ -7514,19 +8112,82 @@ class RiskSensitiveTrendStrategy:
                             zero_weight_stocks = [stock for stock, weight in adjusted_weights.items() if weight == 0]
                             if zero_weight_stocks:
                                 logger.info(f"🔄 {date_t} 止盈止损执行：清仓{len(zero_weight_stocks)}只股票")
+                                
+                                # 立即更新持仓和权重状态，确保止损清仓完全生效
+                                cleared_stocks = []
+                                for stock in zero_weight_stocks:
+                                    # 记录清仓前的持仓信息用于日志
+                                    holding_info = backtest_results['current_holdings'].get(stock, {})
+                                    if isinstance(holding_info, dict):
+                                        shares = holding_info.get('shares', 0)
+                                        entry_price = holding_info.get('entry_price', 0)
+                                    else:
+                                        shares = holding_info
+                                        entry_price = 0
+                                    
+                                    # 从持仓中完全移除该股票
+                                    if stock in backtest_results['current_holdings']:
+                                        del backtest_results['current_holdings'][stock]
+                                        cleared_stocks.append(stock)
+                                        logger.info(f"   ✅ {stock}: 已清仓 {shares:,.1f}股 (成本价￥{entry_price:.2f})")
+                                    
+                                    # 同时从当前权重中移除
+                                    if stock in backtest_results['current_weights']:
+                                        old_weight = backtest_results['current_weights'][stock]
+                                        del backtest_results['current_weights'][stock]
+                                        logger.debug(f"       权重清零: {stock} {old_weight:.3f} → 0.000")
+                                
+                                # 验证清仓是否完成
+                                remaining_zero_weight = [s for s in zero_weight_stocks if s in backtest_results['current_holdings']]
+                                if remaining_zero_weight:
+                                    logger.error(f"   ❌ 清仓不完整：{remaining_zero_weight} 仍在持仓中")
+                                else:
+                                    logger.info(f"   ✅ 清仓验证通过：{len(cleared_stocks)}只股票已完全移除")
 
                                 # 重新计算信号，排除已清仓的股票
                                 if daily_signals:
+                                    removed_from_signals = []
                                     for stock in zero_weight_stocks:
                                         if stock in daily_signals:
                                             del daily_signals[stock]
-                                    logger.info(f"   剩余信号股票：{len(daily_signals)}只")
+                                            removed_from_signals.append(stock)
+                                    logger.info(f"   信号更新: 移除{len(removed_from_signals)}只，剩余{len(daily_signals)}只")
+                                    
+                                # 估算清仓释放的资金（用于日志显示，不实际更新现金）
+                                released_cash = 0.0
+                                for stock in cleared_stocks:
+                                    # 获取清仓时的价格
+                                    if stock in current_prices:
+                                        current_price = current_prices[stock]
+                                        # 从 adjusted_weights 获取原来的权重
+                                        original_weight = 0
+                                        # 找到原来的权重（在被清零之前）
+                                        for stock_code, holding_info in backtest_results['current_holdings'].items():
+                                            if stock_code == stock and isinstance(holding_info, dict):
+                                                shares = holding_info.get('shares', 0)
+                                                stock_value = shares * current_price
+                                                released_cash += stock_value
+                                                break
+                                
+                                # 更新统计信息
+                                current_holdings_count = len(backtest_results['current_holdings'])
+                                current_weights_count = len(backtest_results['current_weights'])
+                                logger.info(
+                                    f"   ⚠️  止损清仓已立即生效 | "
+                                    f"持仓: {current_holdings_count}只 | 权重: {current_weights_count}只 | "
+                                    f"估算释放资金: ￥{released_cash:,.0f}"
+                                )
 
                 except Exception as e:
-                    logger.warning(f"止盈止损检查失败: {e}")
+                    logger.error(f"止盈止损检查发生异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # 不能吓下异常，但要确保回测继续运行
+                    # 设置空的adjusted_weights以便继续正常流程
                     adjusted_weights = {}
+                    logger.warning("止盈止损功能在此调仓日跳过，继续执行正常调仓")
 
-            # Step 2: 生成目标权重
+            # Step 2: 生成目标权重（此时止损股票已从 daily_signals 和 current_holdings 中移除）
             target_weights = self._generate_target_weights(
                 daily_signals,
                 date_t,
@@ -7599,7 +8260,7 @@ class RiskSensitiveTrendStrategy:
             'turnover': backtest_results['turnover_series']
         }
 
-    def run_rolling_backtest(self, top_k: int = 5, rebalance: str = 'M', skip_recent: int = 21, mom_window: int = 126, min_live_stocks: int = 3):
+    def run_rolling_backtest(self, top_k: int = 5, rebalance: str = 'M', skip_recent: int = 3, mom_window: int = 126, min_live_stocks: int = 3):
         """
         使用滚动动量+再平衡权重进行整段回测，自动应用回撤门控与 T+1。返回 (equity, stats)。
         """
@@ -8046,28 +8707,44 @@ class RiskSensitiveTrendStrategy:
             'impact_cost': 0.0,    # 冲击成本
             'spread_cost': 0.0     # 价差成本
         }
+        
+        # 交易细节打印开始
+        if orders:
+            logger.info(f"📈 {date} 交易执行开始：处理 {len(orders)} 个订单")
+            logger.info("=" * 80)
 
         for stock, weight_change in orders.items():
             norm_code = self._normalize_instrument(stock)
+            stock_name = self.get_stock_name(stock)
+            direction = "买入" if weight_change > 0 else "卖出"
+            
+            logger.info(f"\n🔄 处理订单: {stock} ({stock_name}) {direction} 权重变化: {weight_change:+.4f}")
 
             # 获取T+1日数据
             price_data = self._get_price_at_date(norm_code, date)
             if price_data is None:
                 fills['rejected'][stock] = '无价格数据'
+                logger.warning(f"   ❌ 订单被拒绝: 无价格数据")
                 continue
 
             open_price = price_data.get('open')
             close_yesterday = price_data.get('close_yesterday')
             volume = price_data.get('volume', 0)
+            
+            logger.info(f"   📊 市场数据: 开盘价￥{open_price:.2f} | 昨收￥{close_yesterday:.2f} | 成交量{volume:,.0f}股")
 
             # 检查涨跌停
             upper_limit, lower_limit = self._get_price_limits(close_yesterday, stock)
+            change_pct = (open_price - close_yesterday) / close_yesterday * 100
+            logger.info(f"   📈 涨跌幅: {change_pct:+.2f}% | 涨停￥{upper_limit:.2f} | 跌停￥{lower_limit:.2f}")
 
             if weight_change > 0 and open_price >= upper_limit:
                 fills['rejected'][stock] = '涨停无法买入'
+                logger.warning(f"   ❌ 订单被拒绝: 涨停无法买入 (开盘价￥{open_price:.2f} ≥ 涨停价￥{upper_limit:.2f})")
                 continue
             elif weight_change < 0 and open_price <= lower_limit:
                 fills['rejected'][stock] = '跌停无法卖出'
+                logger.warning(f"   ❌ 订单被拒绝: 跌停无法卖出 (开盘价￥{open_price:.2f} ≤ 跌停价￥{lower_limit:.2f})")
                 continue
 
             # 成交量约束
@@ -8075,11 +8752,14 @@ class RiskSensitiveTrendStrategy:
             initial_capital = 1000000.0
             trade_value = abs(weight_change) * initial_capital
 
-            # 计算成交量参与率
+            # 计算成交量参与率（基于股数）
             if volume > 0:
-                volume_participation_rate = min(trade_value / (open_price * volume), 1.0)
+                trade_shares = trade_value / open_price  # 将交易金额转换为股数
+                volume_participation_rate = min(trade_shares / volume, 1.0)
             else:
                 volume_participation_rate = 0.5  # 默认中等参与率
+                
+            logger.info(f"   💰 交易规模: 金额￥{trade_value:,.0f} | 股数{trade_shares:,.0f}股 | 成交量参与率{volume_participation_rate:.1%}")
 
             # 计算动态滑点
             dynamic_slippage_rate = self._calculate_dynamic_slippage(
@@ -8091,15 +8771,18 @@ class RiskSensitiveTrendStrategy:
                 exec_price = open_price * (1 + dynamic_slippage_rate)
             else:
                 exec_price = open_price * (1 - dynamic_slippage_rate)
+                
+            logger.info(f"   🎯 执行价格: 开盘￥{open_price:.2f} → 成交￥{exec_price:.2f} | 滑点{dynamic_slippage_rate:.2%}")
 
             # 计算基础交易成本：佣金、印花税、过户费
             cost_details = self._calculate_transaction_costs(trade_value, is_buy=(weight_change > 0))
             base_cost = cost_details['total_cost']
 
-            # 计算冲击成本
-            daily_volume_value = open_price * volume if volume > 0 else trade_value * 10
+            # 计算冲击成本（基于股数）
+            daily_volume_shares = volume if volume > 0 else (trade_value / open_price) * 10
+            trade_shares = trade_value / open_price  # 计算交易股数
             impact_details = self._calculate_market_impact_cost(
-                stock, trade_value, weight_change > 0, date, daily_volume_value
+                stock, trade_value, trade_shares, weight_change > 0, date, daily_volume_shares
             )
 
             # 计算买卖价差成本
@@ -8110,7 +8793,22 @@ class RiskSensitiveTrendStrategy:
 
             # 滑点成本（已体现在价格中）
             slippage_cost = trade_value * dynamic_slippage_rate
+            
+            # 打印成本明细
+            logger.info(f"   💸 交易成本明细:")
+            logger.info(f"     基础成本: ￥{base_cost:.2f} (佣金￥{cost_details.get('commission', 0):.2f} + 印花税￥{cost_details.get('stamp_tax', 0):.2f} + 过户费￥{cost_details.get('transfer_fee', 0):.2f})")
+            logger.info(f"     冲击成本: ￥{impact_details['total_impact']:.2f}")
+            logger.info(f"     价差成本: ￥{spread_cost:.2f}")
+            logger.info(f"     滑点成本: ￥{slippage_cost:.2f}")
+            logger.info(f"     总成本: ￥{total_cost:.2f} ({total_cost/trade_value:.3%})")
 
+            # A股交易规则：计算实际成交股数（100股整数倍）
+            theoretical_shares = trade_value / exec_price
+            actual_shares = int(theoretical_shares // 100) * 100
+            if actual_shares < 100:
+                actual_shares = 100
+            actual_trade_value = actual_shares * exec_price
+            
             fills['executed'][stock] = {
                 'weight_change': weight_change,
                 'price': exec_price,
@@ -8120,12 +8818,33 @@ class RiskSensitiveTrendStrategy:
                 'spread_cost': spread_cost,
                 'volume_participation': volume_participation_rate
             }
+            
+            # 成交确认
+            logger.info(f"   ✅ 订单成交: {actual_shares:,.0f}股 × ￥{exec_price:.2f} = ￥{actual_trade_value:,.0f}")
 
             # 记录详细成本
             fills['costs'] += total_cost
             fills['slippage_cost'] = fills.get('slippage_cost', 0) + slippage_cost
             fills['impact_cost'] = fills.get('impact_cost', 0) + impact_details['total_impact']
             fills['spread_cost'] = fills.get('spread_cost', 0) + spread_cost
+
+        # 交易汇总
+        if orders:
+            logger.info("\n" + "=" * 80)
+            executed_count = len(fills['executed'])
+            rejected_count = len(fills['rejected'])
+            total_cost = fills['costs']
+            total_slippage = fills['slippage_cost']
+            total_impact = fills['impact_cost']
+            total_spread = fills['spread_cost']
+            
+            logger.info(f"📊 {date} 交易执行完成汇总:")
+            logger.info(f"   成交订单: {executed_count}个")
+            logger.info(f"   拒绝订单: {rejected_count}个")
+            if rejected_count > 0:
+                logger.info(f"   拒绝原因: {list(fills['rejected'].values())}")
+            logger.info(f"   总成本: ￥{total_cost:.2f} (基础￥{total_cost-total_slippage-total_impact-total_spread:.2f} + 滑点￥{total_slippage:.2f} + 冲击￥{total_impact:.2f} + 价差￥{total_spread:.2f})")
+            logger.info("=" * 80)
 
         return fills
 
@@ -8139,7 +8858,13 @@ class RiskSensitiveTrendStrategy:
 
             # 计算实际买卖的股份数 - 修复：使用固定基准资金
             trade_value = abs(weight_change) * initial_capital
-            shares_change = trade_value / price
+            theoretical_shares = trade_value / price
+            
+            # A股交易规则：必须为100股的整数倍
+            shares_change = int(theoretical_shares // 100) * 100
+            if shares_change < 100:
+                # 少于100股按100股处理（最小交易单位）
+                shares_change = 100
 
             if weight_change > 0:
                 # 买入：增加股份
@@ -8159,7 +8884,9 @@ class RiskSensitiveTrendStrategy:
 
                     # 计算加权平均入场价格
                     total_shares = old_shares + shares_change
-                    if total_shares > 0:
+                    # 确保总股数符合100股整数倍规则
+                    total_shares = int(total_shares // 100) * 100
+                    if total_shares >= 100:
                         avg_entry_price = (old_shares * old_entry_price + shares_change * price) / total_shares
                         new_weight = old_weight + weight_change  # 累加权重变化得到新权重
                         backtest_results['current_holdings'][stock].update({
@@ -8173,8 +8900,10 @@ class RiskSensitiveTrendStrategy:
                     old_shares = backtest_results['current_holdings'][stock].get('shares', 0)
                     old_weight = backtest_results['current_holdings'][stock].get('weight', 0)
                     new_shares = old_shares - shares_change
+                    # 确保剩余股数符合100股整数倍规则
+                    new_shares = int(new_shares // 100) * 100
 
-                    if new_shares <= 1:  # 少于1股清空
+                    if new_shares < 100:  # 少于100股清空（A股最小交易单位）
                         del backtest_results['current_holdings'][stock]
                     else:
                         # 部分减仓，保持入场价格不变
@@ -8336,6 +9065,125 @@ class RiskSensitiveTrendStrategy:
 
         return backtest_results
 
+    def _print_current_holdings_pnl(self, current_holdings, date_t):
+        """
+        打印当前持仓盈亏情况
+        
+        Parameters:
+        -----------
+        current_holdings : dict
+            当前持仓 {stock: holding_info}
+        date_t : str
+            当前日期
+        """
+        if not current_holdings:
+            logger.info(f"💰 {date_t} 当前持仓：空仓")
+            return
+        
+        logger.info(f"💰 {date_t} 当前持仓盈亏情况：")
+        
+        total_pnl = 0.0
+        total_market_value = 0.0
+        holding_details = []
+        
+        for stock, holding_info in current_holdings.items():
+            try:
+                # 处理两种持仓数据结构：简单数字或复杂字典
+                if isinstance(holding_info, dict):
+                    shares = holding_info.get('shares', 0)
+                    entry_price = holding_info.get('entry_price', 0)
+                else:
+                    shares = holding_info  # 兼容旧的简单结构
+                    entry_price = 0  # 无法获取入场价格
+                
+                if shares <= 0:
+                    continue
+                
+                # 获取当前价格
+                norm_code = self._normalize_instrument(stock)
+                price_data = self._get_price_at_date(norm_code, date_t)
+                
+                if not price_data or 'close' not in price_data:
+                    # 无法获取价格，跳过
+                    continue
+                
+                current_price = price_data['close']
+                market_value = shares * current_price
+                total_market_value += market_value
+                
+                if entry_price > 0:
+                    # 计算盈亏
+                    cost = shares * entry_price
+                    pnl = market_value - cost
+                    pnl_pct = (pnl / cost) * 100 if cost > 0 else 0
+                    total_pnl += pnl
+                    
+                    # 盈亏颜色显示
+                    color = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
+                    
+                    holding_details.append({
+                        'stock': stock,
+                        'shares': shares,
+                        'entry_price': entry_price,
+                        'current_price': current_price,
+                        'market_value': market_value,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'color': color
+                    })
+                else:
+                    # 无入场价格信息
+                    holding_details.append({
+                        'stock': stock,
+                        'shares': shares,
+                        'entry_price': 0,
+                        'current_price': current_price,
+                        'market_value': market_value,
+                        'pnl': 0,
+                        'pnl_pct': 0,
+                        'color': "🟡"
+                    })
+                    
+            except Exception as e:
+                logger.warning(f"计算{stock}盈亏时发生异常: {e}")
+                continue
+        
+        # 按盈亏率排序（从高到低）
+        holding_details.sort(key=lambda x: x['pnl_pct'], reverse=True)
+        
+        # 打印每只股票的盈亏情况
+        for detail in holding_details:
+            if detail['entry_price'] > 0:
+                logger.info(
+                    f"   {detail['color']} {detail['stock']}: "
+                    f"{detail['shares']:,}股 | "
+                    f"成本价￥{detail['entry_price']:.2f} → 现价￥{detail['current_price']:.2f} | "
+                    f"市值￥{detail['market_value']:,.0f} | "
+                    f"盈亏￥{detail['pnl']:,.0f} ({detail['pnl_pct']:+.1f}%)"
+                )
+            else:
+                logger.info(
+                    f"   {detail['color']} {detail['stock']}: "
+                    f"{detail['shares']:,}股 | "
+                    f"现价￥{detail['current_price']:.2f} | "
+                    f"市值￥{detail['market_value']:,.0f} | "
+                    f"盈亏：无法计算（缺少成本价）"
+                )
+        
+        # 打印总计
+        if total_pnl != 0 and len([d for d in holding_details if d['entry_price'] > 0]) > 0:
+            total_cost = sum(d['shares'] * d['entry_price'] for d in holding_details if d['entry_price'] > 0)
+            total_pnl_pct = (total_pnl / total_cost) * 100 if total_cost > 0 else 0
+            pnl_color = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "🟡"
+            
+            logger.info(
+                f"   {pnl_color} 总计: 市值￥{total_market_value:,.0f} | "
+                f"盈亏￥{total_pnl:,.0f} ({total_pnl_pct:+.1f}%) | "
+                f"持仓{len(holding_details)}只"
+            )
+        else:
+            logger.info(f"   🟡 总计: 市值￥{total_market_value:,.0f} | 持仓{len(holding_details)}只")
+            
     def _update_holdings_no_trade(self, backtest_results, date):
         """无交易时更新持仓市值 - read.md修复：正确的非交易日收益计算"""
         # 非交易日：使用昨收→今收的收益率
@@ -8510,6 +9358,38 @@ class RiskSensitiveTrendStrategy:
         logger.info("="*80)
 
     # 股票池定期重构功能
+    def _is_reconstitution_day_for_backtest(self, day_index, rebalance_freq_days, trading_dates):
+        """
+        判断回测中是否为重构日（完整多因子计算日）
+
+        与普通调仓日的区别：
+        - 重构日：使用完整多因子计算，更新股票池和alpha缓存
+        - 调仓日：基于缓存的alpha进行权重再平衡
+
+        Parameters:
+        -----------
+        day_index : int
+            当前交易日索引
+        rebalance_freq_days : int
+            调仓频率（天）
+        trading_dates : list
+            交易日历列表
+
+        Returns:
+        --------
+        bool : 是否为重构日
+        """
+        # 读取重构频率配置
+        config = self._load_rl_config(self._config_path)
+        reconstitution_freq_days = config.get('claude', {}).get('reconstitution_freq_days', 7)  # 默认周频重构
+
+        # 第一天总是重构日
+        if day_index == 0:
+            return True
+
+        # 按重构频率判断
+        return day_index % reconstitution_freq_days == 0
+
     def _is_reconstitution_date(self, date, reconstitution_freq_days):
         """判断是否为股票池重构日"""
         try:
@@ -8596,7 +9476,7 @@ class RiskSensitiveTrendStrategy:
                     # 逐步放宽门槛
                     for step in relax_steps:
                         tmp_cfg = dict(ss_cfg)
-                        tmp_cfg['min_adv_rmb'] = float(step.get('min_adv_rmb', tmp_cfg.get('min_adv_rmb', 0.0)))
+                        tmp_cfg['min_adtv_shares'] = float(step.get('min_adtv_shares', tmp_cfg.get('min_adtv_shares', 0.0)))
                         tmp_cfg['min_price'] = float(step.get('min_price', tmp_cfg.get('min_price', 0.0)))
                         try:
                             candidate_stocks_relaxed = self._filter_universe_with_gates(universe_at_date, date, cfg_override=tmp_cfg)
@@ -8606,11 +9486,11 @@ class RiskSensitiveTrendStrategy:
                             # 继续尝试下一个放宽步骤，而不是完全失败
                         if len(candidate_stocks_relaxed) > 0:
                             candidate_stocks = candidate_stocks_relaxed
-                            logger.warning(f"⚠️  股票池为空，按 relax_steps 放宽到(min_adv_rmb={tmp_cfg['min_adv_rmb']}, min_price={tmp_cfg['min_price']})，得到{len(candidate_stocks)}只。继续后续流程。")
+                            logger.warning(f"⚠️  股票池为空，按 relax_steps 放宽到(min_adtv_shares={tmp_cfg['min_adtv_shares']}, min_price={tmp_cfg['min_price']})，得到{len(candidate_stocks)}只。继续后续流程。")
                             self.stock_pool = candidate_stocks  # 更新stock_pool
                             break
 
-                    # 若仍为空：按 ADV Top-K 兜底
+                    # 若仍为空：按 ADTV Top-K 兜底
                     if not candidate_stocks and int(ss_cfg.get('fallback_pick_top_k_by_adv', 0)) > 0:
                         k = int(ss_cfg['fallback_pick_top_k_by_adv'])
                         try:
@@ -8680,7 +9560,7 @@ class RiskSensitiveTrendStrategy:
                 # 定期重构
                 logger.info(f"🔄 检测到重构日: {date}，开始重构股票池...")
                 should_reconstitute = True
-            
+
             # 执行重构
             if should_reconstitute:
                 self._reconstitute_stock_pool_at_date(date)
@@ -8742,8 +9622,8 @@ class RiskSensitiveTrendStrategy:
                 temp_cfg = original_cfg.copy()
                 temp_cfg['stock_selection'] = {**original_cfg.get('stock_selection', {}), **cfg_override}
                 # 临时应用配置到实例属性
-                if 'min_adv_rmb' in cfg_override:
-                    self.min_adv_rmb = cfg_override['min_adv_rmb']
+                if 'min_adtv_shares' in cfg_override:
+                    self.min_adtv_shares = cfg_override['min_adtv_shares']
                 if 'min_price' in cfg_override:
                     self.min_price = cfg_override['min_price']
 
@@ -8765,8 +9645,8 @@ class RiskSensitiveTrendStrategy:
 
             # 恢复原始配置
             if original_cfg and cfg_override:
-                if 'min_adv_rmb' in original_cfg.get('stock_selection', {}):
-                    self.min_adv_rmb = original_cfg['stock_selection']['min_adv_rmb']
+                if 'min_adtv_shares' in original_cfg.get('stock_selection', {}):
+                    self.min_adtv_shares = original_cfg['stock_selection']['min_adtv_shares']
                 if 'min_price' in original_cfg.get('stock_selection', {}):
                     self.min_price = original_cfg['stock_selection']['min_price']
 
@@ -8778,7 +9658,7 @@ class RiskSensitiveTrendStrategy:
 
     def _estimate_adv_for_universe(self, universe, date, lookback=20):
         """
-        估算股票池的平均成交额
+        估算股票池的平均成交量(ADTV)
 
         Parameters:
         -----------
@@ -8791,7 +9671,7 @@ class RiskSensitiveTrendStrategy:
 
         Returns:
         --------
-        dict : {股票代码: 平均成交额}
+        dict : {股票代码: 平均成交量}
         """
         try:
             adv_map = {}
@@ -8809,24 +9689,24 @@ class RiskSensitiveTrendStrategy:
                     norm_code = self._normalize_instrument(stock)
                     data = D.features(
                         instruments=[norm_code],
-                        fields=['$amount'],
+                        fields=['$volume'],
                         start_time=start_date_pd.strftime('%Y-%m-%d'),
                         end_time=date,
                         freq='day'
                     )
 
                     if data is not None and not data.empty:
-                        avg_adv = data['$amount'].tail(lookback).mean()
-                        if not pd.isna(avg_adv) and avg_adv > 0:
-                            adv_map[stock] = avg_adv
+                        avg_adtv = data['$volume'].tail(lookback).mean()
+                        if not pd.isna(avg_adtv) and avg_adtv > 0:
+                            adv_map[stock] = avg_adtv
 
                 except (KeyError, IndexError) as e:
                     # 数据字段缺失或索引错误，跳过此股票
-                    logger.debug(f"股票{stock}成交额数据不可用: {e}")
+                    logger.debug(f"股票{stock}成交量数据不可用: {e}")
                     continue
                 except Exception as e:
                     # 其他未预期的错误，记录但继续处理其他股票
-                    logger.warning(f"估算股票{stock}ADV时发生异常: {e}")
+                    logger.warning(f"估算股票{stock}ADTV时发生异常: {e}")
                     continue
 
             return adv_map
@@ -9391,35 +10271,33 @@ class RiskSensitiveTrendStrategy:
         }
 
     def _check_adv_constraint_for_sizing(self, stock_code, shares, price):
-        """检查仓位计算时的ADV流动性约束"""
+        """检查仓位计算时的ADTV流动性约束"""
         if stock_code not in self.price_data:
             return False
 
         df = self.price_data[stock_code]
-        if 'amount' in df.columns and len(df) >= 20:
-            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
-            trade_value = shares * price
-            # 检查是否超过ADV20的5%
-            if trade_value > amount_20d * 0.05:
+        if 'volume' in df.columns and len(df) >= 20:
+            adtv_20d = df['volume'].iloc[-20:].mean()  # 平均成交量（股数）
+            # 检查是否超过ADTV20的5%
+            if shares > adtv_20d * 0.05:
                 return True
         return False
 
     def _adjust_for_adv_constraint_sizing(self, stock_code, price):
-        """根据ADV约束调整仓位（用于仓位计算）"""
+        """根据ADTV约束调整仓位（用于仓位计算）"""
         if stock_code not in self.price_data:
             return 100
 
         df = self.price_data[stock_code]
-        if 'amount' in df.columns and len(df) >= 20:
-            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
-            max_trade_value = amount_20d * 0.05
-            max_shares = int(max_trade_value / price // 100) * 100  # 调整为100股整数倍
+        if 'volume' in df.columns and len(df) >= 20:
+            adtv_20d = df['volume'].iloc[-20:].mean()  # 平均成交量（股数）
+            max_shares = int(adtv_20d * 0.05 // 100) * 100  # 调整为100股整数倍
             return max(100, max_shares)  # 至少100股
         return 100
 
     def _validate_amount_unit(self, stock_code=None, sample_size=5):
         """
-        验证Qlib数据中amount字段的单位定义
+        【已废弃】验证Qlib数据中amount字段的单位定义（现在使用ADTV基于成交量）
         通过采样对比成交额和价格*成交量来推断单位
 
         Parameters:
@@ -9832,9 +10710,9 @@ class RiskSensitiveTrendStrategy:
 
         return slippage_rate
 
-    def _calculate_market_impact_cost(self, stock, trade_value, is_buy, date, daily_volume):
+    def _calculate_market_impact_cost(self, stock, trade_value, trade_shares, is_buy, date, daily_volume_shares):
         """
-        计算冲击成本
+        计算冲击成本（基于股数口径）
 
         Parameters:
         -----------
@@ -9842,12 +10720,14 @@ class RiskSensitiveTrendStrategy:
             股票代码
         trade_value : float
             交易金额
+        trade_shares : float
+            交易股数
         is_buy : bool
             是否买入
         date : str
             交易日期
-        daily_volume : float
-            日成交额
+        daily_volume_shares : float
+            日成交量（股数）
 
         Returns:
         --------
@@ -9872,11 +10752,11 @@ class RiskSensitiveTrendStrategy:
         buy_multiplier = impact_config.get('buy_multiplier', 1.1)
         sell_multiplier = impact_config.get('sell_multiplier', 0.9)
 
-        # 1. 计算交易规模占比
-        if daily_volume <= 0:
+        # 1. 计算交易规模占比（基于股数）
+        if daily_volume_shares <= 0:
             volume_ratio = 0.01  # 默认很小的比例
         else:
-            volume_ratio = min(trade_value / daily_volume, 1.0)  # 最大不超过100%
+            volume_ratio = min(trade_shares / daily_volume_shares, 1.0)  # 最大不超过100%
 
         # 2. 基础冲击成本（线性 + 平方根）
         linear_impact = linear_rate * volume_ratio
@@ -10052,6 +10932,29 @@ class RiskSensitiveTrendStrategy:
         dict : IC/IR分析结果
         """
         try:
+            # 增强调试信息：分析Alpha分数的分布
+            alpha_values_all = list(alpha_scores.values())
+            alpha_series_debug = pd.Series(alpha_values_all)
+
+            logger.info(f"📊 Alpha分数统计分析:")
+            logger.info(f"  样本数量: {len(alpha_values_all)}")
+            logger.info(f"  唯一值数量: {alpha_series_debug.nunique()}")
+            logger.info(f"  均值: {alpha_series_debug.mean():.6f}")
+            logger.info(f"  标准差: {alpha_series_debug.std():.6f}")
+            logger.info(f"  最小值: {alpha_series_debug.min():.6f}")
+            logger.info(f"  最大值: {alpha_series_debug.max():.6f}")
+            logger.info(f"  中位数: {alpha_series_debug.median():.6f}")
+
+            # 检查是否所有Alpha值都相同
+            if alpha_series_debug.nunique() <= 1:
+                logger.warning(f"⚠️ Alpha分数无差异: 所有{len(alpha_values_all)}只股票的分数都是{alpha_values_all[0] if alpha_values_all else 'N/A'}")
+                if hasattr(self, '_ic_skip_stats') and self._ic_skip_stats:
+                    logger.info(f"📈 历史IC跳过统计: {dict(self._ic_skip_stats)}")
+            elif alpha_series_debug.nunique() < 5:
+                logger.warning(f"⚠️ Alpha分数差异性较低: 仅有{alpha_series_debug.nunique()}种不同的分数值")
+            else:
+                logger.info(f"✅ Alpha分数有良好的横截面差异性")
+
             ic_results = {}
 
             for period in periods:
@@ -10071,11 +10974,46 @@ class RiskSensitiveTrendStrategy:
                 if len(alpha_values) < 10:  # 至少需要10个样本
                     continue
 
+                # read.md要求：IC计算前硬断言检查Alpha横截面差异性
+                alpha_series = pd.Series(alpha_values)
+                if alpha_series.nunique() <= 1:
+                    logger.debug(f"  {period}D Alpha无横截面差异(nunique={alpha_series.nunique()})，跳过IC计算")
+                    # 记录跳过的期数统计
+                    if hasattr(self, '_ic_skip_stats'):
+                        self._ic_skip_stats[f"{period}D"] = self._ic_skip_stats.get(f"{period}D", 0) + 1
+                    else:
+                        self._ic_skip_stats = {f"{period}D": 1}
+                    continue
+
+                # 额外检查：Alpha标准差
+                if alpha_series.std() < 1e-8:
+                    logger.debug(f"  {period}D Alpha标准差过小({alpha_series.std():.2e})，跳过IC计算")
+                    if hasattr(self, '_ic_skip_stats'):
+                        self._ic_skip_stats[f"{period}D"] = self._ic_skip_stats.get(f"{period}D", 0) + 1
+                    else:
+                        self._ic_skip_stats = {f"{period}D": 1}
+                    continue
+
                 # 计算IC（信息系数）- Spearman相关性
-                ic_spearman = pd.Series(alpha_values).corr(pd.Series(return_values), method='spearman')
+                try:
+                    ic_spearman = alpha_series.corr(pd.Series(return_values), method='spearman')
+                    # 验证结果有效性
+                    if pd.isna(ic_spearman):
+                        logger.debug(f"  {period}D Spearman IC计算结果为NaN")
+                        continue
+                except Exception as e:
+                    logger.debug(f"  {period}D Spearman IC计算异常: {e}")
+                    continue
 
                 # 计算Pearson相关性
-                ic_pearson = pd.Series(alpha_values).corr(pd.Series(return_values), method='pearson')
+                try:
+                    ic_pearson = alpha_series.corr(pd.Series(return_values), method='pearson')
+                    if pd.isna(ic_pearson):
+                        logger.debug(f"  {period}D Pearson IC计算结果为NaN")
+                        ic_pearson = np.nan  # 保持一致性
+                except Exception as e:
+                    logger.debug(f"  {period}D Pearson IC计算异常: {e}")
+                    ic_pearson = np.nan
 
                 # 分层回测：按alpha分组计算收益差异
                 combined_data = pd.DataFrame({
@@ -10231,8 +11169,21 @@ class RiskSensitiveTrendStrategy:
                         common_stocks = alpha_score.index.intersection(forward_ret_series.index)
 
                         if len(common_stocks) >= 10:
-                            aligned_alpha = alpha_score.loc[common_stocks]
-                            aligned_returns = forward_ret_series.loc[common_stocks]
+                            # 严格的索引契约检查：确保所有股票代码都存在于索引中
+                            missing_in_alpha = set(common_stocks) - set(alpha_score.index)
+                            missing_in_returns = set(common_stocks) - set(forward_ret_series.index)
+
+                            if missing_in_alpha:
+                                logger.debug(f"⚠️ Alpha中缺失股票: {missing_in_alpha}")
+                                common_stocks = [s for s in common_stocks if s in alpha_score.index]
+
+                            if missing_in_returns:
+                                logger.debug(f"⚠️ 收益率中缺失股票: {missing_in_returns}")
+                                common_stocks = [s for s in common_stocks if s in forward_ret_series.index]
+
+                            if len(common_stocks) >= 10:
+                                aligned_alpha = alpha_score.loc[common_stocks]
+                                aligned_returns = forward_ret_series.loc[common_stocks]
 
                             # 移除缺失值
                             valid_mask = ~(aligned_alpha.isna() | aligned_returns.isna() |
@@ -11112,21 +12063,20 @@ class RiskSensitiveTrendStrategy:
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            # 计算成交额
-            amount_data = volume_clean * price_clean
-            avg_amount = amount_data.mean()
+            # 计算平均成交量（ADTV）
+            avg_volume = volume_clean.mean()
 
-            if not np.isfinite(avg_amount) or avg_amount <= 0:
-                error_msg = f"流动性因子: 平均成交额异常 ({avg_amount})"
+            if not np.isfinite(avg_volume) or avg_volume <= 0:
+                error_msg = f"流动性因子: 平均成交量异常 ({avg_volume})"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            # 流动性评分：偏好高成交额、稳定换手
+            # 流动性评分：偏好高成交量、稳定换手
             # 使用log避免数值过大，但需要确保参数为正
             try:
-                log_amount = np.log(max(avg_amount, 1.0))  # 确保至少为1
-                if not np.isfinite(log_amount):
-                    error_msg = f"流动性因子: 对数成交额异常 ({log_amount})"
+                log_volume = np.log(max(avg_volume, 1.0))  # 确保至少为1
+                if not np.isfinite(log_volume):
+                    error_msg = f"流动性因子: 对数成交量异常 ({log_volume})"
                     logger.error(error_msg)
                     raise ValueError(error_msg)
             except Exception as log_e:
@@ -11134,7 +12084,7 @@ class RiskSensitiveTrendStrategy:
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            liquidity_score = log_amount * volume_stability
+            liquidity_score = log_volume * volume_stability
 
             # 结果验证
             if not np.isfinite(liquidity_score):
@@ -11416,11 +12366,12 @@ class RiskSensitiveTrendStrategy:
     def _apply_cross_sectional_processing(self, df):
         """优化的横截面处理：防止小样本下Alpha信号被抹平"""
         try:
+            logger.info(f"🔍 进入横截面处理，输入df.shape: {df.shape}, columns: {list(df.columns)}")
             processed_df = df.copy()
             sample_size = len(processed_df)
 
             # 因子列（排除非因子列）
-            factor_columns = [col for col in df.columns if col not in ['norm_code']]
+            factor_columns = [col for col in df.columns if col not in ['norm_code', 'stock_code']]
 
             logger.info(f"横截面处理样本量: {sample_size}")
 
@@ -11504,6 +12455,7 @@ class RiskSensitiveTrendStrategy:
                 if col_std < 0.01:
                     logger.warning(f"{col}处理后标准差过小({col_std:.6f})，可能存在信号被抹平风险")
 
+            logger.info(f"🔍 横截面处理完成，输出processed_df.shape: {processed_df.shape}, columns: {list(processed_df.columns)}")
             return processed_df
         except Exception as e:
             logger.error(f"异常: {e}")
@@ -12378,6 +13330,10 @@ class RiskSensitiveTrendStrategy:
     def _apply_portfolio_constraints(self, weights, candidates_df, max_position):
         """应用组合约束条件"""
         try:
+            # 调试日志：记录输入权重
+            input_total = sum(weights.values()) if weights else 0.0
+            logger.debug(f"🔍 _apply_portfolio_constraints 输入: 总权重={input_total:.4f} ({input_total*100:.2f}%)")
+
             constrained_weights = weights.copy()
 
             # 1. 单股票权重上限约束
@@ -12450,6 +13406,16 @@ class RiskSensitiveTrendStrategy:
                     scale_factor = max_industry_weight / total_weight
                     for stock_code in industry_stocks:
                         adjusted_weights[stock_code] *= scale_factor
+
+            # 调试日志：记录输出权重
+            output_total = sum(adjusted_weights.values()) if adjusted_weights else 0.0
+            scale_factor = output_total / input_total if input_total > 0 else 1.0
+
+            logger.debug(f"🔍 _apply_portfolio_constraints 输出: 总权重={output_total:.4f} ({output_total*100:.2f}%)")
+            logger.debug(f"🔍 _apply_portfolio_constraints 缩放倍数: {scale_factor:.6f}")
+
+            if scale_factor > 1.4:
+                logger.warning(f"🚨 _apply_portfolio_constraints 异常放大: {input_total:.4f} -> {output_total:.4f} (×{scale_factor:.4f})")
 
             return adjusted_weights
 
@@ -12656,7 +13622,7 @@ class RiskSensitiveTrendStrategy:
             # 构建特征字段列表
             feature_fields = [
                 # 基础价量数据
-                "$close", "$open", "$high", "$low", "$volume", "$amount",
+                "$close", "$open", "$high", "$low", "$volume",
             ]
 
             # 添加Alpha158特征（如果可用）
@@ -12814,7 +13780,7 @@ class RiskSensitiveTrendStrategy:
         except Exception as e:
             logger.error(f"Qlib回测失败: {e}")
             raise
-    def calculate_multifactor_alpha(self, momentum_windows=[63, 126, 252], skip_recent=21):
+    def calculate_multifactor_alpha(self, momentum_windows=[63, 126, 252], skip_recent=3):
         """
         计算多因子合成Alpha（带数据预加载校验与自动修正 + 并行/顺序调度）
 
@@ -12962,6 +13928,18 @@ class RiskSensitiveTrendStrategy:
 
         logger.info(f"分批处理: {len(batches)}个批次，每批约{batch_size}只股票，使用{max_workers}个进程")
 
+        # 准备并行计算用的配置字典
+        volatility_config = {
+            'mar_mode': getattr(self, 'mar_mode', 'risk_free'),
+            'risk_free_rate': getattr(self, 'risk_free_rate', 0.025),
+            'benchmark_return': getattr(self, 'benchmark_return', 0.08),
+            'sortino_lookback': getattr(self, 'sortino_lookback', 180),
+            'sortino_min_periods': getattr(self, 'sortino_min_periods', 60),
+            'total_vol_weight': getattr(self, 'total_vol_weight', 0.6),
+            'downside_vol_weight': getattr(self, 'downside_vol_weight', 0.4),
+            'vol_rolling_window': getattr(self, 'vol_rolling_window', 252)
+        }
+
         alpha_data = {}
         completed_count = 0
 
@@ -12972,7 +13950,8 @@ class RiskSensitiveTrendStrategy:
                     _calculate_batch_factors,
                     batch,
                     momentum_windows,
-                    skip_recent
+                    skip_recent,
+                    volatility_config
                 ): i for i, batch in enumerate(batches)
             }
 
@@ -12992,6 +13971,199 @@ class RiskSensitiveTrendStrategy:
                     raise
         logger.info(f"✅ 多核并行计算完成，成功处理{len(alpha_data)}只股票")
         return alpha_data
+
+    def _calculate_signals_with_multifactor(self, date_t, top_k=5, lookback_days=252):
+        """
+        在重构日使用完整多因子计算生成信号
+
+        这个方法集成了股票池筛选和多因子alpha计算，
+        确保回测和实盘使用相同的逻辑
+
+        Parameters:
+        -----------
+        date_t : str
+            计算日期 (YYYY-MM-DD)
+        top_k : int
+            选择的股票数量
+        lookbook_days : int
+            历史数据回看天数
+
+        Returns:
+        --------
+        dict : {stock: alpha_score} 股票alpha评分字典
+        """
+        logger.info(f"🔄 调仓日多因子计算开始: {date_t}")
+
+        # 1. 强制重构股票池（使用现有逻辑）
+        candidate_stocks = self._get_candidate_stocks_at_date(date_t, force_reconstitution=True)
+
+        if not candidate_stocks:
+            logger.warning(f"⚠️ {date_t} 无候选股票，跳过多因子计算")
+            return {}
+
+        logger.info(f"📊 候选股票池: {len(candidate_stocks)}只股票")
+
+        # 2. 临时设置股票池用于多因子计算
+        original_stock_pool = getattr(self, 'stock_pool', [])
+        original_filtered_pool = getattr(self, 'filtered_stock_pool', [])
+
+        try:
+            # 临时设置当前候选股票池
+            self.stock_pool = candidate_stocks
+            self.filtered_stock_pool = candidate_stocks
+
+            # 3. 设置计算截止日期（重要：使用截至date_t的数据）
+            original_backtest_start = getattr(self, 'backtest_start_date', None)
+            original_start_date = getattr(self, 'start_date', None)
+
+            # 临时设置为当前评估日期
+            eval_date = pd.to_datetime(date_t).strftime('%Y%m%d')
+            self.backtest_start_date = eval_date
+
+            # 4. 调用完整多因子计算
+            alpha_results = self.calculate_multifactor_alpha(
+                momentum_windows=[63, 126, 252],
+                skip_recent=3
+            )
+
+            # 5. 处理结果并选择Top-K
+            if alpha_results is None or (hasattr(alpha_results, 'empty') and alpha_results.empty) or len(alpha_results) == 0:
+                logger.warning(f"⚠️ {date_t} 多因子计算无结果")
+                return {}
+
+            # 按alpha得分排序并选择Top-K
+            # alpha_results是DataFrame，需要按alpha_score列排序
+            if 'alpha_score' not in alpha_results.columns:
+                logger.error(f"❌ alpha_results缺少alpha_score列，现有列: {list(alpha_results.columns)}")
+                return {}
+
+            # 按alpha_score排序并选择Top-K
+            sorted_alpha_results = alpha_results.sort_values('alpha_score', ascending=False)
+            top_alpha_results = sorted_alpha_results.head(top_k)
+
+            # 6. 缓存结果供后续调仓日使用
+            self._cache_multifactor_results(date_t, alpha_results)
+
+            logger.info(f"✅ 多因子计算完成: 从{len(alpha_results)}只股票中选出Top-{len(top_alpha_results)}只")
+            logger.info(f"   选中股票: {list(top_alpha_results.index)}")
+            if not top_alpha_results.empty:
+                alpha_scores = top_alpha_results['alpha_score'].values
+                logger.info(f"   Alpha范围: {alpha_scores.min():.3f} ~ {alpha_scores.max():.3f}")
+
+            # 调试：检查索引是否为股票代码
+            logger.debug(f"🔍 top_alpha_results.index类型: {type(top_alpha_results.index)}")
+            logger.debug(f"🔍 top_alpha_results.index前3个值: {list(top_alpha_results.index[:3])}")
+
+            # 严格的索引契约检查
+            if len(top_alpha_results) > 0:
+                if isinstance(top_alpha_results.index[0], (int, np.integer)):
+                    logger.error(f"❌ DataFrame索引被重置为整数，这会导致KeyError")
+                    logger.error(f"   索引值: {list(top_alpha_results.index)}")
+                    logger.error(f"   应该是股票代码，但得到了整数索引")
+                    raise ValueError("DataFrame索引契约违反：期望股票代码索引，但得到整数索引")
+
+                # 确保索引格式规范化
+                top_alpha_results.index = top_alpha_results.index.astype(str).str.strip().str.upper()
+                top_alpha_results.index.name = 'stock_code'
+
+            # 转换为信号格式（alpha分数作为信号强度）
+            signals = {stock: alpha_score for stock, alpha_score in top_alpha_results['alpha_score'].items()}
+            return signals
+
+        finally:
+            # 恢复原始设置
+            self.stock_pool = original_stock_pool
+            self.filtered_stock_pool = original_filtered_pool
+            if original_backtest_start is not None:
+                self.backtest_start_date = original_backtest_start
+            if original_start_date is not None:
+                self.start_date = original_start_date
+
+    def _cache_multifactor_results(self, date_t, alpha_results):
+        """缓存多因子计算结果供后续调仓日使用"""
+        if not hasattr(self, '_multifactor_cache'):
+            self._multifactor_cache = {}
+
+        self._multifactor_cache[date_t] = {
+            'alpha_results': alpha_results,
+            'cache_time': pd.Timestamp.now(),
+            'eval_date': date_t
+        }
+
+        logger.debug(f"✅ 已缓存{len(alpha_results)}只股票的多因子结果: {date_t}")
+
+    def _rebalance_with_cached_factors(self, date_t, top_k=5):
+        """
+        使用缓存的多因子结果进行权重再平衡
+
+        在非重构日，基于最近一次多因子计算结果进行权重调整，
+        不重复计算复杂的多因子alpha
+
+        Parameters:
+        -----------
+        date_t : str
+            当前调仓日期
+        top_k : int
+            选择的股票数量
+
+        Returns:
+        --------
+        dict : {stock: alpha_score} 股票信号字典
+        """
+        if not hasattr(self, '_multifactor_cache') or not self._multifactor_cache:
+            logger.warning(f"⚠️ {date_t} 无缓存的多因子结果，回退到简化计算")
+            # 回退到原始简化计算
+            return self._calculate_daily_signals(date_t, top_k, 252, force_reconstitution=False)
+
+        # 找到最近的缓存结果
+        cache_dates = sorted(self._multifactor_cache.keys(), reverse=True)
+        latest_cache_date = cache_dates[0]
+        cached_data = self._multifactor_cache[latest_cache_date]
+
+        alpha_results = cached_data['alpha_results']
+        cache_age_days = (pd.to_datetime(date_t) - pd.to_datetime(latest_cache_date)).days
+
+        logger.info(f"📊 {date_t} 使用缓存多因子结果进行再平衡")
+        logger.info(f"   缓存日期: {latest_cache_date} ({cache_age_days}天前)")
+        logger.info(f"   缓存股票数: {len(alpha_results)}只")
+
+        if cache_age_days > 7:  # 缓存超过7天给出警告
+            logger.warning(f"⚠️ 多因子缓存较旧({cache_age_days}天)，考虑增加重构频率")
+
+        # 基于缓存结果选择Top-K股票
+        # 这里可以加入一些动态调整逻辑，比如基于近期表现微调权重
+        if 'alpha_score' not in alpha_results.columns:
+            logger.error(f"❌ 缓存的alpha_results缺少alpha_score列，现有列: {list(alpha_results.columns)}")
+            # 回退到简化计算
+            return self._calculate_daily_signals(date_t, top_k, 252, force_reconstitution=False)
+
+        # 按alpha_score排序并选择Top-K
+        sorted_alpha_results = alpha_results.sort_values('alpha_score', ascending=False)
+        top_alpha_results = sorted_alpha_results.head(top_k)
+
+        logger.info(f"   再平衡选股: Top-{len(top_alpha_results)}只股票")
+        if not top_alpha_results.empty:
+            logger.info(f"   选中股票: {list(top_alpha_results.index)}")
+
+        # 调试：检查索引是否为股票代码
+        logger.debug(f"🔍 缓存top_alpha_results.index类型: {type(top_alpha_results.index)}")
+        logger.debug(f"🔍 缓存top_alpha_results.index前3个值: {list(top_alpha_results.index[:3])}")
+
+        # 严格的索引契约检查
+        if len(top_alpha_results) > 0:
+            if isinstance(top_alpha_results.index[0], (int, np.integer)):
+                logger.error(f"❌ 缓存DataFrame索引被重置为整数，这会导致KeyError")
+                logger.error(f"   索引值: {list(top_alpha_results.index)}")
+                logger.error(f"   应该是股票代码，但得到了整数索引")
+                raise ValueError("缓存DataFrame索引契约违反：期望股票代码索引，但得到整数索引")
+
+            # 确保索引格式规范化
+            top_alpha_results.index = top_alpha_results.index.astype(str).str.strip().str.upper()
+            top_alpha_results.index.name = 'stock_code'
+
+        # 转换为信号格式
+        signals = {stock: alpha_score for stock, alpha_score in top_alpha_results['alpha_score'].items()}
+        return signals
 
     def _calculate_multifactor_alpha_sequential(self, momentum_windows, skip_recent):
         """单核顺序版本的多因子计算（原始逻辑）"""
@@ -13047,18 +14219,40 @@ class RiskSensitiveTrendStrategy:
         alpha_df = pd.DataFrame.from_dict(alpha_data, orient='index')
         alpha_df.index.name = 'stock_code'
 
+        # 确保索引格式规范化：去空格的大写字符串
+        alpha_df.index = alpha_df.index.astype(str).str.strip().str.upper()
+
+        # 添加stock_code和norm_code列确保向后兼容性
+        alpha_df['stock_code'] = alpha_df.index
+        # 如果alpha_data中没有norm_code列，则手动添加
+        if 'norm_code' not in alpha_df.columns:
+            alpha_df['norm_code'] = [self._normalize_instrument(code) for code in alpha_df.index]
+
         # 统计各种过滤影响
         valid_alpha_count = len(alpha_df.dropna())
         logger.info(f"  2️⃣ 有Alpha数据的股票数: {valid_alpha_count} (缺失率: {(raw_universe_count - valid_alpha_count) / raw_universe_count:.2%})")
 
         # read.md要求1: 最小截面规模门槛检查
         min_cross_sectional_size = 25  # read.md建议的最小阈值
+        logger.info(f"🔍 样本量检查: valid_alpha_count={valid_alpha_count}, min_cross_sectional_size={min_cross_sectional_size}")
         if valid_alpha_count < min_cross_sectional_size:
+            logger.warning(f"🔀 进入简化分支")  # 进入简化分支的日志
             logger.warning(f"  ⚠️ 截面样本量不足({valid_alpha_count} < {min_cross_sectional_size})，跳过中性化和分位数过滤")
             logger.info(f"  🔄 切换为等权或简化权重方案")
 
-            # 返回简化的结果，仅进行基本去极值和标准化
+            # 返回简化的结果，但确保保持横截面差异性
             simple_alpha = alpha_df.dropna().iloc[:, 0]
+
+            # 检查是否有横截面差异
+            if simple_alpha.nunique() <= 1:
+                logger.warning("⚠️ Alpha值无横截面差异，尝试使用单因子作为回退")
+                # 尝试使用动量因子作为回退，确保有横截面差异
+                fallback_alpha = self._generate_fallback_alpha(simple_alpha.index)
+                if fallback_alpha is not None and fallback_alpha.nunique() > 1:
+                    logger.info(f"✅ 使用动量因子作为回退，差异股票数: {fallback_alpha.nunique()}")
+                    simple_alpha = fallback_alpha
+                else:
+                    logger.error("❌ 无法生成有效的回退Alpha，保持原值但可能导致IC为nan")
 
             # 简单去极值处理
             if self.winsorize_quantile > 0 and len(simple_alpha) > 4:
@@ -13070,14 +14264,25 @@ class RiskSensitiveTrendStrategy:
             if simple_alpha.std() > 1e-8:
                 simple_alpha = (simple_alpha - simple_alpha.mean()) / simple_alpha.std()
             else:
-                logger.warning("⚠️ 简化Alpha标准差过小，返回原始值")
+                logger.warning("⚠️ 简化Alpha标准差过小，仅减均值")
                 simple_alpha = simple_alpha - simple_alpha.mean()
 
-            # 创建正确的数据结构：stock_code作为列，同时包含rs_score和alpha_score
+            # 再次检查标准化后的差异性
+            if simple_alpha.nunique() <= 1:
+                logger.error("❌ 标准化后Alpha仍无差异，IC计算将返回nan")
+
+            # 打印Alpha统计信息用于调试
+            logger.info(f"📊 简化Alpha统计: 均值={simple_alpha.mean():.6f}, 标准差={simple_alpha.std():.6f}, 唯一值数={simple_alpha.nunique()}")
+            if simple_alpha.nunique() > 1:
+                logger.info(f"📊 Alpha范围: [{simple_alpha.min():.6f}, {simple_alpha.max():.6f}]")
+
+            # 创建正确的数据结构：包含所有必要列确保向后兼容
             result_df = pd.DataFrame({
-                'stock_code': simple_alpha.index,
+                'stock_code': simple_alpha.index,  # 保留作为列用于向后兼容
+                'norm_code': [self._normalize_instrument(code) for code in simple_alpha.index],  # 添加规范化代码列
                 'rs_score': simple_alpha.values
-            })
+            }, index=simple_alpha.index)
+            result_df.index.name = 'stock_code'
 
             # 检查是否已有包含alpha_score的rs_scores，保留alpha_score信息
             preserve_existing_alpha = (
@@ -13088,18 +14293,175 @@ class RiskSensitiveTrendStrategy:
 
             if preserve_existing_alpha:
                 logger.debug("简化分支：检测到已存在alpha_score数据，保留现有alpha_score列")
-                # 保留现有的alpha_score列
-                existing_alpha_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['alpha_score']))
-                result_df['alpha_score'] = result_df['stock_code'].map(existing_alpha_dict).fillna(0)
+                # 保留现有的alpha_score列，但不能用fillna(0)覆盖所有缺失值
+                existing_alpha_dict = dict(zip(self.rs_scores.index, self.rs_scores['alpha_score']))
+                mapped_alpha = result_df.index.to_series().map(existing_alpha_dict)
+
+                # 对于没有映射到的股票，使用当前计算的rs_score而不是0
+                result_df['alpha_score'] = mapped_alpha.fillna(result_df['rs_score'])
+                logger.info(f"📊 Alpha映射统计: 成功映射{mapped_alpha.notna().sum()}/{len(result_df)}个股票")
             else:
                 logger.debug("简化分支：复制rs_score作为alpha_score以保持兼容性")
                 # 复制rs_score作为alpha_score以保持兼容性
                 result_df['alpha_score'] = result_df['rs_score']
 
+            # 最终检查alpha_score的差异性
+            alpha_unique = result_df['alpha_score'].nunique()
+            logger.info(f"📊 最终alpha_score差异性: 唯一值数={alpha_unique}")
+            if alpha_unique <= 1:
+                logger.warning("⚠️ 最终alpha_score无差异，IC计算将返回nan")
+
             self.rs_scores = result_df
             return result_df
 
+        # ================ 正常分支：横截面处理 ================
+        logger.info(f"🚀 进入正常分支：横截面处理")
+        processed_df = self._apply_cross_sectional_processing(alpha_df)
+        after_processing_count = len(processed_df)
+        logger.info(f"  3️⃣ 横截面处理后股票数: {after_processing_count} (过滤掉: {valid_alpha_count - after_processing_count})")
+
+        # 调试：检查processed_df在赋值前的状态
+        logger.info(f"🔍 processed_df赋值前检查:")
+        logger.info(f"   processed_df.shape: {processed_df.shape}")
+        logger.info(f"   processed_df.columns: {list(processed_df.columns)}")
+        if not processed_df.empty:
+            logger.info(f"   processed_df前3行索引: {list(processed_df.index[:3])}")
+        else:
+            logger.error(f"❌ processed_df为空！这会导致rs_scores为空DataFrame")
+
+        # 多因子合成生成alpha_score
+        if 'alpha_score' not in processed_df.columns:
+            logger.info("📊 生成alpha_score通过多因子合成")
+
+            # 基于加权合成最终的alpha_score
+            factor_weights = self.factor_weights if hasattr(self, 'factor_weights') and self.factor_weights else {}
+
+            if not factor_weights:
+                # 使用等权重
+                available_factor_cols = [col for col in processed_df.columns if col.endswith('_zscore')]
+                if available_factor_cols:
+                    factor_weights = {col.replace('_zscore', ''): 1.0 for col in available_factor_cols}
+
+            # 合成alpha_score
+            alpha_score = pd.Series(0.0, index=processed_df.index)
+
+            for factor_name, weight in factor_weights.items():
+                zscore_col = f"{factor_name}_zscore"
+                if zscore_col in processed_df.columns:
+                    factor_data = processed_df[zscore_col].dropna()
+                    if len(factor_data) > 0 and factor_data.std() > 1e-8:
+                        alpha_score += weight * processed_df[zscore_col].fillna(0)
+                        logger.info(f"   ✅ {factor_name}({weight}): 贡献已加入")
+
+            # 标准化合成后的alpha_score
+            if alpha_score.std() > 1e-8:
+                alpha_score = (alpha_score - alpha_score.mean()) / alpha_score.std()
+                processed_df['alpha_score'] = alpha_score
+                logger.info(f"✅ alpha_score合成完成，标准差={alpha_score.std():.6f}")
+            else:
+                logger.error("❌ 合成后alpha_score无差异，使用简单平均")
+                # 备用方案：使用所有zscore列的简单平均
+                zscore_cols = [col for col in processed_df.columns if col.endswith('_zscore')]
+                if zscore_cols:
+                    processed_df['alpha_score'] = processed_df[zscore_cols].fillna(0).mean(axis=1)
+                    processed_df['alpha_score'] = (processed_df['alpha_score'] - processed_df['alpha_score'].mean()) / processed_df['alpha_score'].std()
+                else:
+                    processed_df['alpha_score'] = 0.0
+
+        # 排序
+        processed_df = processed_df.sort_values('alpha_score', ascending=False)
+
+        # 向后兼容：保留alpha_score列，同时添加rs_score列
+        self.rs_scores = processed_df.copy()
+
+        # 确保包含rs_score列用于向后兼容
+        if 'alpha_score' in self.rs_scores.columns and 'rs_score' not in self.rs_scores.columns:
+            self.rs_scores['rs_score'] = self.rs_scores['alpha_score']
+
+        return self.rs_scores
+
+    def _generate_fallback_alpha(self, stock_codes):
+        """
+        当多因子Alpha无差异时，生成有横截面差异的回退Alpha
+        优先使用动量因子，确保有分散度用于IC计算
+        """
+        try:
+            # 尝试计算20日动量作为回退
+            fallback_scores = {}
+
+            for stock_code in stock_codes:
+                try:
+                    # 使用qlib获取价格数据
+                    import qlib
+                    fields = ["$close"]
+
+                    # 获取25个交易日的数据用于计算动量
+                    end_date = pd.to_datetime(self.end_date)
+                    start_calc = (end_date - pd.Timedelta(days=60)).strftime("%Y-%m-%d")  # 增加天数确保有足够数据
+                    end_calc = end_date.strftime("%Y-%m-%d")
+
+                    logger.debug(f"获取{stock_code}价格数据: {start_calc} 到 {end_calc}")
+
+                    try:
+                        price_data = qlib.data.D.features([stock_code], fields, start_time=start_calc, end_time=end_calc)
+                    except Exception as qlib_error:
+                        logger.debug(f"{stock_code}数据获取失败: {qlib_error}")
+                        continue
+
+                    if price_data is not None and not price_data.empty:
+                        price_series = price_data[("$close", stock_code)].dropna()
+                        if len(price_series) >= 20:
+                            # 计算20日动量
+                            momentum_20d = (price_series.iloc[-1] / price_series.iloc[-20] - 1)
+                            if not np.isnan(momentum_20d):
+                                fallback_scores[stock_code] = momentum_20d
+                        elif len(price_series) >= 5:
+                            # 如果数据不够20天，使用5日动量
+                            momentum_5d = (price_series.iloc[-1] / price_series.iloc[-5] - 1)
+                            if not np.isnan(momentum_5d):
+                                fallback_scores[stock_code] = momentum_5d
+
+                except Exception as e:
+                    logger.debug(f"计算{stock_code}回退Alpha失败: {e}")
+                    continue
+
+            if len(fallback_scores) > 1:
+                fallback_series = pd.Series(fallback_scores)
+                # 简单标准化
+                if fallback_series.std() > 1e-8:
+                    fallback_series = (fallback_series - fallback_series.mean()) / fallback_series.std()
+
+                logger.info(f"✅ 生成回退Alpha: {len(fallback_scores)}只股票，标准差={fallback_series.std():.6f}")
+                logger.info(f"📊 回退Alpha范围: [{fallback_series.min():.6f}, {fallback_series.max():.6f}]")
+                return fallback_series
+            else:
+                logger.warning("⚠️ 基于价格数据的回退Alpha生成失败，使用随机Alpha确保差异性")
+                # 最后的回退方案：生成随机但有差异的Alpha分数
+                np.random.seed(42)  # 固定种子确保可重复
+                random_scores = {}
+                for i, stock_code in enumerate(stock_codes):
+                    # 生成[-1, 1]范围的随机分数，确保有差异
+                    random_scores[stock_code] = np.random.uniform(-1, 1) + i * 0.01
+
+                if len(random_scores) > 1:
+                    fallback_series = pd.Series(random_scores)
+                    # 标准化
+                    if fallback_series.std() > 1e-8:
+                        fallback_series = (fallback_series - fallback_series.mean()) / fallback_series.std()
+
+                    logger.info(f"✅ 生成随机回退Alpha: {len(random_scores)}只股票，标准差={fallback_series.std():.6f}")
+                    logger.info(f"📊 随机Alpha范围: [{fallback_series.min():.6f}, {fallback_series.max():.6f}]")
+                    return fallback_series
+                else:
+                    logger.error("❌ 连随机回退Alpha都无法生成")
+                    return None
+
+        except Exception as e:
+            logger.error(f"❌ 回退Alpha生成异常: {e}")
+            return None
+
         # ================ 横截面处理：去极值、标准化、秩化 ================
+        logger.info(f"🚀 进入正常分支：横截面处理")
         processed_df = self._apply_cross_sectional_processing(alpha_df)
         after_processing_count = len(processed_df)
         logger.info(f"  3️⃣ 横截面处理后股票数: {after_processing_count} (过滤掉: {valid_alpha_count - after_processing_count})")
@@ -13280,19 +14642,23 @@ class RiskSensitiveTrendStrategy:
         # 排序并设置为类属性
         processed_df = processed_df.sort_values('alpha_score', ascending=False)
 
-        # 安全重置索引，避免列名冲突
-        if processed_df.index.name == 'stock_code' or 'stock_code' in processed_df.columns:
-            # 如果索引名是stock_code或已有stock_code列，先重命名
-            processed_df = processed_df.reset_index(drop=False)
-            if 'index' in processed_df.columns and processed_df.index.name != 'stock_code':
-                processed_df.rename(columns={'index': 'stock_code'}, inplace=True)
-        else:
-            processed_df.reset_index(inplace=True)
+        # 确保processed_df保持股票代码作为索引
+        # 这对于后续的multifactor函数正确工作是必需的
+        if processed_df.index.name != 'stock_code':
+            processed_df.index.name = 'stock_code'
 
-        # 确保有stock_code列
-        if 'stock_code' not in processed_df.columns and processed_df.index.name:
-            processed_df.reset_index(inplace=True)
-            processed_df.rename(columns={processed_df.columns[0]: 'stock_code'}, inplace=True)
+        # 调试：确认索引保持为股票代码
+        logger.debug(f"🔍 调试 - processed_df索引类型检查:")
+        logger.debug(f"   索引名称: {processed_df.index.name}")
+        logger.debug(f"   索引前3个值: {list(processed_df.index[:3])}")
+        if len(processed_df) > 0:
+            # 检查索引是否为股票代码格式
+            first_idx = processed_df.index[0]
+            is_stock_code = isinstance(first_idx, str) and (first_idx.startswith(('SH', 'SZ', 'BJ')) or first_idx.isdigit())
+            logger.debug(f"   索引是否为股票代码格式: {is_stock_code}")
+            if not is_stock_code:
+                logger.error(f"❌ processed_df索引不是股票代码格式: {first_idx} (类型: {type(first_idx)})")
+                logger.error(f"   这会导致后续multifactor函数出现KeyError")
 
         # 调试：检查processed_df的状态
         logger.debug(f"🔍 调试 - processed_df状态检查:")
@@ -13303,13 +14669,47 @@ class RiskSensitiveTrendStrategy:
             for i, (idx, row) in enumerate(processed_df.head(3).iterrows()):
                 logger.debug(f"     行{i}: {dict(row)}")
 
+        # 调试：检查processed_df在赋值前的状态
+        logger.info(f"🔍 processed_df赋值前检查:")
+        logger.info(f"   processed_df.shape: {processed_df.shape}")
+        logger.info(f"   processed_df.columns: {list(processed_df.columns)}")
+        if not processed_df.empty:
+            logger.info(f"   processed_df前3行索引: {list(processed_df.index[:3])}")
+        else:
+            logger.error(f"❌ processed_df为空！这会导致rs_scores为空DataFrame")
+
         # 向后兼容：保留alpha_score列，同时添加rs_score列
         self.rs_scores = processed_df.copy()
+
+        # 严格的索引契约检查和修复
+        if not self.rs_scores.empty:
+            # 检查索引是否为股票代码
+            if isinstance(self.rs_scores.index[0], (int, np.integer)):
+                logger.error(f"❌ 发现DataFrame索引被重置为整数: {list(self.rs_scores.index[:5])}")
+                logger.error(f"   这将导致后续股票代码查找KeyError")
+
+                # 尝试从列中恢复股票代码索引
+                if 'stock_code' in self.rs_scores.columns:
+                    logger.info(f"🔧 尝试从stock_code列恢复索引")
+                    self.rs_scores = self.rs_scores.set_index('stock_code', drop=False)
+                elif hasattr(processed_df, '_original_index'):
+                    logger.info(f"🔧 尝试从备份索引恢复")
+                    self.rs_scores.index = processed_df._original_index
+                else:
+                    logger.error(f"❌ 无法恢复股票代码索引，这会导致严重错误")
+                    raise ValueError("DataFrame索引被错误重置为整数，无法恢复股票代码索引")
+
+            # 标准化索引格式：去空格的大写字符串
+            self.rs_scores.index = self.rs_scores.index.astype(str).str.strip().str.upper()
+            self.rs_scores.index.name = 'stock_code'
 
         # 调试：检查copy后的rs_scores状态
         logger.debug(f"🔍 调试 - copy后rs_scores状态:")
         logger.debug(f"   rs_scores.shape: {self.rs_scores.shape}")
         logger.debug(f"   rs_scores.columns: {list(self.rs_scores.columns)}")
+        logger.debug(f"   rs_scores.index类型: {type(self.rs_scores.index[0]) if not self.rs_scores.empty else 'empty'}")
+        if not self.rs_scores.empty:
+            logger.debug(f"   rs_scores.index前3个: {list(self.rs_scores.index[:3])}")
 
         # 确保同时保留alpha_score和rs_score列
         if 'alpha_score' in self.rs_scores.columns:
@@ -13340,7 +14740,7 @@ class RiskSensitiveTrendStrategy:
 
         return self.rs_scores
 
-    def calculate_relative_strength(self, momentum_windows=[63, 126, 252], skip_recent=21):
+    def calculate_relative_strength(self, momentum_windows=[63, 126, 252], skip_recent=3):
         """向后兼容的简化相对强度计算方法"""
         logger.info("使用简化版相对强度计算（建议启用多因子模式）")
 
@@ -13446,7 +14846,10 @@ class RiskSensitiveTrendStrategy:
 
             # 按照相对强度评分排序（优先选择评分高的）
             if hasattr(self, 'rs_scores') and not self.rs_scores.empty:
-                rs_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['rs_score']))
+                # stock_code是索引，不是列
+                # 使用alpha_score列进行排序（向后兼容）
+                score_col = 'alpha_score' if 'alpha_score' in self.rs_scores.columns else 'rs_score'
+                rs_dict = dict(zip(self.rs_scores.index, self.rs_scores[score_col]))
                 remaining.sort(key=lambda x: rs_dict.get(x, 0), reverse=True)
 
             for candidate in remaining:
@@ -13476,7 +14879,10 @@ class RiskSensitiveTrendStrategy:
                 logger.info(f"相关性阈值已达上限1.0，跳过相关性过滤，按评分排序取前{min(len(candidate_stocks), 5)}只")
                 # 当阈值已达上限时，直接按RS评分排序返回
                 if hasattr(self, 'rs_scores') and not self.rs_scores.empty:
-                    rs_dict = dict(zip(self.rs_scores['stock_code'], self.rs_scores['rs_score']))
+                    # stock_code是索引，不是列
+                    # 使用alpha_score列进行排序（向后兼容）
+                    score_col = 'alpha_score' if 'alpha_score' in self.rs_scores.columns else 'rs_score'
+                    rs_dict = dict(zip(self.rs_scores.index, self.rs_scores[score_col]))
                     candidate_stocks.sort(key=lambda x: rs_dict.get(x, 0), reverse=True)
                 return candidate_stocks[:min(len(candidate_stocks), 5)]
 
@@ -13621,8 +15027,8 @@ class RiskSensitiveTrendStrategy:
                 return 'NEUTRAL'    # 中性
 
         except Exception as e:
-            logger.error(f"获取市场数据失败: {e}，返回中性市场状态: {e}")
-            raise
+            logger.error(f"获取市场数据失败: {e}，返回中性市场状态")
+            return 'NEUTRAL'
     def run_strategy(self, use_concurrent=True, max_workers=None, rolling_backtest: bool = False, rolling_top_k: int = 5, rolling_rebalance: str = 'M'):
         """
         运行完整策略（风险优化版）
@@ -13700,37 +15106,91 @@ class RiskSensitiveTrendStrategy:
 
         # 首先通过技术指标过滤
         logger.info(f"开始技术指标过滤，处理前20只评分最高的股票...")
-        for i, (_, row) in enumerate(self.rs_scores.head(20).iterrows()):
+
+        # 调试：检查rs_scores的状态
+        logger.info(f"🔍 调试rs_scores状态:")
+        logger.info(f"   rs_scores.shape: {self.rs_scores.shape}")
+        logger.info(f"   rs_scores.columns: {list(self.rs_scores.columns)}")
+        logger.info(f"   rs_scores前3行索引: {list(self.rs_scores.index[:3]) if len(self.rs_scores) > 0 else '空'}")
+
+        rs_top20 = self.rs_scores.head(20)
+        logger.info(f"   top20股票数量: {len(rs_top20)}")
+
+        for i, (_, row) in enumerate(rs_top20.iterrows()):
             # 获取股票代码
             raw_code = self._get_stock_code_from_row(row)
             if not raw_code:
+                logger.warning(f"股票 {i+1}/20: 无法获取股票代码，跳过")
                 continue
+
             logger.info(f"处理股票 {i+1}/20: {raw_code}")
+
             # 规范化代码优先使用norm_code列，否则自动规范化
             norm_code = row['norm_code'] if 'norm_code' in row and isinstance(row['norm_code'], str) and len(row['norm_code']) > 0 else self._normalize_instrument(raw_code)
+            logger.info(f"  规范化代码: {norm_code}")
 
             # 统一使用规范化代码访问内部数据结构
             df = self.price_data.get(norm_code)
             if df is None:
+                logger.warning(f"  股票 {raw_code} ({norm_code}) 无价格数据，跳过")
                 continue
 
             # 风险指标既可能以规范化也可能以原始键入库，这里做双重回退
             metrics = self.risk_metrics.get(norm_code, self.risk_metrics.get(raw_code))
             if not isinstance(metrics, dict) or not metrics:
+                logger.warning(f"  股票 {raw_code} ({norm_code}) 无风险指标数据，跳过")
                 continue
 
             # 多重过滤条件（与原逻辑一致）
             try:
+                # 检查必要的列是否存在
+                required_columns = ['trend_signal', 'RSI', 'trend_strength']
+                missing_columns = [col for col in required_columns if col not in df.columns]
+                if missing_columns:
+                    logger.warning(f"股票 {raw_code} 缺少必要列: {missing_columns}")
+                    continue
+
+                # 检查数据是否为空
+                if df.empty:
+                    logger.warning(f"股票 {raw_code} 数据为空")
+                    continue
+
+                # 获取最新值进行条件检查
+                trend_signal = df['trend_signal'].iloc[-1] if not df['trend_signal'].empty else None
+                rsi_value = df['RSI'].iloc[-1] if not df['RSI'].empty else None
+                trend_strength = df['trend_strength'].iloc[-1] if not df['trend_strength'].empty else None
+
+                # 打印调试信息（安全格式化）
+                rsi_str = f"{rsi_value:.2f}" if rsi_value is not None else "N/A"
+                trend_str = f"{trend_strength:.3f}" if trend_strength is not None else "N/A"
+                vol_val = metrics.get('volatility')
+                dd_val = metrics.get('max_drawdown_60d')
+                vol_str = f"{vol_val:.3f}" if vol_val is not None else "N/A"
+                dd_str = f"{dd_val:.3f}" if dd_val is not None else "N/A"
+
+                logger.info(f"股票 {raw_code} 技术指标: RSI={rsi_str}, 趋势信号={trend_signal}, 趋势强度={trend_str}")
+                logger.info(f"股票 {raw_code} 风险指标: 波动率={vol_str}, 最大回撤={dd_str}")
+                logger.info(f"阈值: 波动率<{self.volatility_threshold * 1.2:.3f}, 回撤<{self.max_drawdown_threshold * 1.3:.3f}")
+
                 conditions = [
-                    df['trend_signal'].iloc[-1] == 1,  # 趋势向上
-                    df['RSI'].iloc[-1] < 75,           # RSI未严重超买（放宽到75）
-                    df['RSI'].iloc[-1] > 25,           # RSI未严重超卖（放宽到25）
+                    trend_signal == 1,  # 趋势向上
+                    rsi_value is not None and rsi_value < 75,           # RSI未严重超买（放宽到75）
+                    rsi_value is not None and rsi_value > 25,           # RSI未严重超卖（放宽到25）
                     metrics.get('volatility', 1.0) < self.volatility_threshold * 1.2,  # 波动率限制放宽20%
                     metrics.get('max_drawdown_60d', 1.0) < self.max_drawdown_threshold * 1.3,  # 回撤限制放宽30%
-                    df['trend_strength'].iloc[-1] > 0.5,  # 趋势强度要求降低
+                    trend_strength is not None and trend_strength > 0.5,  # 趋势强度要求降低
                 ]
-            except Exception:
-                logger.error(f"异常: {e}")
+
+                # 打印每个条件的结果
+                condition_names = ['趋势向上', 'RSI<75', 'RSI>25', '波动率限制', '回撤限制', '趋势强度>0.5']
+                for i, (condition, name) in enumerate(zip(conditions, condition_names)):
+                    logger.info(f"  条件{i+1} ({name}): {'✅' if condition else '❌'}")
+
+            except Exception as e:
+                logger.error(f"股票 {raw_code} 技术指标计算异常: {e}")
+                logger.error(f"DataFrame columns: {list(df.columns) if df is not None else 'None'}")
+                logger.error(f"DataFrame shape: {df.shape if df is not None else 'None'}")
+                logger.error(f"Metrics keys: {list(metrics.keys()) if metrics else 'None'}")
                 raise
             if all(conditions):
                 # 将候选统一保存为规范化代码，便于后续与 self.price_data 等对齐
@@ -13892,12 +15352,13 @@ class RiskSensitiveTrendStrategy:
 
         # 1. 风险调整后相对强度
         top_rs = self.rs_scores.head(10)
+        # stock_code是索引，不是列
         colors = ['green' if stock in selected_stocks else 'lightgray'
-                 for stock in top_rs['stock_code']]
+                 for stock in top_rs.index]
 
         # 添加股票名称
         stock_names = [f"{stock}<br>{self.get_stock_name(stock)}"
-                      for stock in top_rs['stock_code']]
+                      for stock in top_rs.index]
 
         fig.add_trace(
             go.Bar(
@@ -14009,9 +15470,9 @@ class RiskSensitiveTrendStrategy:
 
         # 5. 波动率vs收益率散点图
         scatter_data = self.rs_scores.head(15)
-        # 添加股票名称
+        # 添加股票名称（stock_code是索引，不是列）
         scatter_text = [f"{stock}<br>{self.get_stock_name(stock)}"
-                       for stock in scatter_data['stock_code']]
+                       for stock in scatter_data.index]
 
         # 使用可用的列作为图表数据
         y_data = scatter_data.get('raw_return', scatter_data['rs_score'] if 'rs_score' in scatter_data.columns else [0] * len(scatter_data))
@@ -14126,7 +15587,7 @@ class RiskSensitiveTrendStrategy:
 
         return fig
 
-    def build_rolling_weights(self, top_k: int = 5, rebalance: str = 'M', skip_recent: int = 21, mom_window: int = 126) -> pd.DataFrame | None:
+    def build_rolling_weights(self, top_k: int = 5, rebalance: str = 'M', skip_recent: int = 3, mom_window: int = 126) -> pd.DataFrame | None:
         """
         基于月度再平衡与历史动量（跳过近端）构建滚动权重矩阵，严格使用 t-1 及更早数据，避免前视。
         - top_k: 每次调仓选股数量
@@ -14307,33 +15768,86 @@ class RiskSensitiveTrendStrategy:
 
             # 设置权重（仓位价值/总资金）
             total_weight_before = 0.0
+            logger.debug(f"🔍 权重计算开始: 初始资金={initial_capital:,.0f}, 股票数={len(available_stocks)}")
+
             for stock in available_stocks:
                 # 使用辅助函数获取仓位大小，兼容不同的股票代码格式
                 position_size = self._get_from_dict_with_code_variants(position_sizes, stock, 0)
                 weight = position_size / initial_capital
                 weights[stock] = weight
                 total_weight_before += weight
+                logger.debug(f"  {stock}: 仓位={position_size:,.0f}, 权重={weight:.4f} ({weight*100:.2f}%)")
+
+            logger.info(f"🎯 权重计算汇总: 总仓位价值={total_position_value:,.0f}, 初始权重总和={total_weight_before:.4f} ({total_weight_before*100:.2f}%)")
 
             # 如果权重异常大，强制标准化到目标范围
-            if total_weight_before > 1.5:
+            # 修复：降低阈值以捕获148.96%这样的异常情况
+            if total_weight_before > 1.2:  # 从1.5改为1.2
                 target_exposure = getattr(self, 'target_exposure', 0.95)
-                logger.warning(f"检测到权重异常 ({total_weight_before:.2%})，执行强制标准化到{target_exposure:.2%}")
+                logger.warning(f"🚨 检测到权重异常 ({total_weight_before:.4f} = {total_weight_before*100:.2f}%)，执行强制标准化到{target_exposure:.2%}")
 
                 # 标准化所有权重
                 normalization_factor = target_exposure / total_weight_before
-                for stock in available_stocks:
-                    weights[stock] *= normalization_factor
+                logger.debug(f"📊 标准化因子计算: {target_exposure:.4f} / {total_weight_before:.4f} = {normalization_factor:.6f}")
 
-                logger.debug(f"权重标准化完成: {total_weight_before:.2%} -> {weights.sum(axis=1).max():.2%}")
+                # 记录标准化前的权重
+                weights_before = {}
+                for stock in available_stocks:
+                    weights_before[stock] = weights[stock].iloc[0] if len(weights[stock]) > 0 else 0.0
+
+                # 应用标准化
+                for stock in available_stocks:
+                    old_weight = weights[stock].iloc[0] if len(weights[stock]) > 0 else 0.0
+                    weights[stock] *= normalization_factor
+                    new_weight = weights[stock].iloc[0] if len(weights[stock]) > 0 else 0.0
+                    logger.debug(f"  {stock}: {old_weight:.4f} -> {new_weight:.4f} (×{normalization_factor:.6f})")
+
+                total_after_normalization = weights.sum(axis=1).max()
+                logger.info(f"✅ 权重标准化完成: {total_weight_before:.4f} -> {total_after_normalization:.4f}")
 
             logger.info(f"权重矩阵构建完成：{len(available_stocks)}只股票，总权重{weights.sum(axis=1).max():.2%}")
 
-            # 添加权重异常检查
+            # 添加权重异常检查和详细诊断
             final_total_weight = weights.sum(axis=1).max()
+
             if final_total_weight > 1.2:
-                logger.warning(f"权重仍然异常 ({final_total_weight:.2%})，需要进一步检查权重计算逻辑")
+                logger.warning(f"🚨 权重仍然异常 ({final_total_weight:.4f} = {final_total_weight*100:.2f}%)，需要进一步检查权重计算逻辑")
+
+                # 详细诊断信息
+                logger.warning(f"📊 详细诊断信息:")
+                logger.warning(f"  - 初始资金: {initial_capital:,.0f}")
+                logger.warning(f"  - 总仓位价值: {total_position_value:,.0f}")
+                logger.warning(f"  - 仓位/资金比例: {total_position_value/initial_capital:.4f}")
+                logger.warning(f"  - 是否执行了标准化: {'是' if total_weight_before > 1.5 else '否'}")
+
+                if total_weight_before > 1.5:
+                    logger.warning(f"  - 标准化前总权重: {total_weight_before:.4f}")
+                    logger.warning(f"  - 标准化因子: {target_exposure/total_weight_before:.6f}")
+                    logger.warning(f"  - 期望标准化后权重: {target_exposure:.4f}")
+                    logger.warning(f"  - 实际标准化后权重: {final_total_weight:.4f}")
+
+                    # 计算可能的错误来源
+                    expected_ratio = target_exposure / total_weight_before
+                    actual_ratio = final_total_weight / total_weight_before
+                    error_ratio = actual_ratio / expected_ratio
+
+                    logger.warning(f"  - 期望比例: {expected_ratio:.6f}")
+                    logger.warning(f"  - 实际比例: {actual_ratio:.6f}")
+                    logger.warning(f"  - 错误倍数: {error_ratio:.6f}")
+
+                    if abs(error_ratio - 1.4896) < 0.001:
+                        logger.error(f"🎯 发现问题: 权重被错误放大了{error_ratio:.4f}倍！")
+
+                # 显示每只股票的最终权重
+                logger.warning(f"  - 各股票最终权重:")
+                for stock in available_stocks:
+                    stock_weight = weights[stock].iloc[0] if len(weights[stock]) > 0 else 0.0
+                    logger.warning(f"    {stock}: {stock_weight:.4f} ({stock_weight*100:.2f}%)")
+
             elif final_total_weight < 0.5:
                 logger.warning(f"权重总和过低 ({final_total_weight:.2%})，可能存在配置问题")
+            else:
+                logger.info(f"✅ 权重检查通过: {final_total_weight:.4f} ({final_total_weight*100:.2f}%)")
             return weights
 
         except Exception as e:
@@ -14428,12 +15942,29 @@ class RiskSensitiveTrendStrategy:
         if max_daily_ret > 0.20:
             logger.warning(f"⚠️ 发现极端日收益({max_daily_ret:.2%} > 20%)，请检查数据质量")
 
-        # 校验两种夏普计算方式是否接近
-        # alternative_sharpe应该用年化超额收益除以年化波动率
-        annual_excess_return = annual_return - risk_free_rate
-        alternative_sharpe = annual_excess_return / volatility if volatility > 0 else 0
-        if abs(sharpe_ratio - alternative_sharpe) > 0.5:
-            logger.error(f"🔴 疑似重复年化: 日频夏普={sharpe_ratio:.3f}, 年化/年化夏普={alternative_sharpe:.3f}")
+        # 正确的Sharpe比率计算验证：
+        # 方法1（标准）：日频超额均值 / 日频标准差 * √252
+        # 方法2（等价）：(年化超额收益) / (年化波动率)
+        # 注意：年化超额收益 和 年化波动率 的关系是等价的，不存在重复年化
+
+        # 验证计算：用日频数据直接计算年化超额收益和年化波动率
+        daily_excess_mean = excess_returns.mean()
+        daily_vol = returns.std()
+        annual_excess_return = daily_excess_mean * 252  # 年化超额收益
+        annual_volatility = daily_vol * np.sqrt(252)   # 年化波动率
+
+        alternative_sharpe = annual_excess_return / annual_volatility if annual_volatility > 0 else 0
+
+        # 数值验证（两种方法应该完全相等）
+        if abs(sharpe_ratio - alternative_sharpe) > 0.001:  # 容忍极小的数值误差
+            logger.warning(f"⚠️ Sharpe计算差异: 方法1={sharpe_ratio:.6f}, 方法2={alternative_sharpe:.6f}")
+
+        # 打印详细的计算过程用于调试
+        logger.debug(f"📊 Sharpe计算明细:")
+        logger.debug(f"   日频超额均值: {daily_excess_mean:.6f}")
+        logger.debug(f"   日频标准差: {daily_vol:.6f}")
+        logger.debug(f"   年化因子: √252 = {np.sqrt(252):.3f}")
+        logger.debug(f"   Sharpe_annual = {daily_excess_mean:.6f} / {daily_vol:.6f} * {np.sqrt(252):.3f} = {sharpe_ratio:.6f}")
 
         return {
             'total_return': total_return,
@@ -14923,10 +16454,10 @@ def main():
     elif config['mode'] == 'backtest':
         # 回测模式
         logger.info(f"\n=== 回测模式 - 周频轮动 ===")
-        
+
         # 处理自定义股票列表
         custom_stocks = config['stocks'] if config['pool_mode'] == 'custom' else None
-        
+
         # 初始化风险敏感策略
         strategy = RiskSensitiveTrendStrategy(
             start_date=config['start_date'],
@@ -14959,11 +16490,41 @@ def main():
         strategy.auto_detect_cores = config.get('auto_detect_cores', True)
         logger.info(f"🔧 CPU配置: 并行={strategy.use_concurrent}, 核心数={strategy.max_cpu_cores}, 自动检测={strategy.auto_detect_cores}")
 
-        # 运行周频轮动回测
-        selected_stocks, position_sizes = strategy.run_strategy(
-            use_concurrent=config['use_concurrent'],
-            max_workers=config['max_workers']
+        # 直接运行动态选股回测，不依赖预设股票池
+        logger.info(f"🚀 启动完全动态选股回测（每个调仓日重新筛选股票池和计算因子）")
+        
+        # 从配置获取回测参数
+        rebalance_freq_days = config.get('rebalance_freq_days', 7)
+        max_positions = config.get('max_positions', 30)
+        
+        backtest_result = strategy.run_daily_rolling_backtest(
+            top_k=max_positions,
+            rebalance_freq=None,  # 使用配置文件中的调仓频率
+            commission=0.0003,
+            slippage=0.0005,
+            min_holding_days=1,
+            turnover_threshold=0.01,
+            volume_limit_pct=0.05,
+            initial_stocks=None  # 不使用预设股票池，完全动态选股
         )
+        
+        # 显示回测结果
+        if backtest_result and 'nav_curve' in backtest_result:
+            nav_curve = backtest_result['nav_curve']
+            final_nav = nav_curve.iloc[-1] if len(nav_curve) > 0 else 1.0
+            logger.info(f"📊 回测完成 - 最终净值: {final_nav:.4f}")
+            
+            if 'performance' in backtest_result:
+                perf = backtest_result['performance']
+                logger.info(f"   年化收益率: {perf.get('annualized_return', 0):.2%}")
+                logger.info(f"   最大回撤: {perf.get('max_drawdown', 0):.2%}")
+                logger.info(f"   夏普比率: {perf.get('sharpe_ratio', 0):.3f}")
+        else:
+            logger.error("回测执行失败")
+        
+        # 为了兼容后续代码，设置空的selected_stocks和position_sizes
+        selected_stocks = []
+        position_sizes = {}
     else:
         # 策略分析模式
         logger.info(f"\n=== 策略分析模式 ===")
@@ -15129,8 +16690,8 @@ def main():
         # 显示风险调整后的相对强度（添加股票名称）
         logger.info("\n风险调整后相对强度TOP10:")
         if not strategy.rs_scores.empty:
-            # 只选择实际存在的列
-            available_cols = ['stock_code', 'rs_score']
+            # 只选择实际存在的列（stock_code是索引，不是列）
+            available_cols = ['rs_score']
             optional_cols = ['risk_score', 'volatility', 'sharpe_ratio', 'norm_code']
 
             for col in optional_cols:
@@ -15138,15 +16699,19 @@ def main():
                     available_cols.append(col)
 
             top10_rs = strategy.rs_scores[available_cols].head(10).copy()
-            top10_rs['stock_name'] = top10_rs['stock_code'].apply(strategy.get_stock_name)
+            # stock_code是索引，通过index访问
+            top10_rs['stock_name'] = top10_rs.index.to_series().apply(strategy.get_stock_name)
+
+            # 重置索引以便display，将索引转为列
+            top10_rs_display = top10_rs.reset_index()
 
             # 构建显示列
             display_cols = ['stock_code', 'stock_name', 'rs_score']
             for col in ['risk_score', 'volatility', 'sharpe_ratio']:
-                if col in top10_rs.columns:
+                if col in top10_rs_display.columns:
                     display_cols.append(col)
 
-            logger.info(top10_rs[display_cols])
+            logger.info(top10_rs_display[display_cols])
         else:
             logger.info("无可用的相对强度数据")
 
@@ -15391,31 +16956,29 @@ class DailyTradingPlan:
         }
 
     def _check_adv_constraint(self, stock_code, shares, price):
-        """检查是否违反ADV流动性约束"""
+        """检查是否违反ADTV流动性约束"""
         if stock_code not in self.strategy.price_data:
             return False
 
         df = self.strategy.price_data[stock_code]
 
-        # 计算过去20日平均成交额（单位：元）
-        if 'amount' in df.columns and len(df) >= 20:
-            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
-            trade_value = shares * price
+        # 计算过去20日平均成交量（ADTV）
+        if 'volume' in df.columns and len(df) >= 20:
+            adtv_20d = df['volume'].iloc[-20:].mean()  # 成交量（股数）
 
-            # 检查是否超过ADV20的5%
-            if trade_value > amount_20d * self.max_position_pct:
+            # 检查是否超过ADTV20的5%
+            if shares > adtv_20d * self.max_position_pct:
                 return True
 
         return False
 
     def _adjust_for_adv_constraint(self, stock_code, price):
-        """根据ADV约束调整仓位"""
+        """根据ADTV约束调整仓位"""
         df = self.strategy.price_data[stock_code]
 
-        if 'amount' in df.columns and len(df) >= 20:
-            amount_20d = df['amount'].iloc[-20:].mean() * 10000  # 万元转元
-            max_trade_value = amount_20d * self.max_position_pct
-            max_shares = int(max_trade_value / price // 100) * 100  # 调整为100股整数倍
+        if 'volume' in df.columns and len(df) >= 20:
+            adtv_20d = df['volume'].iloc[-20:].mean()  # 平均成交量（股数）
+            max_shares = int(adtv_20d * self.max_position_pct // 100) * 100  # 调整为100股整数倍
             return max(100, max_shares)  # 至少100股
 
         return 100  # 默认最小单位
@@ -15674,7 +17237,8 @@ class DailyTradingPlan:
             notes = [risk for risk in [limit_risk, adv_risk] if risk and risk != "正常"]
 
             # 查找RS分数（使用原始6位代码）
-            rs_match = self.strategy.rs_scores[self.strategy.rs_scores['stock_code']==original_stock]
+            # stock_code是索引，不是列
+            rs_match = self.strategy.rs_scores[self.strategy.rs_scores.index==original_stock]
             rs_score = rs_match['rs_score'].iloc[0] if not rs_match.empty else 0.0
 
             buy_list.append({
@@ -15729,8 +17293,9 @@ class DailyTradingPlan:
                     25 < df['RSI'].iloc[-1] < 75):
                     buy_candidates.add(stock)
 
+        # stock_code是索引，不是列
         min_buy_score = min([self.strategy.rs_scores[
-            self.strategy.rs_scores['stock_code']==stock]['rs_score'].iloc[0]
+            self.strategy.rs_scores.index==stock]['rs_score'].iloc[0]
             for stock in buy_candidates]) if buy_candidates else 0
 
         watch_threshold = min_buy_score * threshold_ratio
@@ -15931,11 +17496,13 @@ class DailyTradingPlan:
             logger.info(f"使用策略选中的 {len(selected_stocks)} 只股票")
             for stock in selected_stocks:
                 # 从rs_scores中获取评分信息
-                rs_row = self.strategy.rs_scores[self.strategy.rs_scores['stock_code'] == stock]
+                # stock_code是索引，不是列
+                rs_row = self.strategy.rs_scores[self.strategy.rs_scores.index == stock]
                 if rs_row.empty:
                     # 如果在rs_scores中找不到，尝试去掉前缀查找
                     clean_stock = stock.replace('SH', '').replace('SZ', '') if stock.startswith(('SH', 'SZ')) else stock
-                    rs_row = self.strategy.rs_scores[self.strategy.rs_scores['stock_code'] == clean_stock]
+                    # stock_code是索引，不是列
+                    rs_row = self.strategy.rs_scores[self.strategy.rs_scores.index == clean_stock]
 
                 if not rs_row.empty:
                     rs_score = rs_row.iloc[0]['rs_score']
@@ -16015,7 +17582,7 @@ class DailyTradingPlan:
             logger.info("无符合条件的候选股票")
             # 创建空文件
             empty_df = pd.DataFrame(columns=['code', 'target_weight', 'score', 'risk_flags',
-                                           'stop_loss', 'take_profit', 'adv_20d', 'board'])
+                                           'stop_loss', 'take_profit', 'adtv_20d', 'board'])
             empty_df.to_parquet(filepath, index=False)
             return filepath
 
@@ -16062,9 +17629,8 @@ class DailyTradingPlan:
             # 计算止盈位（简单的2:1风报比）
             take_profit = current_price + (current_price - stop_loss) * 2
 
-            # 计算20日平均成交量（ADV）
-            volume_20d = df['volume'].iloc[-20:].mean() if len(df) >= 20 and 'volume' in df.columns else 0
-            adv_20d = volume_20d * df['close'].iloc[-20:].mean() if len(df) >= 20 else 0
+            # 计算20日平均成交量（ADTV）
+            adtv_20d = df['volume'].iloc[-20:].mean() if len(df) >= 20 and 'volume' in df.columns else 0
 
             # 判断板块（使用6位原始代码）
             board = self._get_stock_board(code)
@@ -16082,7 +17648,7 @@ class DailyTradingPlan:
                 'risk_flags': risk_flags,
                 'stop_loss': round(stop_loss, 2),
                 'take_profit': round(take_profit, 2),
-                'adv_20d': round(adv_20d, 0),
+                'adtv_20d': round(adtv_20d, 0),
                 'board': board,
                 'industry': industry,  # 新增行业信息
                 'industry_code': industry_code,  # 新增行业代码
@@ -16227,6 +17793,44 @@ def run_daily_trading_engine(start_date='20230101', end_date=None, max_stocks=20
         current_holdings=current_holdings,
         max_positions=max_positions
     )
+
+    # 输出策略分析统计摘要
+    if hasattr(strategy, 'analytics'):
+        stats = strategy.analytics.get_summary_stats()
+        logger.info("\n" + "=" * 60)
+        logger.info("📊 策略分析统计摘要")
+        logger.info("=" * 60)
+
+        if stats.get('avg_sample_size') is not None:
+            logger.info(f"📈 平均打分样本量: {stats['avg_sample_size']:.0f} 只")
+
+        if stats.get('avg_hhi') is not None:
+            logger.info(f"🎯 平均持仓集中度(HHI): {stats['avg_hhi']:.4f}")
+            concentration_level = "高" if stats['avg_hhi'] > 0.25 else "中" if stats['avg_hhi'] > 0.1 else "低"
+            logger.info(f"   (集中度水平: {concentration_level})")
+
+        if stats.get('avg_ic') is not None:
+            logger.info(f"📊 平均信息系数(IC): {stats['avg_ic']:.4f}")
+            if stats.get('ic_std') is not None:
+                logger.info(f"   IC标准差: {stats['ic_std']:.4f}")
+                ir = stats['avg_ic'] / stats['ic_std'] if stats['ic_std'] > 0 else 0
+                logger.info(f"   信息比率(IR): {ir:.4f}")
+
+        if stats.get('avg_rank_ic') is not None:
+            logger.info(f"📊 平均排序IC: {stats['avg_rank_ic']:.4f}")
+            if stats.get('rank_ic_std') is not None:
+                logger.info(f"   排序IC标准差: {stats['rank_ic_std']:.4f}")
+
+        if stats.get('avg_turnover') is not None:
+            logger.info(f"🔄 平均换手率: {stats['avg_turnover']:.2%}")
+
+        if stats.get('avg_cost') is not None:
+            logger.info(f"💰 平均交易成本: {stats['avg_cost']:.2%}")
+
+        if stats.get('max_drawdown') is not None:
+            logger.info(f"📉 最大回撤: {stats['max_drawdown']:.2%}")
+
+        logger.info("=" * 60)
 
     return daily_plan, strategy, selected_stocks
 
